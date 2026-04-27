@@ -23,14 +23,24 @@ From there, your conversations start accumulating. After 6 PM local time, the ne
 
 The default Quick Start only captures sessions started inside this repo. To capture every Claude Code session no matter the working directory:
 
-1. **Clone to the standard location:** `git clone <your-fork-url> $HOME/Development/claude-memory-compiler` (the bundled `.claude/settings.json` uses absolute paths under `$HOME/Development/claude-memory-compiler/`). If you clone elsewhere, edit those paths in your copy of `settings.json`.
-2. **Install dependencies:** `cd $HOME/Development/claude-memory-compiler && uv sync`.
-3. **Copy hooks into your user-global Claude Code settings:** merge the contents of this repo's `.claude/settings.json` into `~/.claude/settings.json` (create the file if it doesn't exist; merge the `hooks` keys if you already have other settings).
-4. **Done.** Every session, in any directory, fires the hooks. All output still lands in this repo's `daily/` and `knowledge/` directories — there is one central knowledge base, not one per project.
+1. **Clone anywhere you like.** No fixed path required — the hooks resolve via the `CLAUDE_MEMORY_HOME` environment variable.
+2. **Install dependencies:** `cd <your-clone-path> && uv sync`.
+3. **Run the setup helper for personalized instructions:**
+   ```bash
+   bin/setup-global.sh
+   ```
+   It auto-detects your clone path and prints the exact two manual steps:
+   - Add `export CLAUDE_MEMORY_HOME="<your-clone-path>"` to your shell's startup file (e.g. `~/.zshrc`).
+   - Merge the `hooks` object from this repo's `.claude/settings.json` into your `~/.claude/settings.json` (create it if missing).
+4. **Done.** Every Claude Code session, in any directory, fires the hooks. All output lands in `$CLAUDE_MEMORY_HOME/daily/` and `$CLAUDE_MEMORY_HOME/knowledge/` — one central knowledge base, not one per project.
 
 Each session is automatically tagged with the project key (basename of the session's working directory) so retrieval can be scoped per-project later.
 
-**Double-fire prevention:** When you have hooks in both project-local (`.claude/settings.json`) and user-global (`~/.claude/settings.json`) scopes, Claude Code fires both. The hooks include a 10-second per-session dedup guard (`scripts/last-hook-fire.json`) so only the first invocation does work. You don't need to choose between project-local and global — both can coexist.
+**Why an env var?** Team members clone to different locations. With `$CLAUDE_MEMORY_HOME`, the same `settings.json` works on everyone's machine — they just set the env var once for their clone.
+
+**Caveat:** Claude Code hook commands inherit env vars from the shell that launched `claude`. If you run Claude Code from a fresh terminal where `CLAUDE_MEMORY_HOME` is exported, the hooks will see it. If you launch Claude Code from a macOS GUI launcher that doesn't read your shell profile, set the var via `launchctl setenv CLAUDE_MEMORY_HOME <path>` or in `~/.zshenv` instead of `~/.zshrc`.
+
+**Double-fire prevention:** When hooks live in both project-local (`.claude/settings.json`) and user-global (`~/.claude/settings.json`) scopes, Claude Code fires both. The hooks include a 10-second per-session dedup guard (`scripts/last-hook-fire.json`) so only the first invocation does work. You don't need to choose between project-local and global — both can coexist.
 
 ## How It Works
 

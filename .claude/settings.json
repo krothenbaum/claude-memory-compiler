@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --directory $HOME/Development/claude-memory-compiler python $HOME/Development/claude-memory-compiler/hooks/session-start.py",
+            "command": "uv run --directory \"$CLAUDE_MEMORY_HOME\" python \"$CLAUDE_MEMORY_HOME/hooks/session-start.py\"",
             "timeout": 15
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --directory $HOME/Development/claude-memory-compiler python $HOME/Development/claude-memory-compiler/hooks/pre-compact.py",
+            "command": "uv run --directory \"$CLAUDE_MEMORY_HOME\" python \"$CLAUDE_MEMORY_HOME/hooks/pre-compact.py\"",
             "timeout": 10
           }
         ]
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run --directory $HOME/Development/claude-memory-compiler python $HOME/Development/claude-memory-compiler/hooks/session-end.py",
+            "command": "uv run --directory \"$CLAUDE_MEMORY_HOME\" python \"$CLAUDE_MEMORY_HOME/hooks/session-end.py\"",
             "timeout": 10
           }
         ]
