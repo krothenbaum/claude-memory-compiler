@@ -108,8 +108,10 @@ def main() -> None:
     session_id = hook_input.get("session_id", "unknown")
     source = hook_input.get("source", "unknown")
     transcript_path_str = hook_input.get("transcript_path", "")
+    cwd_str = hook_input.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_key = Path(cwd_str).name or "unknown"
 
-    logging.info("SessionEnd fired: session=%s source=%s", session_id, source)
+    logging.info("SessionEnd fired: session=%s source=%s project=%s", session_id, source, project_key)
 
     if not transcript_path_str or not isinstance(transcript_path_str, str):
         logging.info("SKIP: no transcript path")
@@ -152,6 +154,8 @@ def main() -> None:
         str(flush_script),
         str(context_file),
         session_id,
+        project_key,
+        cwd_str,
     ]
 
     # On Windows, use CREATE_NO_WINDOW to avoid flash console window.

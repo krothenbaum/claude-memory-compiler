@@ -53,8 +53,13 @@ def save_flush_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
-def append_to_daily_log(content: str, section: str = "Session") -> None:
-    """Append content to today's daily log."""
+def append_to_daily_log(
+    content: str,
+    section: str = "Session",
+    project_key: str = "unknown",
+    cwd: str = "",
+) -> None:
+    """Append content to today's daily log, tagged with project metadata."""
     today = datetime.now(timezone.utc).astimezone()
     log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
 
@@ -66,13 +71,18 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
         )
 
     time_str = today.strftime("%H:%M")
-    entry = f"### {section} ({time_str})\n\n{content}\n\n"
+    header = f"### {section} [{project_key}] ({time_str})"
+    metadata_lines = [f"**Project:** {project_key}"]
+    if cwd:
+        metadata_lines.append(f"**CWD:** {cwd}")
+    metadata_block = "\n".join(metadata_lines)
+    entry = f"{header}\n\n{metadata_block}\n\n{content}\n\n"
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(entry)
 
 
-async def run_flush(context: str) -> str:
+async def run_flush(context: str, project_key: str = "unknown", cwd: str = "") -> str:
     """Use Claude Agent SDK to extract important knowledge from conversation context."""
     from claude_agent_sdk import (
         AssistantMessage,
@@ -82,9 +92,21 @@ async def run_flush(context: str) -> str:
         query,
     )
 
+    project_block = f"**Project:** {project_key}"
+    if cwd:
+        project_block += f"\n**CWD:** {cwd}"
+
     prompt = f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
 Do NOT use any tools — just return plain text.
+
+This conversation took place in the following project:
+
+{project_block}
+
+Treat the project key as the canonical scope for everything you extract. Anything
+project-specific (e.g. a coding pattern, a bug, a decision) should be described
+as belonging to "{project_key}" so it can be filtered later by project.
 
 Format your response as a structured daily log entry with these sections:
 
@@ -191,13 +213,23 @@ def maybe_trigger_compilation() -> None:
 
 def main():
     if len(sys.argv) < 3:
-        logging.error("Usage: %s <context_file.md> <session_id>", sys.argv[0])
+        logging.error(
+            "Usage: %s <context_file.md> <session_id> [project_key] [cwd]",
+            sys.argv[0],
+        )
         sys.exit(1)
 
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
+    project_key = sys.argv[3] if len(sys.argv) > 3 else "unknown"
+    cwd = sys.argv[4] if len(sys.argv) > 4 else ""
 
-    logging.info("flush.py started for session %s, context: %s", session_id, context_file)
+    logging.info(
+        "flush.py started for session %s project=%s context=%s",
+        session_id,
+        project_key,
+        context_file,
+    )
 
     if not context_file.exists():
         logging.error("Context file not found: %s", context_file)
@@ -223,20 +255,23 @@ def main():
     logging.info("Flushing session %s: %d chars", session_id, len(context))
 
     # Run the LLM extraction
-    response = asyncio.run(run_flush(context))
+    response = asyncio.run(run_flush(context, project_key, cwd))
 
     # Append to daily log
     if "FLUSH_OK" in response:
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
-            "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
+            "FLUSH_OK - Nothing worth saving from this session",
+            "Memory Flush",
+            project_key,
+            cwd,
         )
     elif "FLUSH_ERROR" in response:
         logging.error("Result: %s", response)
-        append_to_daily_log(response, "Memory Flush")
+        append_to_daily_log(response, "Memory Flush", project_key, cwd)
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
-        append_to_daily_log(response, "Session")
+        append_to_daily_log(response, "Session", project_key, cwd)
 
     # Update dedup state
     save_flush_state({"session_id": session_id, "timestamp": time.time()})

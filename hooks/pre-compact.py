@@ -105,8 +105,10 @@ def main() -> None:
 
     session_id = hook_input.get("session_id", "unknown")
     transcript_path_str = hook_input.get("transcript_path", "")
+    cwd_str = hook_input.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_key = Path(cwd_str).name or "unknown"
 
-    logging.info("PreCompact fired: session=%s", session_id)
+    logging.info("PreCompact fired: session=%s project=%s", session_id, project_key)
 
     # transcript_path can be empty (known Claude Code bug #13668)
     if not transcript_path_str or not isinstance(transcript_path_str, str):
@@ -150,6 +152,8 @@ def main() -> None:
         str(flush_script),
         str(context_file),
         session_id,
+        project_key,
+        cwd_str,
     ]
 
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0

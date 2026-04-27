@@ -37,7 +37,10 @@ Each file follows this format:
 
 ## Sessions
 
-### Session (HH:MM) - Brief Title
+### Session [project-key] (HH:MM) - Brief Title
+
+**Project:** project-key
+**CWD:** /full/path/to/working/directory
 
 **Context:** What the user was working on.
 
@@ -58,6 +61,11 @@ Each file follows this format:
 - [ ] Follow up on X
 - [ ] Refactor Y when time permits
 ```
+
+The `project-key` is the basename of the session's working directory (e.g. `main`,
+`claude-memory-compiler`, `Po`). It is captured automatically by the SessionEnd /
+PreCompact hooks from the `cwd` field of the hook input. Use `unknown` if the
+hook could not determine the cwd, and `global` for project-agnostic content.
 
 ### Layer 2: `knowledge/` - Compiled Knowledge (LLM-Owned)
 
@@ -89,11 +97,17 @@ Format:
 ```markdown
 # Knowledge Base Index
 
-| Article | Summary | Compiled From | Updated |
-|---------|---------|---------------|---------|
-| [[concepts/supabase-auth]] | Row-level security patterns and JWT gotchas | daily/2026-04-02.md | 2026-04-02 |
-| [[connections/auth-and-webhooks]] | Token verification patterns shared across Supabase auth and Stripe webhooks | daily/2026-04-02.md, daily/2026-04-04.md | 2026-04-04 |
+| Article | Project | Summary | Compiled From | Updated |
+|---------|---------|---------|---------------|---------|
+| [[concepts/supabase-auth]] | my-app | Row-level security patterns and JWT gotchas | daily/2026-04-02.md | 2026-04-02 |
+| [[connections/auth-and-webhooks]] | my-app, payments-svc | Token verification patterns shared across Supabase auth and Stripe webhooks | daily/2026-04-02.md, daily/2026-04-04.md | 2026-04-04 |
+| [[concepts/python-uv-basics]] | global | Using uv for Python dependency management | daily/2026-04-03.md | 2026-04-03 |
 ```
+
+The Project column lists the project-keys from the originating sessions. Use a
+comma-separated list when an article spans multiple projects, and `global` for
+project-agnostic content. Articles compiled before this column existed will
+have Project = `unknown` until they are recompiled or backfilled.
 
 ### `knowledge/log.md` - Build Log
 
@@ -127,6 +141,7 @@ One article per atomic piece of knowledge. These are facts, patterns, decisions,
 title: "Concept Name"
 aliases: [alternate-name, abbreviation]
 tags: [domain, topic]
+project: my-app          # single project-key, or list e.g. [my-app, payments-svc], or `global`
 sources:
   - "daily/2026-04-01.md"
   - "daily/2026-04-03.md"
@@ -166,6 +181,7 @@ title: "Connection: X and Y"
 connects:
   - "concepts/concept-x"
   - "concepts/concept-y"
+project: [my-app, payments-svc]   # list when the connection spans projects (the common case)
 sources:
   - "daily/2026-04-04.md"
 created: 2026-04-04

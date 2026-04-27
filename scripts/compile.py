@@ -89,24 +89,54 @@ and extract knowledge into structured wiki articles.
 
 Read the daily log above and compile it into wiki articles following the schema exactly.
 
+### Project metadata (IMPORTANT)
+
+Each session entry in the daily log begins with metadata lines like:
+
+```
+### Session [<project-key>] (HH:MM)
+
+**Project:** <project-key>
+**CWD:** /full/path/to/repo
+```
+
+This is the canonical scope for everything extracted from that session. When you
+create or update articles, you MUST:
+
+1. Set `project:` in the article frontmatter to the project-key from that session.
+   - For concepts that legitimately span multiple projects, use a YAML list:
+     `project: [main, ask-orchestrator]`
+   - For project-agnostic / general knowledge, use: `project: global`
+2. When updating an existing article with content from a new project, ADD that
+   project to the existing list rather than overwriting.
+3. In `knowledge/index.md`, every row must include the Project column.
+
 ### Rules:
 
 1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
 2. **Create concept articles** in `knowledge/concepts/` - One .md file per concept
    - Use the exact article format from AGENTS.md (YAML frontmatter + sections)
    - Include `sources:` in frontmatter pointing to the daily log file
+   - Include `project:` in frontmatter (see "Project metadata" above)
    - Use `[[concepts/slug]]` wikilinks to link to related concepts
    - Write in encyclopedia style - neutral, comprehensive
 3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
    relationships between 2+ existing concepts
+   - Connection articles also require `project:` in frontmatter (use a list if the
+     connection spans projects, which is common for connections)
 4. **Update existing articles** if this log adds new information to concepts already in the wiki
    - Read the existing article, add the new information, add the source to frontmatter
+   - Merge `project:` values (add new project to the list if not already present)
 5. **Update knowledge/index.md** - Add new entries to the table
-   - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
+   - Format: `| [[path/slug]] | <project> | One-line summary | source-file | {timestamp[:10]} |`
+   - Columns: Article | Project | Summary | Compiled From | Updated
+   - If the index file does not yet have a Project column, add it (preserving prior rows
+     by setting their Project to `unknown` so they can be backfilled later)
 6. **Append to knowledge/log.md** - Add a timestamped entry:
    ```
    ## [{timestamp}] compile | {log_path.name}
    - Source: daily/{log_path.name}
+   - Projects touched: <comma-separated project keys seen in this log>
    - Articles created: [[concepts/x]], [[concepts/y]]
    - Articles updated: [[concepts/z]] (if any)
    ```
