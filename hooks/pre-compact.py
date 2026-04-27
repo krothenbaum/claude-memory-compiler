@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +39,34 @@ logging.basicConfig(
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 5
+
+# Dedup guard: prevents the hook doing duplicate work when both project-local
+# and user-global settings.json have it configured.
+HOOK_DEDUP_WINDOW_SECONDS = 10
+HOOK_DEDUP_FILE = SCRIPTS_DIR / "last-hook-fire.json"
+
+
+def already_fired(session_id: str, event: str) -> bool:
+    """Returns True if this (session_id, event) was handled within the dedup window."""
+    try:
+        data = json.loads(HOOK_DEDUP_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+
+    key = f"{session_id}:{event}"
+    now = time.time()
+    last = data.get(key, 0)
+    if now - last < HOOK_DEDUP_WINDOW_SECONDS:
+        return True
+
+    data[key] = now
+    cutoff = now - 3600
+    data = {k: v for k, v in data.items() if v > cutoff}
+    try:
+        HOOK_DEDUP_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+    return False
 
 
 def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
@@ -109,6 +138,10 @@ def main() -> None:
     project_key = Path(cwd_str).name or "unknown"
 
     logging.info("PreCompact fired: session=%s project=%s", session_id, project_key)
+
+    if already_fired(session_id, "pre-compact"):
+        logging.info("SKIP: duplicate hook fire for session %s (project+global both configured)", session_id)
+        return
 
     # transcript_path can be empty (known Claude Code bug #13668)
     if not transcript_path_str or not isinstance(transcript_path_str, str):
