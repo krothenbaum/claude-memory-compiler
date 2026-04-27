@@ -5,6 +5,10 @@ This is the "context injection" layer. When Claude Code starts a session,
 this hook reads the knowledge base index and recent daily log, then injects
 them as additional context so Claude always "remembers" what it has learned.
 
+The injection is scoped to the current project (basename of the session's
+working directory) so each session only sees knowledge relevant to the repo
+it was opened in, plus anything tagged `global`.
+
 Configure in .claude/settings.json:
 {
     "hooks": {
@@ -17,6 +21,7 @@ Configure in .claude/settings.json:
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,47 +33,148 @@ DAILY_DIR = ROOT / "daily"
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 
 MAX_CONTEXT_CHARS = 20_000
-MAX_LOG_LINES = 30
+MAX_LOG_LINES = 60
 
 
-def get_recent_log() -> str:
-    """Read the most recent daily log (today or yesterday)."""
+def get_project_key() -> str:
+    """Detect the current project from the session's working directory."""
+    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    return Path(cwd).name or "unknown"
+
+
+def _split_md_row(line: str) -> list[str]:
+    """Split a markdown table row into trimmed cell strings."""
+    parts = line.split("|")
+    if parts and parts[0] == "":
+        parts = parts[1:]
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return [p.strip() for p in parts]
+
+
+def _row_matches_project(project_cell: str, project_key: str) -> bool:
+    """Match a row's Project column value against the current project_key."""
+    cleaned = project_cell.strip().strip("[]")
+    projects = [p.strip().strip("'\"") for p in cleaned.split(",") if p.strip()]
+    return project_key in projects or "global" in projects
+
+
+def filter_index(index_content: str, project_key: str) -> str:
+    """Keep header/separator rows plus rows where the Project column matches.
+
+    Falls back to the unfiltered index if no Project column exists (legacy index).
+    """
+    lines = index_content.splitlines()
+
+    header_idx = None
+    project_col = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("|"):
+            cells = _split_md_row(line)
+            if "Project" in cells:
+                project_col = cells.index("Project")
+                header_idx = i
+                break
+
+    if project_col is None:
+        return index_content
+
+    out_lines: list[str] = []
+    kept_data_rows = 0
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("|"):
+            out_lines.append(line)
+            continue
+
+        # Always keep header and the separator row immediately after it
+        if i == header_idx or i == header_idx + 1:
+            out_lines.append(line)
+            continue
+
+        cells = _split_md_row(line)
+        if project_col >= len(cells):
+            continue
+        if _row_matches_project(cells[project_col], project_key):
+            out_lines.append(line)
+            kept_data_rows += 1
+
+    if kept_data_rows == 0:
+        out_lines.append("")
+        out_lines.append(f"_(no articles tagged with project `{project_key}` or `global` yet)_")
+
+    return "\n".join(out_lines)
+
+
+def filter_daily_log(log_content: str, project_key: str) -> str:
+    """Keep session entries matching project_key (or 'global', or untagged legacy entries)."""
+    parts = log_content.split("\n### ")
+    if len(parts) <= 1:
+        return log_content
+
+    head = parts[0]
+    sessions = parts[1:]
+
+    project_prefix = "**Project:**"
+    kept: list[str] = []
+    for block in sessions:
+        proj = None
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(project_prefix):
+                proj = stripped[len(project_prefix):].strip()
+                break
+
+        if proj is None:
+            # Legacy entry without project metadata — include it
+            kept.append(block)
+        elif proj == project_key or proj == "global":
+            kept.append(block)
+
+    if not kept:
+        return f"{head}\n\n_(no recent sessions for project `{project_key}`)_"
+
+    return head + "\n### " + "\n### ".join(kept)
+
+
+def get_recent_log(project_key: str) -> str:
+    """Read the most recent daily log (today or yesterday), filtered by project."""
     today = datetime.now(timezone.utc).astimezone()
 
     for offset in range(2):
         date = today - timedelta(days=offset)
         log_path = DAILY_DIR / f"{date.strftime('%Y-%m-%d')}.md"
         if log_path.exists():
-            lines = log_path.read_text(encoding="utf-8").splitlines()
-            # Return last N lines to keep context small
+            content = log_path.read_text(encoding="utf-8")
+            filtered = filter_daily_log(content, project_key)
+            lines = filtered.splitlines()
             recent = lines[-MAX_LOG_LINES:] if len(lines) > MAX_LOG_LINES else lines
             return "\n".join(recent)
 
     return "(no recent daily log)"
 
 
-def build_context() -> str:
-    """Assemble the context to inject into the conversation."""
+def build_context(project_key: str) -> str:
+    """Assemble the project-scoped context to inject into the conversation."""
     parts = []
 
-    # Today's date
     today = datetime.now(timezone.utc).astimezone()
-    parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
+    parts.append(
+        f"## Today\n{today.strftime('%A, %B %d, %Y')}\n\n**Project:** {project_key}"
+    )
 
-    # Knowledge base index (the core retrieval mechanism)
     if INDEX_FILE.exists():
         index_content = INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Knowledge Base Index\n\n{index_content}")
+        filtered_index = filter_index(index_content, project_key)
+        parts.append(f"## Knowledge Base Index (scoped to `{project_key}` + `global`)\n\n{filtered_index}")
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
 
-    # Recent daily log
-    recent_log = get_recent_log()
-    parts.append(f"## Recent Daily Log\n\n{recent_log}")
+    recent_log = get_recent_log(project_key)
+    parts.append(f"## Recent Daily Log (scoped to `{project_key}`)\n\n{recent_log}")
 
     context = "\n\n---\n\n".join(parts)
 
-    # Truncate if too long
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[:MAX_CONTEXT_CHARS] + "\n\n...(truncated)"
 
@@ -76,7 +182,8 @@ def build_context() -> str:
 
 
 def main():
-    context = build_context()
+    project_key = get_project_key()
+    context = build_context(project_key)
 
     output = {
         "hookSpecificOutput": {
