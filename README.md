@@ -64,7 +64,28 @@ uv run python scripts/query.py "question"            # ask the knowledge base
 uv run python scripts/query.py "question" --file-back # ask + save answer back
 uv run python scripts/lint.py                        # run health checks
 uv run python scripts/lint.py --structural-only      # free structural checks only
+uv run python scripts/batch-flush.py --dry-run       # seed KB from past transcripts
 ```
+
+## Seeding the Knowledge Base from Past Conversations
+
+If you've already been using Claude Code on a project for a while, `batch-flush.py` extracts knowledge from your existing JSONL transcripts (under `~/.claude/projects/<project>/`) so the KB starts with real context instead of empty. It parses every transcript, chunks large sessions at user-message boundaries (not just the last 30 turns like the live hook), runs LLM extraction on each chunk, and writes everything into dated daily logs ready for `compile.py`.
+
+```bash
+uv run python scripts/batch-flush.py --dry-run            # preview — shows sessions, chunks, est. cost
+uv run python scripts/batch-flush.py                       # run full extraction
+uv run python scripts/batch-flush.py --max-cost 5.00       # stop after $5 spent
+uv run python scripts/batch-flush.py --dates 2026-04-11    # only specific dates
+uv run python scripts/batch-flush.py --resume              # skip sessions already processed
+uv run python scripts/batch-flush.py --compile             # extract + trigger compile
+uv run python scripts/batch-flush.py --all-projects --dry-run  # preview every project on this machine
+```
+
+**Single project (default):** auto-discovers the transcripts directory from `cwd`; override with `--transcripts-dir`. Daily-log entries are tagged with the project key (defaults to `Path.cwd().name`, matching the live hook); override with `--project-key` and `--project-cwd` when seeding from a directory other than the project itself.
+
+**All projects (`--all-projects`):** walks `~/.claude/projects/*` and seeds every project in one pass. Each project's daily-log entries are tagged with that project's basename (decoded from Claude Code's `/`→`-` path encoding via filesystem-existence checks, so dashed names like `claude-memory-compiler` round-trip correctly). Honors `--max-cost` as a global budget across all projects and stops cleanly when the cap is hit.
+
+State (`state.json`) is shared across modes — `--resume` skips sessions already processed by any prior invocation, so single-project runs and `--all-projects` runs are interchangeable.
 
 ## Why No RAG?
 
