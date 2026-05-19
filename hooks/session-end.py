@@ -196,16 +196,68 @@ def main() -> None:
     # Do NOT use DETACHED_PROCESS — it breaks the Agent SDK's subprocess I/O.
     creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+    # Resolve the user's terminal TTY NOW — while `claude` is still alive —
+    # and pass it to the detached flush.py via env var. Once claude exits,
+    # flush.py is reparented to launchd and loses the ancestry path back to
+    # the real terminal device.
+    env = os.environ.copy()
+    tty_path = _resolve_user_tty()
+    if tty_path:
+        env["CLAUDE_MEMORY_TTY"] = tty_path
+        logging.info("Resolved user TTY: %s", tty_path)
+    else:
+        logging.info("No user TTY resolved (notifications will silently no-op)")
+
     try:
         subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
+            env=env,
         )
         logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
     except Exception as e:
         logging.error("Failed to spawn flush.py: %s", e)
+
+
+def _resolve_user_tty() -> str | None:
+    """Walk ancestors to find a process attached to the user's real terminal.
+
+    The hook itself has TTY=?? (Claude Code spawns hooks without a TTY), but
+    the parent `claude` CLI does own the user's terminal. This must run
+    BEFORE `claude` exits — once flush.py is detached, the PPID chain
+    collapses to launchd and the TTY is unrecoverable.
+    """
+    pid = os.getpid()
+    for _ in range(10):
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid=,tty="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split()
+        if len(parts) < 2:
+            return None
+        try:
+            ppid = int(parts[0])
+        except ValueError:
+            return None
+        tty = parts[1]
+        if tty and tty != "??":
+            candidate = tty if tty.startswith("/") else f"/dev/{tty}"
+            if os.path.exists(candidate):
+                return candidate
+        if ppid in (0, 1) or ppid == pid:
+            return None
+        pid = ppid
+    return None
 
 
 if __name__ == "__main__":

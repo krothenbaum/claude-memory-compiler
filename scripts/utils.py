@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 from config import (
@@ -15,6 +17,116 @@ from config import (
     QA_DIR,
     STATE_FILE,
 )
+
+
+# ── Terminal notifications ────────────────────────────────────────────
+#
+# flush.py and compile.py run as detached subprocesses (stdout/stderr piped to
+# files or DEVNULL), so the user never sees them. notify_terminal writes a
+# short line to the controlling TTY device so progress is visible from the
+# shell that originally launched `claude`.
+
+_TTY_PATH_UNSET = object()
+_TTY_PATH_CACHE: object = _TTY_PATH_UNSET  # str | None once resolved
+
+
+def _resolve_tty_path() -> str | None:
+    """Cached lookup of the controlling-terminal device path.
+
+    Falls back to walking the process ancestry when no controlling TTY is
+    attached directly. Claude Code spawns hook subprocesses without a TTY
+    (`TTY=??`), but their `claude` ancestor still owns the user's real
+    terminal, so we crawl PPIDs until we find one with a real TTY column.
+    """
+    global _TTY_PATH_CACHE
+    if _TTY_PATH_CACHE is not _TTY_PATH_UNSET:
+        return _TTY_PATH_CACHE  # type: ignore[return-value]
+
+    env_path = os.environ.get("CLAUDE_MEMORY_TTY")
+    if env_path and os.path.exists(env_path):
+        _TTY_PATH_CACHE = env_path
+        return env_path
+
+    # Try the direct /dev/tty path first (works in foreground or when a
+    # controlling terminal is attached).
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+    except OSError:
+        fd = None
+    if fd is not None:
+        try:
+            path = os.ttyname(fd)
+        except OSError:
+            path = None
+        finally:
+            os.close(fd)
+        if path:
+            _TTY_PATH_CACHE = path
+            return path
+
+    # No controlling TTY on this process. Walk ancestry — when launched as a
+    # Claude Code hook, the `claude` CLI itself owns the user's TTY.
+    path = _walk_ancestors_for_tty()
+    _TTY_PATH_CACHE = path
+    return path
+
+
+def _walk_ancestors_for_tty(max_hops: int = 10) -> str | None:
+    """Walk PPIDs upward and return the first real TTY device path found."""
+    import subprocess as _sp
+
+    pid = os.getpid()
+    for _ in range(max_hops):
+        try:
+            result = _sp.run(
+                ["ps", "-p", str(pid), "-o", "ppid=,tty="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (FileNotFoundError, _sp.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.strip().split()
+        if len(parts) < 2:
+            return None
+        try:
+            ppid = int(parts[0])
+        except ValueError:
+            return None
+        tty = parts[1]
+        # `??` means no controlling terminal; keep walking.
+        if tty and tty != "??":
+            candidate = tty if tty.startswith("/") else f"/dev/{tty}"
+            if os.path.exists(candidate):
+                return candidate
+        if ppid in (0, 1) or ppid == pid:
+            return None
+        pid = ppid
+    return None
+
+
+def notify_terminal(msg: str) -> None:
+    """Write a `[memory] msg` line to the user's terminal.
+
+    No-op when stdout already targets a TTY (foreground run — would
+    duplicate) or when no controlling terminal is reachable.
+    """
+    try:
+        if sys.stdout.isatty():
+            return
+    except (AttributeError, ValueError):
+        pass
+    path = _resolve_tty_path()
+    if not path:
+        return
+    try:
+        with open(path, "w") as tty:
+            tty.write(f"[memory] {msg}\n")
+            tty.flush()
+    except OSError:
+        pass
 
 
 # ── State management ──────────────────────────────────────────────────

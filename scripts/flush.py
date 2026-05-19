@@ -29,6 +29,9 @@ SCRIPTS_DIR = ROOT / "scripts"
 STATE_FILE = SCRIPTS_DIR / "last-flush.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
+sys.path.insert(0, str(SCRIPTS_DIR))
+from utils import notify_terminal, _resolve_tty_path  # noqa: E402
+
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
 # file handle bug on Windows), so this is our only observability channel.
@@ -161,34 +164,94 @@ respond with exactly: FLUSH_OK
     return response
 
 
-COMPILE_AFTER_HOUR = 18  # 6 PM local time
+COMPILE_AFTER_HOUR = 16  # 4 PM local time
+
+
+def count_claude_instances() -> int:
+    """Count running Claude Code CLI processes, excluding the bundled `claude`
+    binary that flush.py itself spawns via the Agent SDK.
+
+    Concurrent flush.py runs each launch
+    `.venv/.../claude_agent_sdk/_bundled/claude` as a child during the LLM
+    call. `pgrep -x claude` cannot distinguish that from a real Claude Code
+    session — and on macOS `pgrep -a` does not emit the full command line —
+    so we shell out to `ps` and inspect each process's argv for the bundled
+    path.
+
+    Returns -1 if `ps` is unavailable or fails (caller should treat as
+    unknown and skip, to avoid running compile while other sessions are
+    still active).
+    """
+    import subprocess as _sp
+
+    try:
+        result = _sp.run(
+            ["ps", "-A", "-o", "pid=,comm=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, _sp.TimeoutExpired, OSError):
+        return -1
+    if result.returncode != 0:
+        return -1
+
+    count = 0
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        comm = parts[1]
+        args = parts[2] if len(parts) > 2 else ""
+        if comm.rsplit("/", 1)[-1] != "claude":
+            continue
+        if "claude_agent_sdk/_bundled" in args:
+            continue
+        count += 1
+    return count
 
 
 def maybe_trigger_compilation() -> None:
-    """If it's past the compile hour and today's log hasn't been compiled, run compile.py."""
+    """If it's past the compile hour, no other Claude instances are open, and
+    today's log hasn't been compiled, run compile.py."""
     import subprocess as _sp
 
     now = datetime.now(timezone.utc).astimezone()
     if now.hour < COMPILE_AFTER_HOUR:
         return
 
-    # Check if today's log has already been compiled
+    # Only compile when no Claude Code instances are still open. flush.py is a
+    # detached background subprocess, so the session that triggered it has
+    # typically exited by now; any remaining `claude` processes are other
+    # active sessions we should not interrupt.
+    instances = count_claude_instances()
+    if instances != 0:
+        if instances < 0:
+            logging.info("Skipping compile: pgrep unavailable, cannot verify no Claude instances open")
+        else:
+            logging.info("Skipping compile: %d Claude instance(s) still open", instances)
+        return
+
+    # Skip if today's log has no unprocessed content past its last
+    # `@compiled-through` marker. This is the source of truth — state.json
+    # hash is incidental. Lets us auto-fire any number of times per day,
+    # processing only the new sessions each time.
     today_log = f"{now.strftime('%Y-%m-%d')}.md"
-    compile_state_file = SCRIPTS_DIR / "state.json"
-    if compile_state_file.exists():
+    log_path = DAILY_DIR / today_log
+    if log_path.exists():
         try:
-            compile_state = json.loads(compile_state_file.read_text(encoding="utf-8"))
-            ingested = compile_state.get("ingested", {})
-            if today_log in ingested:
-                # Already compiled today - check if the log has changed since
-                from hashlib import sha256
-                log_path = DAILY_DIR / today_log
-                if log_path.exists():
-                    current_hash = sha256(log_path.read_bytes()).hexdigest()[:16]
-                    if ingested[today_log].get("hash") == current_hash:
-                        return  # log unchanged since last compile
-        except (json.JSONDecodeError, OSError):
-            pass
+            content = log_path.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        if content:
+            # Inline regex to avoid importing compile.py (which loads the Agent SDK).
+            import re as _re
+            marker_re = _re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
+            last_end = 0
+            for m in marker_re.finditer(content):
+                last_end = m.end()
+            if not content[last_end:].strip():
+                return  # nothing new since the last compile marker
 
     compile_script = SCRIPTS_DIR / "compile.py"
     if not compile_script.exists():
@@ -204,9 +267,25 @@ def maybe_trigger_compilation() -> None:
     else:
         kwargs["start_new_session"] = True
 
+    # Hand the controlling-TTY path to the detached compile.py subprocess so
+    # it can write progress messages even though `start_new_session=True`
+    # severs /dev/tty access.
+    env = os.environ.copy()
+    tty_path = _resolve_tty_path()
+    if tty_path:
+        env["CLAUDE_MEMORY_TTY"] = tty_path
+
     try:
         log_handle = open(str(SCRIPTS_DIR / "compile.log"), "a")
-        _sp.Popen(cmd, stdout=log_handle, stderr=_sp.STDOUT, cwd=str(ROOT), **kwargs)
+        _sp.Popen(
+            cmd,
+            stdout=log_handle,
+            stderr=_sp.STDOUT,
+            cwd=str(ROOT),
+            env=env,
+            **kwargs,
+        )
+        notify_terminal("end-of-day compile triggered")
     except Exception as e:
         logging.error("Failed to spawn compile.py: %s", e)
 
@@ -253,6 +332,7 @@ def main():
         return
 
     logging.info("Flushing session %s: %d chars", session_id, len(context))
+    notify_terminal(f"flush started — project={project_key} ({len(context)} chars)")
 
     # Run the LLM extraction
     response = asyncio.run(run_flush(context, project_key, cwd))
@@ -266,18 +346,23 @@ def main():
             project_key,
             cwd,
         )
+        result_summary = "FLUSH_OK (nothing worth saving)"
     elif "FLUSH_ERROR" in response:
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush", project_key, cwd)
+        result_summary = "FLUSH_ERROR (see flush.log)"
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session", project_key, cwd)
+        result_summary = f"saved {len(response)} chars to daily log"
 
     # Update dedup state
     save_flush_state({"session_id": session_id, "timestamp": time.time()})
 
     # Clean up context file
     context_file.unlink(missing_ok=True)
+
+    notify_terminal(f"flush complete — {result_summary}")
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.

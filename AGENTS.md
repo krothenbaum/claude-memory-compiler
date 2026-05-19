@@ -392,7 +392,7 @@ This ensures flush.py survives after Claude Code's hook process exits.
 5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
 6. Appends result to `daily/YYYY-MM-DD.md`
 7. Cleans up temp context file
-8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger.
+8. **End-of-day auto-compilation:** If it's past 4 PM local time (`COMPILE_AFTER_HOUR = 16`), no other Claude Code instances are running (`pgrep -x claude` returns 0 — flush.py is a detached subprocess so it does not count itself), and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. The pgrep gate means PreCompact-triggered flushes (current session continues) never run compile, and SessionEnd flushes only run compile when this was the last open session — compilation never competes with an active session. If `pgrep` is unavailable (non-Unix) the gate fails closed and skips compile; users can still run `uv run python scripts/compile.py` manually.
 
 ### JSONL Transcript Format
 
