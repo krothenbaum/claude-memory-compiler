@@ -7,7 +7,11 @@ asks an LLM to confirm and write only genuine connections.
 
 from __future__ import annotations
 
+import math
 import re
+from collections import defaultdict
+from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
@@ -53,3 +57,52 @@ def load_existing_pairs(connections_dir: Path) -> set[frozenset[str]]:
             for j in range(i + 1, len(members)):
                 pairs.add(frozenset((members[i], members[j])))
     return pairs
+
+
+@dataclass
+class Candidate:
+    """A candidate connection. Fields `a` and `c` satisfy a < c (lexicographic)."""
+    a: str
+    c: str
+    bridges: list[str]
+    score: float
+
+
+def candidate_pairs(
+    adj: dict[str, set[str]],
+    existing: set[frozenset[str]],
+    *,
+    hub_degree: int = 12,
+    min_bridges: int = 2,
+) -> list[Candidate]:
+    """Generate Swanson 2-hop connection candidates, ranked by bridge rarity.
+
+    A candidate is a pair (a, c) that is NOT directly linked, NOT already
+    connected, and shares at least `min_bridges` common neighbors after dropping
+    bridges and endpoints whose degree exceeds `hub_degree`. Score sums each
+    bridge's rarity (1 / log2(degree + 2)), so links through specific, low-degree
+    concepts rank above links through generic hubs. Sorted descending by score.
+    """
+    deg = {n: len(neighbors) for n, neighbors in adj.items()}
+    shared: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for b, neighbors in adj.items():
+        if deg[b] > hub_degree:
+            continue  # hub bridge: connects everything to everything, low signal
+        for a, c in combinations(sorted(neighbors), 2):
+            if c in adj.get(a, set()):
+                continue  # directly linked -> obvious, not a discovery
+            if frozenset((a, c)) in existing:
+                continue  # already has a connection article
+            shared[(a, c)].append(b)
+
+    candidates: list[Candidate] = []
+    for (a, c), bridges in shared.items():
+        if len(bridges) < min_bridges:
+            continue
+        if deg.get(a, 0) > hub_degree or deg.get(c, 0) > hub_degree:
+            continue  # hub endpoint: too generic to yield a specific connection
+        score = sum(1 / math.log2(deg[b] + 2) for b in bridges)
+        candidates.append(Candidate(a=a, c=c, bridges=sorted(bridges), score=score))
+
+    candidates.sort(key=lambda x: x.score, reverse=True)
+    return candidates
