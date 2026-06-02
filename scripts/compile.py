@@ -157,8 +157,9 @@ daily conversation log and extract knowledge into structured wiki articles.
 
 The full index of existing articles is below. Each row has the article slug and
 a one-line summary. Use the `Read` tool to fetch any article whose content you
-need before updating it. DO NOT read articles unrelated to the new sessions —
-that wastes turns and tokens.
+need before updating it. To keep concept extraction efficient, avoid reading
+unrelated articles while you are extracting concepts. You SHOULD, however, read
+related articles when hunting for connections (see the connection step below).
 
 {wiki_index}
 
@@ -173,14 +174,15 @@ that wastes turns and tokens.
 
 Compile the sessions above into wiki articles following the schema exactly.
 Earlier sessions in this daily log (above the slice you see) have ALREADY been
-compiled in prior runs; the wiki index already reflects them. Focus only on
-extracting new knowledge from the sessions provided here.
+compiled in prior runs; the wiki index already reflects them. Extract new
+knowledge from the sessions provided here, then actively look for how that new
+knowledge connects to the existing graph (see the connection step below).
 
 ### Workflow (efficient)
 
 1. Skim the daily log and identify 1-7 concepts worth extracting.
 2. For each concept, decide create-new vs update-existing by consulting the index above.
-3. ONLY for concepts you're updating: `Read` that specific article before editing.
+3. ONLY for concepts you're updating: `Read` that specific article before editing. (Connection hunting in Rule 3 has its own allowance to read related articles.)
 4. Write/Edit articles, then update `knowledge/index.md` and append to `knowledge/log.md`.
 5. Steps 4 are MANDATORY even for small extractions — index.md and log.md MUST be updated
    before you stop. If only one concept is worth extracting, that is still a complete run
@@ -217,8 +219,13 @@ create or update articles, you MUST:
    - Include `project:` in frontmatter (see "Project metadata" above)
    - Use `[[concepts/slug]]` wikilinks to link to related concepts
    - Write in encyclopedia style - neutral, comprehensive
-3. **Create connection articles** in `knowledge/connections/` if this log reveals non-obvious
-   relationships between 2+ existing concepts
+3. **Create connection articles** in `knowledge/connections/`. This is REQUIRED, not optional,
+   whenever a plausible non-obvious relationship exists. After writing or updating concepts, scan
+   the FULL wiki index above for non-obvious relationships between the concepts you touched and ANY
+   existing concept, including across projects and across time. For each promising pair, `Read` both
+   articles to confirm the relationship, then write a connection article. Prefer cross-project and
+   cross-domain links. Skip relationships that are already obvious from existing wikilinks. If after
+   reading the relationship turns out weak or merely co-occurrence, skip it and do not write an article.
    - Connection articles also require `project:` in frontmatter (use a list if the
      connection spans projects, which is common for connections)
 4. **Update existing articles** if this log adds new information to concepts already in the wiki
