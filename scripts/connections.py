@@ -21,7 +21,7 @@ from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, no
 from utils import notify_terminal, read_wiki_index
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
-CONNECTS_RE = re.compile(r'"concepts/([a-z0-9-]+)"')
+CONNECTS_RE = re.compile(r'''["']concepts/([a-z0-9-]+)["']''')
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_FILE = Path(__file__).resolve().parent / "compile.log"

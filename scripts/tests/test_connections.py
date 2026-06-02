@@ -33,6 +33,21 @@ def test_load_existing_pairs_empty_when_no_connections(kb):
     assert connections.load_existing_pairs(kb["connections"]) == set()
 
 
+def test_load_existing_pairs_handles_single_quoted_slugs(kb):
+    conn = kb["connections"] / "a-and-d.md"
+    conn.write_text(
+        "---\n"
+        'title: "Connection: A and D"\n'
+        "connects:\n"
+        "  - 'concepts/a'\n"
+        "  - 'concepts/d'\n"
+        "---\n\n# Connection: A and D\n",
+        encoding="utf-8",
+    )
+    pairs = connections.load_existing_pairs(kb["connections"])
+    assert frozenset(("a", "d")) in pairs
+
+
 def _pair_set(cands):
     return {frozenset((c.a, c.c)) for c in cands}
 
