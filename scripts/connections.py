@@ -7,12 +7,15 @@ asks an LLM to confirm and write only genuine connections.
 
 from __future__ import annotations
 
+import argparse
 import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
+
+from config import CONCEPTS_DIR, CONNECTIONS_DIR
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
 CONNECTS_RE = re.compile(r'"concepts/([a-z0-9-]+)"')
@@ -106,3 +109,48 @@ def candidate_pairs(
 
     candidates.sort(key=lambda x: x.score, reverse=True)
     return candidates
+
+
+def build_candidates(
+    hub_degree: int = 12, min_bridges: int = 2
+) -> list[Candidate]:
+    """Build ranked candidates from the live knowledge base on disk."""
+    adj = build_graph(CONCEPTS_DIR)
+    existing = load_existing_pairs(CONNECTIONS_DIR)
+    return candidate_pairs(
+        adj, existing, hub_degree=hub_degree, min_bridges=min_bridges
+    )
+
+
+def _print_candidates(cands: list[Candidate], top: int) -> None:
+    print(f"{len(cands)} candidate pairs (showing top {min(top, len(cands))}):\n")
+    for cand in cands[:top]:
+        print(f"[{cand.score:.2f}] {cand.a}  <->  {cand.c}")
+        print(f"        via: {', '.join(cand.bridges)}")
+        print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Swanson 2-hop connection discovery")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print ranked candidates without calling the LLM")
+    parser.add_argument("--top", type=int, default=15,
+                        help="Max candidates to send to the gate (full run) or display (dry-run) (default 15)")
+    parser.add_argument("--hub-degree", type=int, default=12,
+                        help="Bridges/endpoints above this degree are dropped (default 12)")
+    parser.add_argument("--min-bridges", type=int, default=2,
+                        help="Minimum shared bridges required (default 2)")
+    args = parser.parse_args()
+
+    cands = build_candidates(hub_degree=args.hub_degree, min_bridges=args.min_bridges)
+
+    if args.dry_run:
+        _print_candidates(cands, args.top)
+        return
+
+    import asyncio
+    asyncio.run(synthesize_connections(cands[: args.top]))
+
+
+if __name__ == "__main__":
+    main()
