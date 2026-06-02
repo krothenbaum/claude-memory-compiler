@@ -8,17 +8,29 @@ asks an LLM to confirm and write only genuine connections.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import re
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
-from config import CONCEPTS_DIR, CONNECTIONS_DIR
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, now_iso
+from utils import notify_terminal, read_wiki_index
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
 CONNECTS_RE = re.compile(r'"concepts/([a-z0-9-]+)"')
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+LOG_FILE = Path(__file__).resolve().parent / "compile.log"
+
+logger = logging.getLogger("connections")
+logger.setLevel(logging.DEBUG)
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_fh)
 
 
 def build_graph(concepts_dir: Path) -> dict[str, set[str]]:
@@ -128,6 +140,145 @@ def _print_candidates(cands: list[Candidate], top: int) -> None:
         print(f"[{cand.score:.2f}] {cand.a}  <->  {cand.c}")
         print(f"        via: {', '.join(cand.bridges)}")
         print()
+
+
+def _format_candidates(cands: list[Candidate]) -> str:
+    lines = []
+    for i, cand in enumerate(cands, 1):
+        lines.append(
+            f"{i}. [[concepts/{cand.a}]] <-> [[concepts/{cand.c}]]  "
+            f"(shared bridges: {', '.join(cand.bridges)})"
+        )
+    return "\n".join(lines)
+
+
+async def synthesize_connections(cands: list[Candidate]) -> float:
+    """Ask the LLM to confirm and write only genuine connections.
+
+    Returns the API cost. The model is instructed to be conservative: write a
+    connection article only when a specific, non-obvious, reusable insight links
+    the pair, and to reject co-occurrence-only pairs with a one-line reason.
+
+    The caller is responsible for bounding `cands` (main passes cands[:top]).
+    """
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        query,
+    )
+
+    if not cands:
+        print("No candidates to synthesize.")
+        return 0.0
+
+    schema = AGENTS_FILE.read_text(encoding="utf-8")
+    wiki_index = read_wiki_index()
+    timestamp = now_iso()
+
+    prompt = f"""You are a connection synthesizer for a personal knowledge base.
+Your job is to evaluate candidate relationships between EXISTING concept articles
+and write connection articles ONLY for the genuine, non-obvious ones.
+
+## Schema (AGENTS.md)
+
+{schema}
+
+## Current Wiki Index
+
+{wiki_index}
+
+## Candidate Pairs (Swanson 2-hop bridges, hub-filtered)
+
+Each pair below was found because the two concepts are not directly linked but
+share specific intermediate concepts (bridges). A shared bridge is a HINT, not
+proof. Many candidates are mere co-occurrence (concepts that appeared in the same
+line of work but share no transferable idea).
+
+{_format_candidates(cands)}
+
+## Your Task
+
+For EACH candidate pair:
+1. `Read` both concept articles (and a bridge if helpful) to understand them.
+2. Decide: is there a SPECIFIC, NON-OBVIOUS, REUSABLE insight that links them?
+   - YES: write a connection article in `knowledge/connections/` using the exact
+     Connection Article format from the schema (frontmatter with `title`,
+     `connects:` listing both `concepts/<slug>`, `project:` as a YAML block list
+     (e.g. `project:` on its own line then `  - <project-slug>` lines), `sources:`,
+     `created`/`updated` set to {timestamp[:10]}; body sections: The Connection,
+     Key Insight, Evidence, Related Concepts with [[wikilinks]]).
+   - NO: do not write anything; record a one-line rejection reason instead.
+
+Be conservative. When in doubt, REJECT. A co-occurrence within one project or
+initiative is NOT a connection. Only write when the relationship would teach a
+reader something they could not get from either article alone.
+
+### Mandatory bookkeeping before you stop:
+- For every connection article you create, add a row to `knowledge/index.md`
+  (Article | Project | Summary | Compiled From | Updated).
+- Append ONE entry to `knowledge/log.md`:
+  ```
+  ## [{timestamp}] connections | swanson-pass
+  - Candidates evaluated: <n>
+  - Connections created: [[connections/x]], [[connections/y]] (or: none)
+  - Rejected (co-occurrence / too weak): <pair> - <reason>; <pair> - <reason>
+  ```
+  This log entry is REQUIRED even if you create zero connections.
+
+### File paths:
+- Write connection articles to: {CONNECTIONS_DIR}
+- Update index at: {KNOWLEDGE_DIR / 'index.md'}
+- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+"""
+
+    def _on_stderr(line: str) -> None:
+        logger.debug("[cli stderr] %s", line.rstrip())
+
+    log_md_path = KNOWLEDGE_DIR / "log.md"
+    log_md_before = log_md_path.stat().st_size if log_md_path.exists() else 0
+
+    cost = 0.0
+    notify_terminal(f"connections pass started ({len(cands)} candidates)")
+    logger.info("Begin connections pass (%d candidates)", len(cands))
+    try:
+        async for message in query(
+            prompt=prompt,
+            options=ClaudeAgentOptions(
+                cwd=str(ROOT_DIR),
+                system_prompt={"type": "preset", "preset": "claude_code"},
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
+                permission_mode="bypassPermissions",
+                max_turns=80,  # higher than compile.py (60): a pass evaluates many pairs, each needing 2+ Reads
+                stderr=_on_stderr,
+                extra_args={"debug-to-stderr": None},
+                setting_sources=[],
+            ),
+        ):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        pass  # model writes files directly
+            elif isinstance(message, ResultMessage):
+                cost = message.total_cost_usd or 0.0
+                print(f"  Cost: ${cost:.4f}")
+                logger.info("connections pass cost=$%.4f", cost)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"  Error in connections pass: {e}")
+        logger.error("Exception in connections pass: %s\n%s", e, tb)
+        notify_terminal(f"connections pass failed: {e}")
+        return 0.0
+
+    log_md_after = log_md_path.stat().st_size if log_md_path.exists() else 0
+    if log_md_after <= log_md_before:
+        print("  Warning: knowledge/log.md did not grow; the gate may have skipped its required audit entry.")
+        logger.warning("connections pass did not append to log.md (size %d -> %d)", log_md_before, log_md_after)
+        notify_terminal("connections pass: WARNING log.md not updated (audit entry missing)")
+
+    notify_terminal(f"connections pass complete (${cost:.4f})")
+    return cost
 
 
 def main() -> None:
