@@ -73,13 +73,14 @@ def _resolve_root(env: Mapping[str, str]) -> Path:
     if canonical is not None:
         return canonical
     if compatibility is not None:
-        if not getattr(sys, _COMPATIBILITY_WARNING_STATE, False):
+        current_pid = os.getpid()
+        if getattr(sys, _COMPATIBILITY_WARNING_STATE, None) != current_pid:
+            setattr(sys, _COMPATIBILITY_WARNING_STATE, current_pid)
             warnings.warn(
                 "CLAUDE_MEMORY_HOME is deprecated; use AI_MEMORY_HOME instead",
                 DeprecationWarning,
                 stacklevel=3,
             )
-            setattr(sys, _COMPATIBILITY_WARNING_STATE, True)
         return compatibility
     return _REPOSITORY_ROOT
 

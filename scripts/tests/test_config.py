@@ -77,6 +77,42 @@ def test_compatibility_warning_is_shared_across_import_styles(monkeypatch, tmp_p
     assert len(caught) == 1
 
 
+def test_compatibility_warning_is_recorded_before_strict_warning_raises(
+    monkeypatch, tmp_path
+):
+    state_name = config_module._COMPATIBILITY_WARNING_STATE
+    monkeypatch.setattr(sys, state_name, None, raising=False)
+    env = {"CLAUDE_MEMORY_HOME": str(tmp_path)}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        with pytest.raises(DeprecationWarning):
+            load_config(env)
+
+    assert getattr(sys, state_name) == os.getpid()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_config(env)
+    assert caught == []
+
+
+def test_compatibility_warning_is_once_per_pid(monkeypatch, tmp_path):
+    state_name = config_module._COMPATIBILITY_WARNING_STATE
+    previous_pid = 101
+    current_pid = 202
+    monkeypatch.setattr(sys, state_name, previous_pid, raising=False)
+    monkeypatch.setattr(config_module.os, "getpid", lambda: current_pid)
+    env = {"CLAUDE_MEMORY_HOME": str(tmp_path)}
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_config(env)
+        load_config(env)
+
+    assert len(caught) == 1
+    assert getattr(sys, state_name) == current_pid
+
+
 def test_conflicting_home_variables_fail(monkeypatch, tmp_path):
     _clean_environment(monkeypatch)
     monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path / "canonical"))

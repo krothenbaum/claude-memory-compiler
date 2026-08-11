@@ -1,9 +1,25 @@
 """Provider-neutral request and result contracts for memory generation."""
 
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, Protocol
+
+
+if __name__ == "providers":
+    provider_module = sys.modules[__name__]
+    scripts_package = sys.modules.get("scripts")
+    if scripts_package is None:
+        scripts_package = ModuleType("scripts")
+        scripts_package.__path__ = [str(Path(__file__).resolve().parent)]
+        scripts_package.__package__ = "scripts"
+        sys.modules["scripts"] = scripts_package
+    scripts_package.providers = provider_module
+    sys.modules.setdefault("scripts.providers", provider_module)
+elif __name__ == "scripts.providers":
+    sys.modules.setdefault("providers", sys.modules[__name__])
 
 
 class TaskKind(StrEnum):

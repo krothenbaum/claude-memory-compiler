@@ -2,6 +2,8 @@
 
 import importlib
 import inspect
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -98,3 +100,46 @@ def test_package_import_uses_package_task_kind(monkeypatch):
     package_providers = importlib.import_module("scripts.providers")
 
     assert package_config.TaskKind is package_providers.TaskKind
+
+
+@pytest.mark.parametrize(
+    ("first_module", "second_module"),
+    [
+        ("providers", "scripts.providers"),
+        ("scripts.providers", "providers"),
+    ],
+)
+def test_provider_contract_identity_is_stable_across_import_order(
+    first_module, second_module
+):
+    code = f"""
+import importlib
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+sys.path[:] = [path for path in sys.path if Path(path or ".").resolve() != root]
+sys.path.insert(0, str(root / "scripts"))
+if {first_module!r}.startswith("scripts."):
+    sys.path.insert(0, str(root))
+importlib.import_module({first_module!r})
+sys.path.insert(0, str(root))
+importlib.import_module({second_module!r})
+direct = importlib.import_module("providers")
+package = importlib.import_module("scripts.providers")
+scripts = importlib.import_module("scripts")
+assert direct is package
+assert scripts.providers is package
+assert direct.TaskKind is package.TaskKind
+assert direct.TextRequest is package.TextRequest
+assert direct.ProviderResult is package.ProviderResult
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
