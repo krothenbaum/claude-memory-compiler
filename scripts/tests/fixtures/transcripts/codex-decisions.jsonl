@@ -1,0 +1,9 @@
+{"timestamp":"2026-08-10T17:00:00Z","type":"session_meta","payload":{"id":"codex-decisions-session","cwd":"/workspaces/card-app","timestamp":"2026-08-10T17:00:00Z"}}
+{"timestamp":"2026-08-10T17:00:01Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"header\":\"Rollout\",\"question\":\"Which rollout should we use?\",\"options\":[{\"label\":\"Staged rollout\"},{\"label\":\"Immediate rollout\"}]}]}","call_id":"decision-1"}}
+{"timestamp":"2026-08-10T17:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"decision-1","output":"{\"answers\":{\"Rollout\":{\"answers\":[\"Staged rollout\"]}}}"}}
+{"timestamp":"2026-08-10T17:00:03Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{\"task_name\":\"research\"}","call_id":"spawn-1"}}
+{"timestamp":"2026-08-10T17:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn-1","output":"{\"agent_id\":\"agent-123\",\"status\":\"running\"}"}}
+{"timestamp":"2026-08-10T17:00:05Z","type":"response_item","payload":{"type":"function_call","name":"wait_agent","arguments":"{\"ids\":[\"agent-123\"]}","call_id":"wait-1"}}
+{"timestamp":"2026-08-10T17:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"wait-1","output":"{\"status\":{\"agent-123\":{\"completed\":\"SUBAGENT_FINDING: Fabric Avatar is already a rounded square in Encore.\"}}}"}}
+{"timestamp":"2026-08-10T17:00:07Z","type":"response_item","payload":{"type":"function_call","name":"send_message","arguments":"{\"target\":\"agent-123\",\"message\":\"check another detail\"}","call_id":"send-1"}}
+{"timestamp":"2026-08-10T17:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"send-1","output":"ROUTINE_COLLAB_ACK_SHOULD_NOT_APPEAR"}}

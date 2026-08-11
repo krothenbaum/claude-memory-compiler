@@ -29,6 +29,9 @@ ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
 STATE_DIR = SCRIPTS_DIR
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from transcripts import parse_claude_transcript, render_turns
 
 logging.basicConfig(
     filename=str(SCRIPTS_DIR / "flush.log"),
@@ -71,146 +74,22 @@ def already_fired(session_id: str, event: str) -> bool:
     return False
 
 
-# High-signal tools whose input/output carry decisions or findings worth keeping.
-# Everything else (Read, Bash, Grep, Edit, Write, MCP calls, ...) is routine
-# mechanism and stays out of the flushed context.
-SUBAGENT_TOOLS = {"Agent", "Task"}
-MAX_TOOL_RESULT_CHARS = 2000  # cap a single subagent result so it can't dominate
-
-
-def _tool_result_to_text(content) -> str:
-    """A tool_result's content is either a plain string or a list of blocks."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    return ""
-
-
-def _render_ask_question(tool_input) -> str:
-    """Render an AskUserQuestion tool_use input (the questions and their options)."""
-    questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
-    lines = ["[Decision requested]"]
-    for q in questions:
-        if not isinstance(q, dict):
-            continue
-        header = (q.get("header") or "").strip()
-        question = (q.get("question") or "").strip()
-        options = [
-            o.get("label", "")
-            for o in q.get("options", [])
-            if isinstance(o, dict) and o.get("label")
-        ]
-        prefix = f"({header}) " if header else ""
-        line = f"- {prefix}{question}".rstrip()
-        if options:
-            line += " | options: " + ", ".join(options)
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _render_tool_result(tool_name: str, content) -> str:
-    """Render a tool_result only when it carries a decision or a finding."""
-    text = _tool_result_to_text(content).strip()
-    if not text:
-        return ""
-    if tool_name == "AskUserQuestion":
-        return f"[Decision made] {text}"
-    if tool_name in SUBAGENT_TOOLS:
-        # The async-launch acknowledgement is bookkeeping, not a finding; the
-        # real result arrives later as a task-notification text message.
-        if text.startswith("Async agent launched"):
-            return ""
-        if len(text) > MAX_TOOL_RESULT_CHARS:
-            text = text[:MAX_TOOL_RESULT_CHARS] + " …[truncated]"
-        return f"[Subagent result] {text}"
-    return ""
-
-
-def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
-    """Read JSONL transcript and extract the last ~N turns as markdown.
-
-    Keeps plain user/assistant text, plus the high-signal tool activity that
-    carries the actual substance of a session: AskUserQuestion prompts and
-    answers (decisions) and subagent results (findings). Routine tool calls
-    (Read, Bash, Edit, ...) are dropped so they neither leak file dumps into
-    the log nor drown out the signal.
-    """
-    turns: list[str] = []
-    tool_names: dict[str, str] = {}  # tool_use_id -> tool name, to classify results
-
-    with open(transcript_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            msg = entry.get("message", {})
-            if isinstance(msg, dict):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-            else:
-                role = entry.get("role", "")
-                content = entry.get("content", "")
-
-            if role not in ("user", "assistant"):
-                continue
-
-            parts: list[str] = []
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, str):
-                        if block.strip():
-                            parts.append(block)
-                        continue
-                    if not isinstance(block, dict):
-                        continue
-                    btype = block.get("type")
-                    if btype == "text":
-                        text = block.get("text", "")
-                        if text.strip():
-                            parts.append(text)
-                    elif btype == "tool_use":
-                        tool_id = block.get("id")
-                        name = block.get("name", "")
-                        if tool_id:
-                            tool_names[tool_id] = name
-                        if name == "AskUserQuestion":
-                            parts.append(_render_ask_question(block.get("input", {})))
-                    elif btype == "tool_result":
-                        name = tool_names.get(block.get("tool_use_id"), "")
-                        rendered = _render_tool_result(name, block.get("content"))
-                        if rendered:
-                            parts.append(rendered)
-            elif isinstance(content, str):
-                if content.strip():
-                    parts.append(content)
-
-            joined = "\n".join(p for p in parts if p and p.strip())
-            if joined.strip():
-                label = "User" if role == "user" else "Assistant"
-                turns.append(f"**{label}:** {joined.strip()}\n")
-
-    recent = turns[-MAX_TURNS:]
-    context = "\n".join(recent)
-
+def extract_conversation_context(
+    transcript_path: Path, metadata: dict | None = None
+) -> tuple[str, int]:
+    """Normalize a live Claude slice and render it for the flush prompt."""
+    session = parse_claude_transcript(
+        transcript_path,
+        metadata or {},
+        limits={"max_turns": MAX_TURNS},
+    )
+    context = render_turns(session)
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[-MAX_CONTEXT_CHARS:]
         boundary = context.find("\n**")
         if boundary > 0:
             context = context[boundary + 1 :]
-
-    return context, len(recent)
+    return context, len(session.turns)
 
 
 def main() -> None:
@@ -250,7 +129,15 @@ def main() -> None:
 
     # Extract conversation context in the hook (fast, no API calls)
     try:
-        context, turn_count = extract_conversation_context(transcript_path)
+        context, turn_count = extract_conversation_context(
+            transcript_path,
+            {
+                "session_id": session_id,
+                "cwd": cwd_str,
+                "project": project_key,
+                "trigger": "session_end",
+            },
+        )
     except Exception as e:
         logging.error("Context extraction failed: %s", e)
         return

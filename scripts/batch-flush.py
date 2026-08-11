@@ -30,6 +30,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from transcripts import (
+    NormalizedSession,
+    Turn as NormalizedTurn,
+    chunk_session,
+    parse_claude_transcript,
+    render_turns,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
@@ -234,51 +242,15 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
 # ── Conversation extraction ──────────────────────────────────────────────
 
 def extract_full_conversation(transcript_path: Path) -> list[Turn]:
-    """Parse ALL user/assistant text turns from a JSONL transcript."""
-    turns: list[Turn] = []
-    index = 0
-
-    with open(transcript_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            msg = entry.get("message", {})
-            if isinstance(msg, dict):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-            else:
-                role = entry.get("role", "")
-                content = entry.get("content", "")
-
-            if role not in ("user", "assistant"):
-                continue
-
-            # Extract text from content blocks, skip tool_use/tool_result/image blocks
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                text = "\n".join(text_parts)
-            elif isinstance(content, str):
-                text = content
-            else:
-                continue
-
-            text = text.strip()
-            if text:
-                turns.append(Turn(role=role, text=text, index=index))
-                index += 1
-
-    return turns
+    """Normalize ALL Claude turns for historical chunking."""
+    session = parse_claude_transcript(
+        transcript_path,
+        {"session_id": transcript_path.stem, "trigger": "historical"},
+    )
+    return [
+        Turn(role=turn.role, text=turn.text, index=index)
+        for index, turn in enumerate(session.turns)
+    ]
 
 
 def extract_tool_summary(transcript_path: Path, project_cwd: str = "") -> str:
@@ -343,63 +315,36 @@ def extract_tool_summary(transcript_path: Path, project_cwd: str = "") -> str:
 # ── Chunking ─────────────────────────────────────────────────────────────
 
 def chunk_conversation(turns: list[Turn], target_chars: int = CHUNK_TARGET_CHARS) -> list[Chunk]:
-    """Split conversation into chunks at user-message boundaries."""
+    """Delegate user-boundary chunking to the normalized transcript module."""
     if not turns:
         return []
 
-    # Format all turns as markdown
-    formatted = []
-    for t in turns:
-        label = "User" if t.role == "user" else "Assistant"
-        formatted.append((t.index, f"**{label}:** {t.text}\n"))
-
-    # Calculate total text
-    total_chars = sum(len(text) for _, text in formatted)
-
-    # If small enough, single chunk
-    if total_chars <= target_chars * 1.3:
-        text = "\n".join(text for _, text in formatted)
-        return [Chunk(
-            text=text,
-            char_count=len(text),
-            position="full",
-            turn_range=(turns[0].index, turns[-1].index),
-        )]
-
-    # Split into chunks at user-message boundaries
+    normalized = NormalizedSession(
+        agent="claude",
+        session_id="historical",
+        project="unknown",
+        cwd="",
+        timestamp="",
+        trigger="historical",
+        turns=tuple(NormalizedTurn(turn.role, turn.text) for turn in turns),
+        source_path="",
+        source_hash="",
+    )
+    normalized_chunks = chunk_session(normalized, target_chars)
     chunks: list[Chunk] = []
-    current_texts: list[str] = []
-    current_chars = 0
-    chunk_start_idx = turns[0].index
-
-    for i, (turn_idx, text) in enumerate(formatted):
-        # Check if adding this turn exceeds the target and we're at a user boundary
-        is_user_turn = turns[i].role == "user"
-        if current_chars >= target_chars and is_user_turn and current_texts:
-            # Flush current chunk
-            chunk_text = "\n".join(current_texts)
-            chunks.append(Chunk(
-                text=chunk_text,
-                char_count=len(chunk_text),
-                position="",  # assigned later
-                turn_range=(chunk_start_idx, turns[i - 1].index),
-            ))
-            current_texts = []
-            current_chars = 0
-            chunk_start_idx = turn_idx
-
-        current_texts.append(text)
-        current_chars += len(text)
-
-    # Flush remaining
-    if current_texts:
-        chunk_text = "\n".join(current_texts)
-        chunks.append(Chunk(
-            text=chunk_text,
-            char_count=len(chunk_text),
-            position="",
-            turn_range=(chunk_start_idx, turns[-1].index),
-        ))
+    cursor = 0
+    for normalized_chunk in normalized_chunks:
+        chunk_turns = turns[cursor : cursor + len(normalized_chunk.turns)]
+        text = render_turns(normalized_chunk)
+        chunks.append(
+            Chunk(
+                text=text,
+                char_count=len(text),
+                position="",
+                turn_range=(chunk_turns[0].index, chunk_turns[-1].index),
+            )
+        )
+        cursor += len(normalized_chunk.turns)
 
     # Assign position labels
     n = len(chunks)
