@@ -161,6 +161,42 @@ def test_claude_live_limits_keep_recent_complete_turns():
     assert "Decision made" in session.turns[1].text
 
 
+@pytest.mark.parametrize("max_chars", [0, 1, 5, len("**User:** \n")])
+def test_max_chars_drops_turn_when_no_text_can_fit(tmp_path, max_chars):
+    transcript = tmp_path / "one-turn.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"role": "user", "content": "abcdef"}}),
+        encoding="utf-8",
+    )
+
+    session = parse_claude_transcript(
+        transcript, {}, limits={"max_chars": max_chars}
+    )
+
+    assert session.turns == ()
+    assert render_turns(session) == ""
+    assert len(render_turns(session)) <= max_chars
+
+
+@pytest.mark.parametrize(
+    "max_chars", [len("**User:** \n") + 1, len("**User:** \n") + 5, 100]
+)
+def test_max_chars_is_a_hard_rendered_bound_when_text_fits(tmp_path, max_chars):
+    transcript = tmp_path / "one-turn.jsonl"
+    transcript.write_text(
+        json.dumps({"message": {"role": "user", "content": "abcdef"}}),
+        encoding="utf-8",
+    )
+
+    session = parse_claude_transcript(
+        transcript, {}, limits={"max_chars": max_chars}
+    )
+
+    assert session.turns
+    assert all(turn.text for turn in session.turns)
+    assert len(render_turns(session)) <= max_chars
+
+
 def test_codex_parser_keeps_user_and_assistant_text():
     session = parse_codex_transcript(FIXTURES / "codex-basic.jsonl", {})
     assert session.session_id == "codex-basic-session"
@@ -214,8 +250,62 @@ def test_codex_parser_keeps_decisions_and_selected_subagent_findings():
     assert "[Subagent result] SUBAGENT_FINDING" in rendered
     assert "Fabric Avatar is already a rounded square in Encore" in rendered
     assert "agent-123" not in rendered
+    assert "Wait completed" not in rendered
+    assert "PROGRESS_UPDATE_SHOULD_NOT_APPEAR" not in rendered
+    assert "ENCRYPTED_COLLAB_CONTENT_SHOULD_NOT_APPEAR" not in rendered
+    assert "final-turn" not in rendered
     assert "ROUTINE_COLLAB_ACK_SHOULD_NOT_APPEAR" not in rendered
-    assert [turn.kind for turn in session.turns] == ["decision", "subagent_finding"]
+    assert rendered.count("SUBAGENT_FINDING") == 1
+    assert rendered.count("Applied the selected rollout.") == 1
+    assert [turn.kind for turn in session.turns] == [
+        "decision",
+        "subagent_finding",
+        "message",
+    ]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"error": "cancelled"},
+        {"status": "cancelled"},
+        {"message": "No answer was selected."},
+        {"answers": {}},
+        {"answers": {"Rollout": {"answers": []}}},
+        {"answers": {"Rollout": {"answers": [False]}}},
+    ],
+)
+def test_codex_parser_excludes_non_choice_request_user_input_outputs(
+    tmp_path, output
+):
+    transcript = tmp_path / "non-choice.jsonl"
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "request_user_input",
+                "call_id": "choice-1",
+                "arguments": "{}",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "choice-1",
+                "output": json.dumps(output),
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_codex_transcript(transcript, {})
+
+    assert session.turns == ()
+    assert render_turns(session) == ""
 
 
 def test_chunk_session_preserves_turns_and_deterministic_provenance():

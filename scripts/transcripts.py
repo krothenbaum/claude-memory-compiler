@@ -148,7 +148,11 @@ def _limit_value(limits: object, name: str) -> int | None:
         value = limits.get(name)
     else:
         value = getattr(limits, name, None)
-    return value if isinstance(value, int) and value > 0 else None
+    if not isinstance(value, int):
+        return None
+    if value > 0 or (name == "max_chars" and value == 0):
+        return value
+    return None
 
 
 def _render_turn(turn: Turn) -> str:
@@ -165,6 +169,8 @@ def _apply_limits(turns: Sequence[Turn], limits: object) -> tuple[Turn, ...]:
     max_chars = _limit_value(limits, "max_chars")
     if max_chars is None:
         return tuple(limited)
+    if max_chars == 0:
+        return ()
 
     while len(limited) > 1 and len(_render_turns(limited)) > max_chars:
         limited.pop(0)
@@ -174,9 +180,11 @@ def _apply_limits(turns: Sequence[Turn], limits: object) -> tuple[Turn, ...]:
         label = "User" if turn.role == "user" else "Assistant"
         framing_chars = len(f"**{label}:** \n")
         available = max(0, max_chars - framing_chars)
+        if available == 0:
+            return ()
         limited[0] = Turn(
             role=turn.role,
-            text=turn.text[-available:] if available else "",
+            text=turn.text[-available:],
             kind=turn.kind,
             timestamp=turn.timestamp,
         )
@@ -339,22 +347,30 @@ def _answer_text(value: object) -> str:
     return ""
 
 
+def _choice_text(value: object) -> str:
+    if isinstance(value, dict) and "answers" in value:
+        return _choice_text(value["answers"])
+    if isinstance(value, list):
+        choices = [
+            item.strip() for item in value if isinstance(item, str) and item.strip()
+        ]
+        return ", ".join(choices)
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
 def _render_codex_decision(output: object) -> str:
     parsed = _json_value(output)
     if isinstance(parsed, dict) and isinstance(parsed.get("answers"), dict):
         answers = []
         for question, value in parsed["answers"].items():
-            answer = _answer_text(value)
+            answer = _choice_text(value)
             if answer:
                 answers.append(f"{question}: {answer}")
         if answers:
             return "[Decision made] " + "; ".join(answers)
-    text = _tool_result_text(parsed).strip() if isinstance(parsed, list) else str(parsed).strip()
-    if not text or text == "None":
-        return ""
-    if len(text) > MAX_FINDING_CHARS:
-        text = text[:MAX_FINDING_CHARS] + " …[truncated]"
-    return f"[Decision made] {text}"
+    return ""
 
 
 def _completed_finding(value: object) -> str:
@@ -385,6 +401,42 @@ def _completed_finding(value: object) -> str:
         if "<subagent_notification>" in lowered and "completed" in lowered:
             return parsed
     return ""
+
+
+def _codex_agent_message_finding(payload: Mapping[str, object]) -> str:
+    author = _nonempty_string(payload.get("author"))
+    recipient = _nonempty_string(payload.get("recipient"))
+    content = payload.get("content")
+    if not author or not recipient or not isinstance(content, list):
+        return ""
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "input_text":
+            continue
+        text = _nonempty_string(block.get("text"))
+        header, marker, finding = text.partition("\nPayload:\n")
+        if (
+            marker
+            and header.startswith("Message Type: FINAL_ANSWER\n")
+            and f"\nSender: {author}" in header
+            and finding.strip()
+        ):
+            return finding.strip()
+    return ""
+
+
+def _codex_subagent_turn(value: object, timestamp: str | None) -> Turn | None:
+    finding = _completed_finding(value).strip()
+    if not finding:
+        return None
+    if len(finding) > MAX_FINDING_CHARS:
+        finding = finding[:MAX_FINDING_CHARS] + " …[truncated]"
+    return Turn(
+        "assistant",
+        f"[Subagent result] {finding}",
+        "subagent_finding",
+        timestamp,
+    )
 
 
 def parse_codex_transcript(
@@ -430,6 +482,15 @@ def parse_codex_transcript(
             text = "\n".join(part for part in parts if part.strip()).strip()
             if text:
                 turns.append(Turn(role=role, text=text, timestamp=timestamp))
+        elif payload_type == "agent_message":
+            finding = _codex_agent_message_finding(payload)
+            if not finding:
+                continue
+            finding_turn = _codex_subagent_turn(
+                {"completed": finding}, timestamp
+            )
+            if finding_turn is not None:
+                turns.append(finding_turn)
         elif payload_type in {"function_call", "custom_tool_call"}:
             call_id = (
                 _nonempty_string(payload.get("call_id"))
@@ -449,18 +510,9 @@ def parse_codex_transcript(
                 if text:
                     turns.append(Turn("user", text, "decision", timestamp))
             elif tool_name in CODEX_SUBAGENT_RESULT_TOOLS:
-                finding = _completed_finding(output).strip()
-                if finding:
-                    if len(finding) > MAX_FINDING_CHARS:
-                        finding = finding[:MAX_FINDING_CHARS] + " …[truncated]"
-                    turns.append(
-                        Turn(
-                            "assistant",
-                            f"[Subagent result] {finding}",
-                            "subagent_finding",
-                            timestamp,
-                        )
-                    )
+                finding_turn = _codex_subagent_turn(output, timestamp)
+                if finding_turn is not None:
+                    turns.append(finding_turn)
 
     return _make_session(
         agent="codex",
