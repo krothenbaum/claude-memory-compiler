@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Iterator, Literal, Mapping, Sequence
+from typing import Iterable, Iterator, Literal, Mapping, Sequence
 
 
 AgentName = Literal["claude", "codex"]
@@ -160,7 +161,12 @@ def _render_turn(turn: Turn) -> str:
     return f"**{label}:** {turn.text}\n"
 
 
-def _apply_limits(turns: Sequence[Turn], limits: object) -> tuple[Turn, ...]:
+def _turn_accumulator(limits: object) -> list[Turn] | deque[Turn]:
+    max_turns = _limit_value(limits, "max_turns") if limits is not None else None
+    return deque(maxlen=max_turns) if max_turns is not None else []
+
+
+def _apply_limits(turns: Iterable[Turn], limits: object) -> tuple[Turn, ...]:
     limited = list(turns)
     max_turns = _limit_value(limits, "max_turns")
     if max_turns is not None:
@@ -205,17 +211,60 @@ def _tool_result_text(content: object) -> str:
     return "\n".join(parts)
 
 
+def _remember_call(calls: dict[str, str | None], call_id: str, name: str) -> None:
+    if call_id in calls:
+        calls[call_id] = None
+    else:
+        calls[call_id] = name
+
+
+def _duplicate_call_ids(call_ids: Iterable[str]) -> set[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for call_id in call_ids:
+        if call_id in seen:
+            duplicates.add(call_id)
+        else:
+            seen.add(call_id)
+    return duplicates
+
+
+def _claude_call_ids(path: Path) -> Iterator[str]:
+    for record in _read_jsonl(path):
+        message = record.get("message", {})
+        if isinstance(message, dict):
+            role = message.get("role", "")
+            content = message.get("content", "")
+        else:
+            role = record.get("role", "")
+            content = record.get("content", "")
+        if role not in ("user", "assistant") or not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                call_id = _nonempty_string(block.get("id"))
+                if call_id:
+                    yield call_id
+
+
 def _render_ask_question(tool_input: object) -> str:
     questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
-    lines = ["[Decision requested]"]
+    if not isinstance(questions, list):
+        questions = []
+    lines: list[str] = []
     for question_data in questions:
         if not isinstance(question_data, dict):
             continue
         header = _nonempty_string(question_data.get("header")).strip()
         question = _nonempty_string(question_data.get("question")).strip()
+        if not question:
+            continue
+        raw_options = question_data.get("options", [])
+        if not isinstance(raw_options, list):
+            raw_options = []
         options = [
             _nonempty_string(option.get("label"))
-            for option in question_data.get("options", [])
+            for option in raw_options
             if isinstance(option, dict) and _nonempty_string(option.get("label"))
         ]
         prefix = f"({header}) " if header else ""
@@ -223,7 +272,9 @@ def _render_ask_question(tool_input: object) -> str:
         if options:
             line += " | options: " + ", ".join(options)
         lines.append(line)
-    return "\n".join(lines)
+    if not lines:
+        return ""
+    return "\n".join(["[Decision requested]", *lines])
 
 
 def _claude_tool_result(tool_name: str, content: object) -> tuple[str, TurnKind] | None:
@@ -248,11 +299,23 @@ def parse_claude_transcript(
 ) -> NormalizedSession:
     """Normalize Claude JSONL while retaining only durable conversation signal."""
     transcript_path = Path(path)
-    turns: list[Turn] = []
-    tool_names: dict[str, str] = {}
+    turns = _turn_accumulator(limits)
+    tool_names: dict[str, str | None] = {
+        call_id: None
+        for call_id in _duplicate_call_ids(_claude_call_ids(transcript_path))
+    }
+    fallback_session_id = ""
+    fallback_cwd = ""
     fallback_timestamp = ""
 
     for record in _read_jsonl(transcript_path):
+        if not fallback_session_id:
+            fallback_session_id = (
+                _nonempty_string(record.get("sessionId"))
+                or _nonempty_string(record.get("session_id"))
+            )
+        if not fallback_cwd:
+            fallback_cwd = _nonempty_string(record.get("cwd"))
         if not fallback_timestamp:
             fallback_timestamp = _nonempty_string(record.get("timestamp"))
         message = record.get("message", {})
@@ -287,15 +350,21 @@ def parse_claude_transcript(
                     tool_id = _nonempty_string(block.get("id"))
                     tool_name = _nonempty_string(block.get("name"))
                     if tool_id:
-                        tool_names[tool_id] = tool_name
+                        _remember_call(tool_names, tool_id, tool_name)
                     if tool_name == "AskUserQuestion":
-                        parts.append(_render_ask_question(block.get("input", {})))
-                        kind = "decision"
+                        rendered = _render_ask_question(block.get("input", {}))
+                        if rendered:
+                            parts.append(rendered)
+                            kind = "decision"
                 elif block_type == "tool_result":
                     tool_name = tool_names.get(
-                        _nonempty_string(block.get("tool_use_id")), ""
+                        _nonempty_string(block.get("tool_use_id"))
                     )
-                    rendered = _claude_tool_result(tool_name, block.get("content"))
+                    rendered = (
+                        _claude_tool_result(tool_name, block.get("content"))
+                        if tool_name is not None
+                        else None
+                    )
                     if rendered is not None:
                         text, result_kind = rendered
                         parts.append(text)
@@ -317,6 +386,8 @@ def parse_claude_transcript(
         path=transcript_path,
         metadata=metadata,
         turns=_apply_limits(turns, limits) if limits is not None else turns,
+        fallback_session_id=fallback_session_id,
+        fallback_cwd=fallback_cwd,
         fallback_timestamp=fallback_timestamp,
     )
 
@@ -404,10 +475,14 @@ def _completed_finding(value: object) -> str:
 
 
 def _parse_agent_message_header(header: str) -> dict[str, str] | None:
+    expected_names = ("Message Type", "Task name", "Sender")
+    lines = header.split("\n")
+    if len(lines) != len(expected_names):
+        return None
     fields: dict[str, str] = {}
-    for line in header.split("\n"):
+    for line, expected_name in zip(lines, expected_names, strict=True):
         name, separator, value = line.partition(": ")
-        if not separator or not name or name in fields:
+        if not separator or name != expected_name or not value:
             return None
         fields[name] = value
     return fields
@@ -430,6 +505,7 @@ def _codex_agent_message_finding(payload: Mapping[str, object]) -> str:
             marker
             and fields is not None
             and fields.get("Message Type") == "FINAL_ANSWER"
+            and fields.get("Task name") == recipient
             and fields.get("Sender") == author
             and finding.strip()
         ):
@@ -451,6 +527,21 @@ def _codex_subagent_turn(value: object, timestamp: str | None) -> Turn | None:
     )
 
 
+def _codex_call_ids(path: Path) -> Iterator[str]:
+    for record in _read_jsonl(path):
+        payload = record.get("payload", {})
+        if record.get("type") != "response_item" or not isinstance(payload, dict):
+            continue
+        if payload.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        call_id = (
+            _nonempty_string(payload.get("call_id"))
+            or _nonempty_string(payload.get("id"))
+        )
+        if call_id:
+            yield call_id
+
+
 def parse_codex_transcript(
     path: Path | str,
     metadata: Mapping[str, object],
@@ -460,8 +551,11 @@ def parse_codex_transcript(
     transcript_path = Path(path)
     session_meta: dict = {}
     session_meta_timestamp = ""
-    calls: dict[str, str] = {}
-    turns: list[Turn] = []
+    calls: dict[str, str | None] = {
+        call_id: None
+        for call_id in _duplicate_call_ids(_codex_call_ids(transcript_path))
+    }
+    turns = _turn_accumulator(limits)
 
     for record in _read_jsonl(transcript_path):
         record_type = record.get("type")
@@ -509,13 +603,17 @@ def parse_codex_transcript(
                 or _nonempty_string(payload.get("id"))
             )
             if call_id:
-                calls[call_id] = _tool_basename(_nonempty_string(payload.get("name")))
+                _remember_call(
+                    calls,
+                    call_id,
+                    _tool_basename(_nonempty_string(payload.get("name"))),
+                )
         elif payload_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = (
                 _nonempty_string(payload.get("call_id"))
                 or _nonempty_string(payload.get("id"))
             )
-            tool_name = calls.get(call_id, "")
+            tool_name = calls.get(call_id)
             output = payload.get("output", payload.get("content"))
             if tool_name in CODEX_DECISION_TOOLS:
                 text = _render_codex_decision(output)
@@ -546,7 +644,27 @@ def render_turns(session: NormalizedSession) -> str:
     return _render_turns(session.turns)
 
 
-def _session_with_turns(session: NormalizedSession, turns: Sequence[Turn]) -> NormalizedSession:
+def _chunk_hash(
+    parent_source_hash: str, ordinal: int, turn_start: int, turn_end: int
+) -> str:
+    canonical = {
+        "chunk_ordinal": ordinal,
+        "parent_source_hash": parent_source_hash,
+        "turn_end": turn_end,
+        "turn_start": turn_start,
+    }
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _session_with_turns(
+    session: NormalizedSession,
+    turns: Sequence[Turn],
+    *,
+    ordinal: int,
+    turn_start: int,
+    turn_end: int,
+) -> NormalizedSession:
     normalized_turns = tuple(turns)
     return NormalizedSession(
         agent=session.agent,
@@ -557,12 +675,11 @@ def _session_with_turns(session: NormalizedSession, turns: Sequence[Turn]) -> No
         trigger=session.trigger,
         turns=normalized_turns,
         source_path=session.source_path,
-        source_hash=_canonical_hash(
-            agent=session.agent,
-            session_id=session.session_id,
-            project=session.project,
-            cwd=session.cwd,
-            turns=normalized_turns,
+        source_hash=_chunk_hash(
+            session.source_hash,
+            ordinal,
+            turn_start,
+            turn_end,
         ),
     )
 
@@ -578,18 +695,44 @@ def chunk_session(
 
     total_chars = sum(len(_render_turn(turn)) for turn in session.turns)
     if total_chars <= target_chars * 1.3:
-        return [_session_with_turns(session, session.turns)]
+        return [
+            _session_with_turns(
+                session,
+                session.turns,
+                ordinal=0,
+                turn_start=0,
+                turn_end=len(session.turns),
+            )
+        ]
 
     chunks: list[NormalizedSession] = []
     current: list[Turn] = []
     current_chars = 0
-    for turn in session.turns:
+    chunk_start = 0
+    for turn_index, turn in enumerate(session.turns):
         if current and current_chars >= target_chars and turn.role == "user":
-            chunks.append(_session_with_turns(session, current))
+            chunks.append(
+                _session_with_turns(
+                    session,
+                    current,
+                    ordinal=len(chunks),
+                    turn_start=chunk_start,
+                    turn_end=turn_index,
+                )
+            )
             current = []
             current_chars = 0
+            chunk_start = turn_index
         current.append(turn)
         current_chars += len(_render_turn(turn))
     if current:
-        chunks.append(_session_with_turns(session, current))
+        chunks.append(
+            _session_with_turns(
+                session,
+                current,
+                ordinal=len(chunks),
+                turn_start=chunk_start,
+                turn_end=len(session.turns),
+            )
+        )
     return chunks

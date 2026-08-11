@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
 from transcripts import (
     NormalizedSession,
     Turn as NormalizedTurn,
@@ -38,9 +42,7 @@ from transcripts import (
     render_turns,
 )
 
-ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
-SCRIPTS_DIR = ROOT / "scripts"
 STATE_FILE = SCRIPTS_DIR / "state.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 

@@ -6,9 +6,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import weakref
 
 import pytest
+import transcripts as transcripts_module
 
 from transcripts import (
     NormalizedSession,
@@ -118,6 +121,74 @@ def test_timestamp_uses_stable_transcript_value(tmp_path):
     assert first.timestamp == second.timestamp == "2026-08-10T15:00:00Z"
 
 
+def test_claude_embedded_metadata_is_stable_across_renamed_copies(tmp_path):
+    records = [
+        {
+            "sessionId": None,
+            "session_id": 7,
+            "cwd": [],
+            "timestamp": 99,
+            "message": {"role": "user", "content": "Before metadata"},
+        },
+        {
+            "sessionId": "embedded-session",
+            "cwd": "/workspaces/card-app",
+            "timestamp": "2026-08-10T15:00:00Z",
+            "message": {"role": "user", "content": "Embedded metadata"},
+        },
+        {
+            "session_id": "later-conflict",
+            "cwd": "/workspaces/wrong-project",
+            "timestamp": "2026-08-10T16:00:00Z",
+            "message": {"role": "assistant", "content": "Later turn"},
+        },
+    ]
+    serialized = "\n".join(json.dumps(record) for record in records)
+    first_path = tmp_path / "renamed-one.jsonl"
+    second_path = tmp_path / "renamed-two.jsonl"
+    first_path.write_text(serialized, encoding="utf-8")
+    second_path.write_text(serialized, encoding="utf-8")
+
+    first = parse_claude_transcript(first_path, {})
+    second = parse_claude_transcript(second_path, {})
+
+    assert first.session_id == second.session_id == "embedded-session"
+    assert first.cwd == second.cwd == "/workspaces/card-app"
+    assert first.project == second.project == "card-app"
+    assert first.timestamp == second.timestamp == "2026-08-10T15:00:00Z"
+    assert first.source_path != second.source_path
+    assert first.source_hash == second.source_hash
+
+
+def test_claude_caller_metadata_overrides_embedded_metadata(tmp_path):
+    transcript = tmp_path / "embedded.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "sessionId": "embedded-session",
+                "cwd": "/workspaces/embedded",
+                "timestamp": "2026-08-10T15:00:00Z",
+                "message": {"role": "user", "content": "Hello"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session = parse_claude_transcript(
+        transcript,
+        {
+            "session_id": "caller-session",
+            "cwd": "/workspaces/caller",
+            "timestamp": "2026-08-11T15:00:00Z",
+        },
+    )
+
+    assert session.session_id == "caller-session"
+    assert session.cwd == "/workspaces/caller"
+    assert session.project == "caller"
+    assert session.timestamp == "2026-08-11T15:00:00Z"
+
+
 def test_claude_basic_fixture_renders_exact_durable_context():
     session = parse_claude_transcript(
         FIXTURES / "claude-basic.jsonl", CLAUDE_METADATA
@@ -161,6 +232,231 @@ def test_claude_live_limits_keep_recent_complete_turns():
     assert "Decision made" in session.turns[1].text
 
 
+def test_claude_malformed_questions_and_options_do_not_abort_later_turns(tmp_path):
+    transcript = tmp_path / "malformed-questions.jsonl"
+    records = [
+        {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "null-questions",
+                        "name": "AskUserQuestion",
+                        "input": {"questions": None},
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "scalar-questions",
+                        "name": "AskUserQuestion",
+                        "input": {"questions": 7},
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "mixed-questions",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                None,
+                                "bad question",
+                                {
+                                    "question": "Valid without options?",
+                                    "options": None,
+                                },
+                                {"question": "", "options": []},
+                                {
+                                    "question": "Good mixed options?",
+                                    "options": [
+                                        None,
+                                        3,
+                                        {"label": "Yes"},
+                                        {"label": None},
+                                    ],
+                                },
+                            ]
+                        },
+                    }
+                ],
+            }
+        },
+        {"message": {"role": "user", "content": "AFTER_MALFORMED"}},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    try:
+        session = parse_claude_transcript(transcript, {})
+    except (TypeError, AttributeError) as error:
+        pytest.fail(f"malformed question data aborted parsing: {error}")
+
+    rendered = render_turns(session)
+    assert "Valid without options?" in rendered
+    assert "Good mixed options? | options: Yes" in rendered
+    assert "bad question" not in rendered
+    assert "AFTER_MALFORMED" in rendered
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        None,
+        {},
+        {"questions": None},
+        {"questions": []},
+        {
+            "questions": [
+                None,
+                "bad",
+                {},
+                {"question": ""},
+                {"question": "   ", "options": []},
+            ]
+        },
+    ],
+)
+def test_claude_empty_decision_requests_emit_no_signal(tmp_path, tool_input):
+    transcript = tmp_path / "empty-decision.jsonl"
+    records = [
+        {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "empty-decision",
+                        "name": "AskUserQuestion",
+                        "input": tool_input,
+                    }
+                ],
+            }
+        },
+        {"message": {"role": "user", "content": "VALID_LATER_TURN"}},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_claude_transcript(transcript, {})
+    rendered = render_turns(session)
+
+    assert session.turns == (Turn("user", "VALID_LATER_TURN"),)
+    assert "[Decision requested]" not in rendered
+
+
+def _claude_tool_use(name, call_id="reused-id"):
+    block = {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+    if name == "AskUserQuestion":
+        block["input"] = {
+            "questions": [{"question": "Choose?", "options": [{"label": "A"}]}]
+        }
+    return block
+
+
+@pytest.mark.parametrize(
+    ("calls", "output_before"),
+    [
+        (("Read", "AskUserQuestion"), False),
+        (("AskUserQuestion", "Read"), False),
+        (("AskUserQuestion", "AskUserQuestion"), False),
+        (("Read", "Read"), False),
+        (("AskUserQuestion",), True),
+    ],
+    ids=[
+        "routine-then-decision",
+        "decision-then-routine",
+        "same-decision",
+        "same-routine",
+        "output-before-call",
+    ],
+)
+def test_claude_reused_or_unknown_tool_ids_exclude_outputs(
+    tmp_path, calls, output_before
+):
+    transcript = tmp_path / "claude-reused-call-id.jsonl"
+    output_record = {
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "reused-id",
+                    "content": "AMBIGUOUS_RESULT_SHOULD_NOT_APPEAR",
+                }
+            ],
+        }
+    }
+    call_record = {
+        "message": {
+            "role": "assistant",
+            "content": [_claude_tool_use(name) for name in calls],
+        }
+    }
+    records = (
+        [output_record, call_record] if output_before else [call_record, output_record]
+    )
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    rendered = render_turns(parse_claude_transcript(transcript, {}))
+
+    assert "AMBIGUOUS_RESULT_SHOULD_NOT_APPEAR" not in rendered
+    assert "[Decision made]" not in rendered
+
+
+def test_claude_later_reuse_invalidates_an_earlier_tool_output(tmp_path):
+    transcript = tmp_path / "claude-late-reused-call-id.jsonl"
+    records = [
+        {
+            "message": {
+                "role": "assistant",
+                "content": [_claude_tool_use("AskUserQuestion")],
+            }
+        },
+        {
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "reused-id",
+                        "content": "EARLY_AMBIGUOUS_RESULT_SHOULD_NOT_APPEAR",
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "assistant",
+                "content": [_claude_tool_use("Read")],
+            }
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    rendered = render_turns(parse_claude_transcript(transcript, {}))
+
+    assert "EARLY_AMBIGUOUS_RESULT_SHOULD_NOT_APPEAR" not in rendered
+    assert "[Decision made]" not in rendered
+
+
 @pytest.mark.parametrize("max_chars", [0, 1, 5, len("**User:** \n")])
 def test_max_chars_drops_turn_when_no_text_can_fit(tmp_path, max_chars):
     transcript = tmp_path / "one-turn.jsonl"
@@ -195,6 +491,57 @@ def test_max_chars_is_a_hard_rendered_bound_when_text_fits(tmp_path, max_chars):
     assert session.turns
     assert all(turn.text for turn in session.turns)
     assert len(render_turns(session)) <= max_chars
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_positive_max_turns_bounds_live_turn_accumulation(
+    tmp_path, monkeypatch, agent
+):
+    transcript = tmp_path / f"many-{agent}-turns.jsonl"
+    records = []
+    for index in range(100):
+        role = "user" if index % 2 == 0 else "assistant"
+        text = f"turn-{index}"
+        if agent == "claude":
+            records.append({"message": {"role": role, "content": text}})
+        else:
+            block_type = "input_text" if role == "user" else "output_text"
+            records.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": block_type, "text": text}],
+                    },
+                }
+            )
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+    parser = parse_claude_transcript if agent == "claude" else parse_codex_transcript
+    full = parser(transcript, {})
+
+    original_turn = Turn
+    counts = {"live": 0, "peak": 0}
+
+    def tracking_turn(*args, **kwargs):
+        turn = original_turn(*args, **kwargs)
+        counts["live"] += 1
+        counts["peak"] = max(counts["peak"], counts["live"])
+
+        def released():
+            counts["live"] -= 1
+
+        weakref.finalize(turn, released)
+        return turn
+
+    monkeypatch.setattr(transcripts_module, "Turn", tracking_turn)
+
+    limited = parser(transcript, {}, limits={"max_turns": 3})
+
+    assert limited.turns == full.turns[-3:]
+    assert counts["peak"] <= 4
 
 
 def test_codex_parser_keeps_user_and_assistant_text():
@@ -268,7 +615,7 @@ def _parse_collaboration_envelope(tmp_path, sender_lines):
     transcript = tmp_path / "collaboration-envelope.jsonl"
     envelope_lines = [
         "Message Type: FINAL_ANSWER",
-        "Task name: /root/research",
+        "Task name: /root",
         *sender_lines,
         "Payload:",
         "EXACT_SENDER_FINDING",
@@ -323,6 +670,57 @@ def test_codex_collaboration_rejects_inexact_sender_fields(
 
 
 @pytest.mark.parametrize(
+    "header_lines",
+    [
+        ["Message Type: FINAL_ANSWER", "Sender: /root/research"],
+        [
+            "Message Type: FINAL_ANSWER",
+            "Task name: /root/other",
+            "Sender: /root/research",
+        ],
+        [
+            "Message Type: FINAL_ANSWER",
+            "Task name: /root",
+            "Sender: /root/research",
+            "Unexpected: value",
+        ],
+        [
+            "Message Type: FINAL_ANSWER",
+            "Sender: /root/research",
+            "Task name: /root",
+        ],
+    ],
+    ids=["missing-task", "mismatched-task", "extra-field", "wrong-order"],
+)
+def test_codex_collaboration_requires_exact_canonical_header(
+    tmp_path, header_lines
+):
+    transcript = tmp_path / "invalid-collaboration-header.jsonl"
+    record = {
+        "type": "response_item",
+        "payload": {
+            "type": "agent_message",
+            "author": "/root/research",
+            "recipient": "/root",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "\n".join(
+                        [*header_lines, "Payload:", "SHOULD_NOT_APPEAR"]
+                    ),
+                }
+            ],
+        },
+    }
+    transcript.write_text(json.dumps(record), encoding="utf-8")
+
+    session = parse_codex_transcript(transcript, {})
+
+    assert session.turns == ()
+    assert "SHOULD_NOT_APPEAR" not in render_turns(session)
+
+
+@pytest.mark.parametrize(
     "output",
     [
         {"error": "cancelled"},
@@ -366,6 +764,122 @@ def test_codex_parser_excludes_non_choice_request_user_input_outputs(
     assert render_turns(session) == ""
 
 
+@pytest.mark.parametrize(
+    ("calls", "output_before"),
+    [
+        (("exec_command", "request_user_input"), False),
+        (("request_user_input", "exec_command"), False),
+        (("request_user_input", "request_user_input"), False),
+        (("exec_command", "exec_command"), False),
+        (("request_user_input",), True),
+    ],
+    ids=[
+        "routine-then-decision",
+        "decision-then-routine",
+        "same-decision",
+        "same-routine",
+        "output-before-call",
+    ],
+)
+@pytest.mark.parametrize(
+    ("call_type", "output_type"),
+    [
+        ("function_call", "function_call_output"),
+        ("custom_tool_call", "custom_tool_call_output"),
+    ],
+)
+def test_codex_reused_or_unknown_call_ids_exclude_outputs(
+    tmp_path, calls, output_before, call_type, output_type
+):
+    transcript = tmp_path / "codex-reused-call-id.jsonl"
+    call_records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": call_type,
+                "name": name,
+                "call_id": "reused-id",
+                "arguments": "{}",
+            },
+        }
+        for name in calls
+    ]
+    output_record = {
+        "type": "response_item",
+        "payload": {
+            "type": output_type,
+            "call_id": "reused-id",
+            "output": json.dumps(
+                {"answers": {"Choice": {"answers": ["LEAKED_CHOICE"]}}}
+            ),
+        },
+    }
+    records = (
+        [output_record, *call_records]
+        if output_before
+        else [*call_records, output_record]
+    )
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_codex_transcript(transcript, {})
+
+    assert session.turns == ()
+    assert "LEAKED_CHOICE" not in render_turns(session)
+
+
+@pytest.mark.parametrize(
+    ("call_type", "output_type"),
+    [
+        ("function_call", "function_call_output"),
+        ("custom_tool_call", "custom_tool_call_output"),
+    ],
+)
+def test_codex_later_reuse_invalidates_an_earlier_call_output(
+    tmp_path, call_type, output_type
+):
+    transcript = tmp_path / "codex-late-reused-call-id.jsonl"
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": call_type,
+                "name": "request_user_input",
+                "call_id": "reused-id",
+                "arguments": "{}",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": output_type,
+                "call_id": "reused-id",
+                "output": json.dumps(
+                    {"answers": {"Choice": {"answers": ["LEAKED_CHOICE"]}}}
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": call_type,
+                "name": "exec_command",
+                "call_id": "reused-id",
+                "arguments": "{}",
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_codex_transcript(transcript, {})
+
+    assert session.turns == ()
+    assert "LEAKED_CHOICE" not in render_turns(session)
+
+
 def test_chunk_session_preserves_turns_and_deterministic_provenance():
     session = parse_claude_transcript(
         FIXTURES / "claude-decisions.jsonl", CLAUDE_METADATA
@@ -402,6 +916,38 @@ def test_chunk_session_keeps_assistant_reply_with_oversize_user_turn():
     assert tuple(turn for chunk in chunks for turn in chunk.turns) == oversized.turns
 
 
+def test_chunk_session_hashes_repeated_slices_by_position(tmp_path):
+    transcript = tmp_path / "repeated.jsonl"
+    records = []
+    for _ in range(3):
+        records.extend(
+            [
+                {"message": {"role": "user", "content": "same user"}},
+                {"message": {"role": "assistant", "content": "same assistant"}},
+            ]
+        )
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+    session = parse_claude_transcript(
+        transcript,
+        {"session_id": "repeated-session", "cwd": "/workspaces/repeated"},
+    )
+    parent_hash = session.source_hash
+
+    chunks = chunk_session(session, target_chars=1)
+    repeated = chunk_session(session, target_chars=1)
+
+    assert len(chunks) == 3
+    assert all(chunk.turns == chunks[0].turns for chunk in chunks)
+    assert tuple(turn for chunk in chunks for turn in chunk.turns) == session.turns
+    assert len({chunk.source_hash for chunk in chunks}) == 3
+    assert [chunk.source_hash for chunk in chunks] == [
+        chunk.source_hash for chunk in repeated
+    ]
+    assert session.source_hash == parent_hash
+
+
 def test_batch_parser_delegates_full_claude_normalization(monkeypatch):
     batch_path = Path(__file__).resolve().parents[1] / "batch-flush.py"
     spec = importlib.util.spec_from_file_location("batch_flush", batch_path)
@@ -419,3 +965,32 @@ def test_batch_parser_delegates_full_claude_normalization(monkeypatch):
     assert "[Subagent result]" in rendered
     assert "SHOULD_NOT_APPEAR" not in rendered
     assert len(turns) == 5
+
+
+def test_batch_flush_imports_from_arbitrary_cwd_without_pythonpath(tmp_path):
+    batch_path = Path(__file__).resolve().parents[1] / "batch-flush.py"
+    probe = """
+import importlib.util
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("isolated_batch_flush", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert module.ROOT == path.parent.parent
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(batch_path)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
