@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --directory \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}\" python \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}/hooks/codex-session-start.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --directory \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}\" python \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}/hooks/codex-session-end.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

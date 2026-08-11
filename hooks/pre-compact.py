@@ -1,81 +1,74 @@
-"""
-PreCompact hook - captures conversation transcript before auto-compaction.
-
-When Claude Code's context window fills up, it auto-compacts (summarizes and
-discards detail). This hook fires BEFORE that happens, extracting conversation
-context and spawning flush.py to extract knowledge that would otherwise
-be lost to summarization.
-
-The hook itself does NO API calls - only local file I/O for speed (<10s).
-"""
+"""Fast Claude PreCompact adapter: preserve the live slice in the queue."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
-import subprocess
-import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
+import re
+import sys
 
-# Recursion guard
-if os.environ.get("CLAUDE_INVOKED_BY"):
+
+if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
     sys.exit(0)
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = ROOT / "scripts"
-STATE_DIR = SCRIPTS_DIR
-sys.path.insert(0, str(SCRIPTS_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from transcripts import parse_claude_transcript, render_turns
+from scripts.capture import enqueue_hook_input
+from scripts.transcripts import parse_claude_transcript, render_turns
 
-logging.basicConfig(
-    filename=str(SCRIPTS_DIR / "flush.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [pre-compact] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 5
 
-# Dedup guard: prevents the hook doing duplicate work when both project-local
-# and user-global settings.json have it configured.
-HOOK_DEDUP_WINDOW_SECONDS = 10
-HOOK_DEDUP_FILE = SCRIPTS_DIR / "last-hook-fire.json"
+
+def _runtime_root() -> Path:
+    configured = os.environ.get("AI_MEMORY_HOME") or os.environ.get(
+        "CLAUDE_MEMORY_HOME"
+    )
+    return Path(configured).expanduser() if configured else ROOT
 
 
-def already_fired(session_id: str, event: str) -> bool:
-    """Returns True if this (session_id, event) was handled within the dedup window."""
+def _logger() -> logging.Logger:
+    logger = logging.getLogger("ai-memory-pre-compact")
+    if logger.handlers:
+        return logger
     try:
-        data = json.loads(HOOK_DEDUP_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        data = {}
-
-    key = f"{session_id}:{event}"
-    now = time.time()
-    last = data.get(key, 0)
-    if now - last < HOOK_DEDUP_WINDOW_SECONDS:
-        return True
-
-    data[key] = now
-    cutoff = now - 3600
-    data = {k: v for k, v in data.items() if v > cutoff}
-    try:
-        HOOK_DEDUP_FILE.write_text(json.dumps(data), encoding="utf-8")
+        log_dir = _runtime_root() / "scripts" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = logging.FileHandler(
+            log_dir / "hooks.log", encoding="utf-8"
+        )
     except OSError:
-        pass
-    return False
+        handler = logging.NullHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [pre-compact] %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+def _read_hook_input() -> dict[str, object]:
+    raw_input = sys.stdin.read()
+    try:
+        value = json.loads(raw_input)
+    except json.JSONDecodeError:
+        fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r"\\\\", raw_input)
+        value = json.loads(fixed_input)
+    if not isinstance(value, dict):
+        raise ValueError("hook input must be a JSON object")
+    return value
 
 
 def extract_conversation_context(
     transcript_path: Path, metadata: dict | None = None
 ) -> tuple[str, int]:
-    """Normalize a live Claude slice and render it for the flush prompt."""
     session = parse_claude_transcript(
         transcript_path,
         metadata or {},
@@ -91,95 +84,51 @@ def extract_conversation_context(
 
 
 def main() -> None:
-    # Read hook input from stdin
+    logger = _logger()
     try:
-        raw_input = sys.stdin.read()
-        try:
-            hook_input: dict = json.loads(raw_input)
-        except json.JSONDecodeError:
-            fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r'\\\\', raw_input)
-            hook_input = json.loads(fixed_input)
-    except (json.JSONDecodeError, ValueError, EOFError) as e:
-        logging.error("Failed to parse stdin: %s", e)
+        hook_input = _read_hook_input()
+    except (json.JSONDecodeError, ValueError, EOFError) as error:
+        logger.error("failed to parse hook input: %s", error)
         return
 
-    session_id = hook_input.get("session_id", "unknown")
-    transcript_path_str = hook_input.get("transcript_path", "")
-    cwd_str = hook_input.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    project_key = Path(cwd_str).name or "unknown"
-
-    logging.info("PreCompact fired: session=%s project=%s", session_id, project_key)
-
-    if already_fired(session_id, "pre-compact"):
-        logging.info("SKIP: duplicate hook fire for session %s (project+global both configured)", session_id)
+    transcript_value = hook_input.get("transcript_path")
+    if not isinstance(transcript_value, str) or not transcript_value:
+        logger.info("skip: no transcript path")
+        return
+    transcript_path = Path(transcript_value).expanduser()
+    if not transcript_path.is_file():
+        logger.info("skip: transcript missing")
         return
 
-    # transcript_path can be empty (known Claude Code bug #13668)
-    if not transcript_path_str or not isinstance(transcript_path_str, str):
-        logging.info("SKIP: no transcript path")
-        return
+    cwd = hook_input.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        hook_input["cwd"] = cwd
+    hook_input.setdefault("project", Path(cwd).name or "unknown")
 
-    transcript_path = Path(transcript_path_str)
-    if not transcript_path.exists():
-        logging.info("SKIP: transcript missing: %s", transcript_path_str)
-        return
-
-    # Extract conversation context in the hook
     try:
         context, turn_count = extract_conversation_context(
             transcript_path,
             {
-                "session_id": session_id,
-                "cwd": cwd_str,
-                "project": project_key,
+                "session_id": hook_input.get("session_id", ""),
+                "cwd": cwd,
+                "project": hook_input["project"],
+                "timestamp": hook_input.get("timestamp", ""),
                 "trigger": "pre_compact",
             },
         )
-    except Exception as e:
-        logging.error("Context extraction failed: %s", e)
-        return
-
-    if not context.strip():
-        logging.info("SKIP: empty context")
-        return
-
-    if turn_count < MIN_TURNS_TO_FLUSH:
-        logging.info("SKIP: only %d turns (min %d)", turn_count, MIN_TURNS_TO_FLUSH)
-        return
-
-    # Write context to a temp file for the background process
-    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
-    context_file = STATE_DIR / f"flush-context-{session_id}-{timestamp}.md"
-    context_file.write_text(context, encoding="utf-8")
-
-    # Spawn flush.py as a background process
-    flush_script = SCRIPTS_DIR / "flush.py"
-
-    cmd = [
-        "uv",
-        "run",
-        "--directory",
-        str(ROOT),
-        "python",
-        str(flush_script),
-        str(context_file),
-        session_id,
-        project_key,
-        cwd_str,
-    ]
-
-    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-    try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
+        if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
+            logger.info("skip: empty or too-short transcript")
+            return
+        outcome = enqueue_hook_input(
+            hook_input,
+            source_agent="claude",
+            trigger="pre_compact",
+            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
         )
-        logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
-    except Exception as e:
-        logging.error("Failed to spawn flush.py: %s", e)
+        logger.info("capture %s for session %s", outcome.status, outcome.job_id)
+    except Exception as error:
+        logger.error("capture failed: %s", error)
 
 
 if __name__ == "__main__":

@@ -26,19 +26,38 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Paths relative to project root
+# Internal provider jobs must not inject memory back into themselves. Keep the
+# check before any operation that could inspect or write runtime state.
+if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
+    sys.exit(0)
+
 ROOT = Path(__file__).resolve().parent.parent
-KNOWLEDGE_DIR = ROOT / "knowledge"
-DAILY_DIR = ROOT / "daily"
-INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 
 MAX_CONTEXT_CHARS = 20_000
 MAX_LOG_LINES = 60
 
 
-def get_project_key() -> str:
+def resolve_memory_home(memory_home: Path | str | None = None) -> Path:
+    """Resolve the retrieval root without mutating configuration or runtime state."""
+    if memory_home is not None:
+        return Path(memory_home).expanduser()
+    canonical = os.environ.get("AI_MEMORY_HOME")
+    compatibility = os.environ.get("CLAUDE_MEMORY_HOME")
+    if canonical and compatibility:
+        if Path(canonical).expanduser().resolve() != Path(compatibility).expanduser().resolve():
+            raise ValueError("AI_MEMORY_HOME and CLAUDE_MEMORY_HOME resolve differently")
+    configured = canonical or compatibility
+    return Path(configured).expanduser() if configured else ROOT
+
+
+def get_project_key(hook_input: dict[str, object] | None = None) -> str:
     """Detect the current project from the session's working directory."""
-    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    payload_cwd = (hook_input or {}).get("cwd")
+    cwd = (
+        payload_cwd
+        if isinstance(payload_cwd, str) and payload_cwd
+        else os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    )
     return Path(cwd).name or "unknown"
 
 
@@ -137,13 +156,19 @@ def filter_daily_log(log_content: str, project_key: str) -> str:
     return head + "\n### " + "\n### ".join(kept)
 
 
-def get_recent_log(project_key: str) -> str:
+def get_recent_log(
+    project_key: str,
+    *,
+    memory_home: Path | str | None = None,
+    now: datetime | None = None,
+) -> str:
     """Read the most recent daily log (today or yesterday), filtered by project."""
-    today = datetime.now(timezone.utc).astimezone()
+    today = (now or datetime.now(timezone.utc)).astimezone()
+    daily_dir = resolve_memory_home(memory_home) / "daily"
 
     for offset in range(2):
         date = today - timedelta(days=offset)
-        log_path = DAILY_DIR / f"{date.strftime('%Y-%m-%d')}.md"
+        log_path = daily_dir / f"{date.strftime('%Y-%m-%d')}.md"
         if log_path.exists():
             content = log_path.read_text(encoding="utf-8")
             filtered = filter_daily_log(content, project_key)
@@ -154,23 +179,30 @@ def get_recent_log(project_key: str) -> str:
     return "(no recent daily log)"
 
 
-def build_context(project_key: str) -> str:
+def build_context(
+    project_key: str,
+    *,
+    memory_home: Path | str | None = None,
+    now: datetime | None = None,
+) -> str:
     """Assemble the project-scoped context to inject into the conversation."""
     parts = []
 
-    today = datetime.now(timezone.utc).astimezone()
+    today = (now or datetime.now(timezone.utc)).astimezone()
+    root = resolve_memory_home(memory_home)
+    index_file = root / "knowledge" / "index.md"
     parts.append(
         f"## Today\n{today.strftime('%A, %B %d, %Y')}\n\n**Project:** {project_key}"
     )
 
-    if INDEX_FILE.exists():
-        index_content = INDEX_FILE.read_text(encoding="utf-8")
+    if index_file.exists():
+        index_content = index_file.read_text(encoding="utf-8")
         filtered_index = filter_index(index_content, project_key)
         parts.append(f"## Knowledge Base Index (scoped to `{project_key}` + `global`)\n\n{filtered_index}")
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
 
-    recent_log = get_recent_log(project_key)
+    recent_log = get_recent_log(project_key, memory_home=root, now=today)
     parts.append(f"## Recent Daily Log (scoped to `{project_key}`)\n\n{recent_log}")
 
     context = "\n\n---\n\n".join(parts)
@@ -181,18 +213,35 @@ def build_context(project_key: str) -> str:
     return context
 
 
-def main():
-    project_key = get_project_key()
-    context = build_context(project_key)
-
-    output = {
+def session_start_output(context: str) -> dict[str, object]:
+    """Return the supported SessionStart command-hook response envelope."""
+    return {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": context,
         }
     }
 
-    print(json.dumps(output))
+
+def _read_optional_input() -> dict[str, object]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("hook input must be a JSON object")
+    return value
+
+
+def main():
+    try:
+        hook_input = _read_optional_input()
+        project_key = get_project_key(hook_input)
+        context = build_context(project_key)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return
+
+    print(json.dumps(session_start_output(context)))
 
 
 if __name__ == "__main__":

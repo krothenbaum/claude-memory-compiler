@@ -1,83 +1,79 @@
-"""
-SessionEnd hook - captures conversation transcript for memory extraction.
-
-When a Claude Code session ends, this hook reads the transcript path from
-stdin, extracts conversation context, and spawns flush.py as a background
-process to extract knowledge into the daily log.
-
-The hook itself does NO API calls - only local file I/O for speed (<10s).
-"""
+"""Fast Claude SessionEnd adapter: normalize, enqueue, and return."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
-import time
-from datetime import datetime, timezone
-from pathlib import Path
 
-# Recursion guard: if we were spawned by flush.py (which calls Agent SDK,
-# which runs Claude Code, which would fire this hook again), exit immediately.
-if os.environ.get("CLAUDE_INVOKED_BY"):
+
+# This must precede imports of the capture/queue modules: those modules can
+# create runtime state when their public entry points are used.
+if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
     sys.exit(0)
 
 ROOT = Path(__file__).resolve().parent.parent
-DAILY_DIR = ROOT / "daily"
-SCRIPTS_DIR = ROOT / "scripts"
-STATE_DIR = SCRIPTS_DIR
-sys.path.insert(0, str(SCRIPTS_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from transcripts import parse_claude_transcript, render_turns
+from scripts.capture import enqueue_hook_input
+from scripts.transcripts import parse_claude_transcript, render_turns
 
-logging.basicConfig(
-    filename=str(SCRIPTS_DIR / "flush.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [hook] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
 
-# Dedup guard: prevents the hook doing duplicate work when both project-local
-# and user-global settings.json have it configured (Claude Code does not dedupe
-# identical hook commands across scopes).
-HOOK_DEDUP_WINDOW_SECONDS = 10
-HOOK_DEDUP_FILE = SCRIPTS_DIR / "last-hook-fire.json"
+
+def _runtime_root() -> Path:
+    configured = os.environ.get("AI_MEMORY_HOME") or os.environ.get(
+        "CLAUDE_MEMORY_HOME"
+    )
+    return Path(configured).expanduser() if configured else ROOT
 
 
-def already_fired(session_id: str, event: str) -> bool:
-    """Returns True if this (session_id, event) was handled within the dedup window."""
+def _logger() -> logging.Logger:
+    logger = logging.getLogger("ai-memory-session-end")
+    if logger.handlers:
+        return logger
     try:
-        data = json.loads(HOOK_DEDUP_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        data = {}
-
-    key = f"{session_id}:{event}"
-    now = time.time()
-    last = data.get(key, 0)
-    if now - last < HOOK_DEDUP_WINDOW_SECONDS:
-        return True
-
-    data[key] = now
-    cutoff = now - 3600
-    data = {k: v for k, v in data.items() if v > cutoff}
-    try:
-        HOOK_DEDUP_FILE.write_text(json.dumps(data), encoding="utf-8")
+        log_dir = _runtime_root() / "scripts" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = logging.FileHandler(
+            log_dir / "hooks.log", encoding="utf-8"
+        )
     except OSError:
-        pass
-    return False
+        handler = logging.NullHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [session-end] %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+def _read_hook_input() -> dict[str, object]:
+    """Read Claude JSON, retaining the legacy Windows-backslash recovery."""
+    raw_input = sys.stdin.read()
+    try:
+        value = json.loads(raw_input)
+    except json.JSONDecodeError:
+        fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r"\\\\", raw_input)
+        value = json.loads(fixed_input)
+    if not isinstance(value, dict):
+        raise ValueError("hook input must be a JSON object")
+    return value
 
 
 def extract_conversation_context(
     transcript_path: Path, metadata: dict | None = None
 ) -> tuple[str, int]:
-    """Normalize a live Claude slice and render it for the flush prompt."""
+    """Preserve the characterized Claude live-slice rendering contract."""
     session = parse_claude_transcript(
         transcript_path,
         metadata or {},
@@ -92,122 +88,8 @@ def extract_conversation_context(
     return context, len(session.turns)
 
 
-def main() -> None:
-    # Read hook input from stdin
-    # Claude Code on Windows may pass paths with unescaped backslashes
-    try:
-        raw_input = sys.stdin.read()
-        try:
-            hook_input: dict = json.loads(raw_input)
-        except json.JSONDecodeError:
-            fixed_input = re.sub(r'(?<!\\)\\(?!["\\])', r'\\\\', raw_input)
-            hook_input = json.loads(fixed_input)
-    except (json.JSONDecodeError, ValueError, EOFError) as e:
-        logging.error("Failed to parse stdin: %s", e)
-        return
-
-    session_id = hook_input.get("session_id", "unknown")
-    source = hook_input.get("source", "unknown")
-    transcript_path_str = hook_input.get("transcript_path", "")
-    cwd_str = hook_input.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    project_key = Path(cwd_str).name or "unknown"
-
-    logging.info("SessionEnd fired: session=%s source=%s project=%s", session_id, source, project_key)
-
-    if already_fired(session_id, "session-end"):
-        logging.info("SKIP: duplicate hook fire for session %s (project+global both configured)", session_id)
-        return
-
-    if not transcript_path_str or not isinstance(transcript_path_str, str):
-        logging.info("SKIP: no transcript path")
-        return
-
-    transcript_path = Path(transcript_path_str)
-    if not transcript_path.exists():
-        logging.info("SKIP: transcript missing: %s", transcript_path_str)
-        return
-
-    # Extract conversation context in the hook (fast, no API calls)
-    try:
-        context, turn_count = extract_conversation_context(
-            transcript_path,
-            {
-                "session_id": session_id,
-                "cwd": cwd_str,
-                "project": project_key,
-                "trigger": "session_end",
-            },
-        )
-    except Exception as e:
-        logging.error("Context extraction failed: %s", e)
-        return
-
-    if not context.strip():
-        logging.info("SKIP: empty context")
-        return
-
-    if turn_count < MIN_TURNS_TO_FLUSH:
-        logging.info("SKIP: only %d turns (min %d)", turn_count, MIN_TURNS_TO_FLUSH)
-        return
-
-    # Write context to a temp file for the background process
-    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
-    context_file = STATE_DIR / f"session-flush-{session_id}-{timestamp}.md"
-    context_file.write_text(context, encoding="utf-8")
-
-    # Spawn flush.py as a background process
-    flush_script = SCRIPTS_DIR / "flush.py"
-
-    cmd = [
-        "uv",
-        "run",
-        "--directory",
-        str(ROOT),
-        "python",
-        str(flush_script),
-        str(context_file),
-        session_id,
-        project_key,
-        cwd_str,
-    ]
-
-    # On Windows, use CREATE_NO_WINDOW to avoid flash console window.
-    # Do NOT use DETACHED_PROCESS — it breaks the Agent SDK's subprocess I/O.
-    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-    # Resolve the user's terminal TTY NOW — while `claude` is still alive —
-    # and pass it to the detached flush.py via env var. Once claude exits,
-    # flush.py is reparented to launchd and loses the ancestry path back to
-    # the real terminal device.
-    env = os.environ.copy()
-    tty_path = _resolve_user_tty()
-    if tty_path:
-        env["CLAUDE_MEMORY_TTY"] = tty_path
-        logging.info("Resolved user TTY: %s", tty_path)
-    else:
-        logging.info("No user TTY resolved (notifications will silently no-op)")
-
-    try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-            env=env,
-        )
-        logging.info("Spawned flush.py for session %s (%d turns, %d chars)", session_id, turn_count, len(context))
-    except Exception as e:
-        logging.error("Failed to spawn flush.py: %s", e)
-
-
 def _resolve_user_tty() -> str | None:
-    """Walk ancestors to find a process attached to the user's real terminal.
-
-    The hook itself has TTY=?? (Claude Code spawns hooks without a TTY), but
-    the parent `claude` CLI does own the user's terminal. This must run
-    BEFORE `claude` exits — once flush.py is detached, the PPID chain
-    collapses to launchd and the TTY is unrecoverable.
-    """
+    """Find the terminal while the parent Claude process is still alive."""
     pid = os.getpid()
     for _ in range(10):
         try:
@@ -225,7 +107,7 @@ def _resolve_user_tty() -> str | None:
         if len(parts) < 2:
             return None
         try:
-            ppid = int(parts[0])
+            parent = int(parts[0])
         except ValueError:
             return None
         tty = parts[1]
@@ -233,10 +115,63 @@ def _resolve_user_tty() -> str | None:
             candidate = tty if tty.startswith("/") else f"/dev/{tty}"
             if os.path.exists(candidate):
                 return candidate
-        if ppid in (0, 1) or ppid == pid:
+        if parent in (0, 1) or parent == pid:
             return None
-        pid = ppid
+        pid = parent
     return None
+
+
+def main() -> None:
+    logger = _logger()
+    try:
+        hook_input = _read_hook_input()
+    except (json.JSONDecodeError, ValueError, EOFError) as error:
+        logger.error("failed to parse hook input: %s", error)
+        return
+
+    transcript_value = hook_input.get("transcript_path")
+    if not isinstance(transcript_value, str) or not transcript_value:
+        logger.info("skip: no transcript path")
+        return
+    transcript_path = Path(transcript_value).expanduser()
+    if not transcript_path.is_file():
+        logger.info("skip: transcript missing")
+        return
+
+    cwd = hook_input.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        hook_input["cwd"] = cwd
+    hook_input.setdefault("project", Path(cwd).name or "unknown")
+
+    try:
+        context, turn_count = extract_conversation_context(
+            transcript_path,
+            {
+                "session_id": hook_input.get("session_id", ""),
+                "cwd": cwd,
+                "project": hook_input["project"],
+                "timestamp": hook_input.get("timestamp", ""),
+                "trigger": "session_end",
+            },
+        )
+        if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
+            logger.info("skip: empty or too-short transcript")
+            return
+
+        tty_path = _resolve_user_tty()
+        if tty_path:
+            os.environ["CLAUDE_MEMORY_TTY"] = tty_path
+        outcome = enqueue_hook_input(
+            hook_input,
+            source_agent="claude",
+            trigger="session_end",
+            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+        )
+        logger.info("capture %s for session %s", outcome.status, outcome.job_id)
+    except Exception as error:
+        # Hooks are advisory. A capture failure must never block the host agent.
+        logger.error("capture failed: %s", error)
 
 
 if __name__ == "__main__":

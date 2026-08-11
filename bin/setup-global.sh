@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Print the steps to wire claude-memory-compiler into Claude Code globally.
-# Auto-detects this repo's path so it works for any clone location.
-# This script writes nothing — it only prints instructions you run yourself.
+# Print opt-in merge steps for Claude Code and Codex. This script writes nothing.
 
 set -euo pipefail
 
@@ -10,7 +8,7 @@ SHELL_RC=""
 case "${SHELL:-}" in
   */zsh) SHELL_RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
   */bash) SHELL_RC="$HOME/.bashrc" ;;
-  *) SHELL_RC="(your shell's startup file, e.g. ~/.zshrc, ~/.bashrc, ~/.profile)" ;;
+  *) SHELL_RC="(your shell startup file, such as ~/.zshrc or ~/.bashrc)" ;;
 esac
 
 cat <<EOF
@@ -18,28 +16,34 @@ cat <<EOF
 
 Detected repo at: $REPO_ROOT
 
-Two manual steps:
+This setup is opt-in and does not edit either agent's configuration.
 
-1) Export CLAUDE_MEMORY_HOME so Claude Code hooks can find this repo.
-   Add this line to $SHELL_RC:
+1) Export the canonical memory root in $SHELL_RC:
 
-     export CLAUDE_MEMORY_HOME="$REPO_ROOT"
+     export AI_MEMORY_HOME="$REPO_ROOT"
 
-   Then reload your shell (or open a new terminal):
+   CLAUDE_MEMORY_HOME remains a deprecated fallback for existing installs.
+   Reload your shell after editing the file.
 
-     source $SHELL_RC
-
-2) Merge this repo's .claude/settings.json into your user-global settings:
+2) Merge the hooks from this repository's .claude/settings.json into:
 
      ~/.claude/settings.json
 
-   Specifically, copy the "hooks" object. If you already have hooks in
-   ~/.claude/settings.json, merge them — don't overwrite.
+   Preserve every unrelated setting and hook already present; do not replace
+   the destination file.
 
-After both steps, every Claude Code session (in any directory) will
-capture into $REPO_ROOT/daily/ and compile into $REPO_ROOT/knowledge/.
+3) Codex hooks require codex-cli 0.146.1 or newer. Validate the installed CLI:
 
-Note: Claude Code hooks inherit the env vars of the terminal that
-launched 'claude'. If you run Claude Code from a fresh terminal where
-CLAUDE_MEMORY_HOME is exported, the hooks will see it.
+     codex --version
+     codex features list | grep '^hooks'
+
+   Then merge .codex/hooks.json.example into:
+
+     ~/.codex/hooks.json
+
+   Preserve every unrelated setting and hook already present; do not replace
+   the destination file. The example remains inert until you merge it.
+
+Hooks inherit environment variables from the terminal that launches Claude
+Code or Codex. Start each agent from a fresh shell where AI_MEMORY_HOME is set.
 EOF

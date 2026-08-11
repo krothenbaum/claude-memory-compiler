@@ -1,0 +1,339 @@
+"""Subprocess contract tests for the fast Claude and Codex hook adapters."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parents[2]
+HOOKS = ROOT / "hooks"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "transcripts"
+FIXED_NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def _fake_uv(bin_dir: Path) -> Path:
+    """Install a worker-launch stand-in that records the queued agent."""
+    bin_dir.mkdir()
+    executable = bin_dir / "uv"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, sqlite3, sys\n"
+        "root = pathlib.Path(sys.argv[sys.argv.index('--directory') + 1])\n"
+        "database = root / 'scripts' / 'jobs.sqlite3'\n"
+        "with sqlite3.connect(database) as connection:\n"
+        "    agent = connection.execute(\n"
+        "        'SELECT source_agent FROM jobs ORDER BY id DESC LIMIT 1'\n"
+        "    ).fetchone()[0]\n"
+        "label = {'claude': 'Claude Code', 'codex': 'Codex'}[agent]\n"
+        "daily = root / 'daily'\n"
+        "daily.mkdir(parents=True, exist_ok=True)\n"
+        "(daily / 'fake-worker.md').write_text(f'**Agent:** {label}\\n')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def _hook_env(
+    memory_home: Path,
+    *,
+    fake_bin: Path | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env["AI_MEMORY_HOME"] = str(memory_home)
+    env.pop("CLAUDE_MEMORY_HOME", None)
+    env.pop("CLAUDE_INVOKED_BY", None)
+    env.pop("AI_MEMORY_INTERNAL_JOB", None)
+    if fake_bin is not None:
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _run_hook(
+    name: str,
+    payload: dict[str, object],
+    memory_home: Path,
+    *,
+    fake_bin: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], float]:
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, str(HOOKS / name)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=3,
+        env=_hook_env(memory_home, fake_bin=fake_bin, extra=extra_env),
+        check=False,
+    )
+    return result, time.monotonic() - started
+
+
+def _job_rows(memory_home: Path) -> list[tuple[str, str, str]]:
+    database = memory_home / "scripts" / "jobs.sqlite3"
+    with sqlite3.connect(database) as connection:
+        return connection.execute(
+            "SELECT source_agent, session_id, trigger FROM jobs ORDER BY id"
+        ).fetchall()
+
+
+def _wait_for(path: Path, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+def test_codex_session_end_returns_under_three_seconds_and_enqueues(tmp_path):
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "codex-session-end.py",
+        {
+            "hook_event_name": "SessionEnd",
+            "session_id": "codex-hook-session",
+            "transcript_path": str(FIXTURES / "codex-basic.jsonl"),
+            "cwd": "/projects/codex-project",
+            "reason": "user_exit",
+            "source": "cli",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 3
+    assert result.stdout == ""
+    assert _job_rows(memory_home) == [
+        ("codex", "codex-hook-session", "session_end")
+    ]
+    fake_daily = memory_home / "daily" / "fake-worker.md"
+    _wait_for(fake_daily)
+    assert fake_daily.read_text(encoding="utf-8") == "**Agent:** Codex\n"
+
+
+def test_claude_session_end_enqueues_without_model_call(tmp_path):
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "claude-hook-session",
+            "transcript_path": str(FIXTURES / "claude-basic.jsonl"),
+            "cwd": "/projects/claude-project",
+            "source": "terminal",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 3
+    assert _job_rows(memory_home) == [
+        ("claude", "claude-hook-session", "session_end")
+    ]
+    _wait_for(memory_home / "daily" / "fake-worker.md")
+    assert "**Agent:** Claude Code" in (
+        memory_home / "daily" / "fake-worker.md"
+    ).read_text(encoding="utf-8")
+    assert not list((memory_home / "scripts").glob("session-flush-*.md"))
+
+
+def test_precompact_then_session_end_deduplicates_normalized_slice(tmp_path):
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+    payload = {
+        "session_id": "same-session",
+        "transcript_path": str(FIXTURES / "claude-decisions.jsonl"),
+        "cwd": "/projects/shared-project",
+    }
+
+    precompact, _ = _run_hook(
+        "pre-compact.py", payload, memory_home, fake_bin=fake_bin
+    )
+    session_end, _ = _run_hook(
+        "session-end.py", payload, memory_home, fake_bin=fake_bin
+    )
+
+    assert precompact.returncode == session_end.returncode == 0
+    rows = _job_rows(memory_home)
+    assert len(rows) == 1
+    assert rows[0][:2] == ("claude", "same-session")
+
+
+def test_internal_job_guard_creates_no_jobs_or_spool_files(tmp_path):
+    memory_home = tmp_path / "must-not-exist"
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {"transcript_path": str(FIXTURES / "claude-basic.jsonl")},
+        memory_home,
+        extra_env={"AI_MEMORY_INTERNAL_JOB": "1"},
+    )
+
+    assert result.returncode == 0
+    assert elapsed < 3
+    assert not memory_home.exists()
+
+
+def test_internal_codex_job_creates_no_queue_or_session_rollout(tmp_path):
+    memory_home = tmp_path / "must-not-exist"
+    codex_home = tmp_path / "codex-must-not-exist"
+    result, elapsed = _run_hook(
+        "codex-session-end.py",
+        {"transcript_path": str(FIXTURES / "codex-basic.jsonl")},
+        memory_home,
+        extra_env={
+            "AI_MEMORY_INTERNAL_JOB": "1",
+            "CODEX_HOME": str(codex_home),
+        },
+    )
+
+    assert result.returncode == 0
+    assert elapsed < 3
+    assert not memory_home.exists()
+    assert not codex_home.exists()
+
+
+def test_missing_transcript_fails_closed_without_blocking_host(tmp_path):
+    memory_home = tmp_path / "memory"
+    for hook_name in ("session-end.py", "pre-compact.py", "codex-session-end.py"):
+        result, elapsed = _run_hook(
+            hook_name,
+            {"session_id": "missing", "transcript_path": ""},
+            memory_home,
+        )
+        assert result.returncode == 0, result.stderr
+        assert elapsed < 3
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "spool").exists()
+
+
+def _load_hook(name: str):
+    path = HOOKS / name
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_retrieval_files(memory_home: Path) -> None:
+    (memory_home / "knowledge").mkdir(parents=True)
+    (memory_home / "daily").mkdir()
+    (memory_home / "knowledge" / "index.md").write_text(
+        "# Index\n\n"
+        "| Title | Project |\n"
+        "| --- | --- |\n"
+        "| Alpha fact | alpha |\n"
+        "| Global fact | global |\n"
+        "| Beta secret | beta |\n",
+        encoding="utf-8",
+    )
+    (memory_home / "daily" / "2026-08-11.md").write_text(
+        "# Daily\n\n"
+        "### Alpha\n**Project:** alpha\nALPHA_RECENT\n\n"
+        "### Beta\n**Project:** beta\nBETA_RECENT\n",
+        encoding="utf-8",
+    )
+
+
+def test_shared_retrieval_builder_returns_plain_project_scoped_context(tmp_path):
+    memory_home = tmp_path / "memory"
+    _write_retrieval_files(memory_home)
+    session_start = _load_hook("session-start.py")
+
+    context = session_start.build_context(
+        "alpha", memory_home=memory_home, now=FIXED_NOW
+    )
+
+    assert "Alpha fact" in context
+    assert "Global fact" in context
+    assert "ALPHA_RECENT" in context
+    assert "Beta secret" not in context
+    assert "BETA_RECENT" not in context
+
+
+def test_claude_session_start_wraps_shared_context_in_claude_shape(tmp_path):
+    memory_home = tmp_path / "memory"
+    _write_retrieval_files(memory_home)
+    result, _ = _run_hook(
+        "session-start.py",
+        {"cwd": "/projects/alpha"},
+        memory_home,
+        extra_env={"CLAUDE_PROJECT_DIR": "/projects/alpha"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "Alpha fact" in context
+    assert "Beta secret" not in context
+
+
+def test_codex_session_start_wraps_shared_context_in_supported_shape(tmp_path):
+    memory_home = tmp_path / "memory"
+    _write_retrieval_files(memory_home)
+    result, _ = _run_hook(
+        "codex-session-start.py",
+        {"hook_event_name": "SessionStart", "cwd": "/projects/alpha"},
+        memory_home,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": output["hookSpecificOutput"]["additionalContext"],
+        }
+    }
+    assert "Alpha fact" in output["hookSpecificOutput"]["additionalContext"]
+    assert "Beta secret" not in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_examples_preserve_ten_second_capture_timeouts_and_are_opt_in():
+    claude = json.loads((ROOT / ".claude" / "settings.json").read_text())
+    for event in ("PreCompact", "SessionEnd"):
+        command = claude["hooks"][event][0]["hooks"][0]
+        assert command["timeout"] == 10
+        assert "AI_MEMORY_HOME" in command["command"]
+        assert "CLAUDE_MEMORY_HOME" in command["command"]
+
+    codex = json.loads((ROOT / ".codex" / "hooks.json.example").read_text())
+    assert set(codex["hooks"]) == {"SessionStart", "SessionEnd"}
+    assert not (ROOT / ".codex" / "hooks.json").exists()
+
+
+def test_global_setup_only_prints_safe_merge_instructions():
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin" / "setup-global.sh")],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "AI_MEMORY_HOME" in result.stdout
+    assert "~/.claude/settings.json" in result.stdout
+    assert "~/.codex/hooks.json" in result.stdout
+    assert "codex-cli 0.146.1 or newer" in result.stdout
+    assert result.stdout.count("do not replace") == 2

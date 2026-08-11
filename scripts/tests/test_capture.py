@@ -99,6 +99,50 @@ def test_hook_capture_guard_precedes_payload_resolution(tmp_path):
     assert not (tmp_path / "must-not-exist").exists()
 
 
+def test_codex_hook_capture_falls_back_to_transcript_session_metadata(tmp_path):
+    source = tmp_path / "codex.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-11T10:15:00Z",
+                "type": "session_meta",
+                "payload": {"id": "meta-session", "cwd": "/projects/meta-project"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Remember this"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = enqueue_hook_input(
+        {
+            "transcript_path": str(source),
+            "reason": "user_exit",
+            "source": "cli",
+        },
+        source_agent="codex",
+        trigger="session_end",
+        memory_home=tmp_path / "memory",
+        launcher=lambda _: None,
+        env={},
+        clock=lambda: NOW,
+    )
+
+    assert result.job.session_id == "meta-session"
+    assert result.job.cwd == "/projects/meta-project"
+    assert result.job.project == "meta-project"
+
+
 def test_capture_never_uses_session_id_as_a_spool_path(tmp_path):
     source = tmp_path / "outside.jsonl"
     source.write_text(
