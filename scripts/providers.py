@@ -678,11 +678,11 @@ def _safe_provider_reason(
 def _safe_router_reason(
     message: str, provider: GenerationProvider, prompt: str
 ) -> str:
-    reason = _safe_provider_reason(message, os.environ, prompt)
+    source_env = dict(os.environ)
     provider_env = getattr(provider, "_source_env", None)
     if isinstance(provider_env, Mapping):
-        reason = _safe_reason(reason, provider_env)
-    return reason
+        source_env.update(provider_env)
+    return _safe_provider_reason(message, source_env, prompt)
 
 
 class ClaudeProvider:
@@ -915,6 +915,7 @@ class ProviderRouter:
         self._fallback_workspace_factory = fallback_workspace_factory
 
     async def _record(self, attempt: ProviderResult) -> None:
+        """Persist an attempt, failing closed if mandatory persistence fails."""
         if self._attempt_callback is None:
             return
         callback_result = self._attempt_callback(attempt)
@@ -945,7 +946,7 @@ class ProviderRouter:
                 task=request.task,
                 outcome="error",
                 elapsed_ms=max(0, round((time.monotonic() - started) * 1000)),
-                reason=_safe_provider_reason(str(exc), os.environ, request.prompt),
+                reason=_safe_router_reason(str(exc), provider, request.prompt),
             )
 
     async def generate_text(self, request: TextRequest) -> RoutedResult:

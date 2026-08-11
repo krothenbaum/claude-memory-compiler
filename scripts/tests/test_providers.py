@@ -1109,6 +1109,75 @@ def test_router_normalizes_unexpected_claude_exception(text_request):
     assert [attempt.provider for attempt in seen] == ["codex", "claude"]
 
 
+@pytest.mark.parametrize("provider_name", ["codex", "claude"])
+@pytest.mark.parametrize(
+    "secret",
+    ["provider-only-secret", "provider-only-secret-" + "x" * 600],
+    ids=["short-secret", "long-secret"],
+)
+def test_router_redacts_provider_owned_secrets_from_unexpected_exceptions(
+    text_request, provider_name, secret
+):
+    import providers
+
+    prompt = "router prompt must stay private"
+    request = TextRequest(
+        text_request.task,
+        prompt,
+        text_request.cwd,
+        text_request.timeout_seconds,
+    )
+    crashing = FakeProvider(RuntimeError(f"adapter crashed: {secret} {prompt}"))
+    crashing._source_env = {"ANTHROPIC_API_KEY": secret}
+    if provider_name == "codex":
+        codex = crashing
+        claude = FakeProvider(success_result("claude", "done"))
+        attempt_index = 0
+    else:
+        codex = FakeProvider(_provider_result("codex", "capacity", "limit"))
+        claude = crashing
+        attempt_index = 1
+
+    result = _run(providers.ProviderRouter(codex, claude).generate_text(request))
+
+    reason = result.attempts[attempt_index].reason
+    assert prompt not in reason
+    assert secret[:100] not in reason
+    assert len(reason) <= 500
+
+
+@pytest.mark.parametrize("callback_kind", ["sync", "async"])
+def test_router_fails_closed_when_attempt_callback_fails(
+    text_request, callback_kind
+):
+    import providers
+
+    codex = FakeProvider(_provider_result("codex", "capacity", "limit"))
+    claude = FakeProvider(success_result("claude", "must not run"))
+    seen = []
+
+    def sync_callback(attempt):
+        seen.append(attempt)
+        raise RuntimeError("attempt persistence failed")
+
+    async def async_callback(attempt):
+        seen.append(attempt)
+        raise RuntimeError("attempt persistence failed")
+
+    callback = sync_callback if callback_kind == "sync" else async_callback
+
+    with pytest.raises(RuntimeError, match="attempt persistence failed"):
+        _run(
+            providers.ProviderRouter(
+                codex, claude, attempt_callback=callback
+            ).generate_text(text_request)
+        )
+
+    assert len(seen) == 1
+    assert seen[0].provider == "codex"
+    assert claude.text_requests == []
+
+
 def test_router_accepts_failed_validation_attempt_with_fresh_stage(tmp_path):
     import providers
 
