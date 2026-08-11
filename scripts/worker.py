@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -41,6 +42,14 @@ def _utc_now() -> datetime:
 def daily_writer_boundary(job: Job, text: str) -> None:
     """Append an extracted capture through the shared serialized writer."""
     config = load_config(os.environ)
+    identity_material = "\0".join(
+        (
+            str(getattr(job, "kind", "capture")),
+            str(job.source_agent),
+            str(getattr(job, "session_id", job.id)),
+            str(getattr(job, "source_hash", "")),
+        )
+    ).encode()
     append_daily_entry(
         config.root_dir,
         text,
@@ -48,6 +57,7 @@ def daily_writer_boundary(job: Job, text: str) -> None:
         project_key=job.project,
         cwd=job.cwd,
         agent=job.source_agent,
+        capture_identity=hashlib.sha256(identity_material).hexdigest(),
     )
 
 
@@ -182,7 +192,10 @@ class MemoryWorker:
         ) or f"{result.provider}:{result.outcome}:{result.reason or result.outcome}"
 
     async def _write(self, job: Job, text: str) -> None:
-        outcome = self.daily_writer(job, text)
+        if inspect.iscoroutinefunction(self.daily_writer):
+            outcome = self.daily_writer(job, text)
+        else:
+            outcome = await asyncio.to_thread(self.daily_writer, job, text)
         if inspect.isawaitable(outcome):
             await outcome
 

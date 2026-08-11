@@ -83,6 +83,20 @@ def read_text_with_baseline(path: Path | str) -> tuple[str, FileBaseline]:
     return data.decode("utf-8"), baseline
 
 
+def _fsync_directory(path: Path | str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(Path(path), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 class ExclusiveFileLock:
     """Owner-only cross-platform advisory file lock.
 
@@ -129,7 +143,7 @@ class ExclusiveFileLock:
 
     def acquire(self) -> bool:
         if self._descriptor is not None:
-            return True
+            raise RuntimeError("file lock is already acquired by this instance")
         parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not parent_existed:
@@ -192,6 +206,7 @@ def append_daily_entry(
     project_key: str = "unknown",
     cwd: str = "",
     agent: str = "claude",
+    capture_identity: str | None = None,
     now: datetime | None = None,
 ) -> Path:
     """Append one provenance-tagged daily entry under the writer lock."""
@@ -202,49 +217,62 @@ def append_daily_entry(
     display_agent = {"claude": "Claude Code", "codex": "Codex"}.get(agent)
     if display_agent is None:
         raise ValueError("agent must be 'claude' or 'codex'")
+    if capture_identity is not None and not re.fullmatch(r"[0-9a-f]{64}", capture_identity):
+        raise ValueError("capture identity must be a lowercase SHA-256 digest")
 
     metadata_lines = [f"**Agent:** {display_agent}", f"**Project:** {project_key}"]
     if cwd:
         metadata_lines.append(f"**CWD:** {cwd}")
+    identity_line = (
+        f"<!-- @capture-id:{capture_identity} -->\n" if capture_identity is not None else ""
+    )
     entry = (
         f"### {section} [{project_key}] ({timestamp.strftime('%H:%M')})\n\n"
-        f"{'\n'.join(metadata_lines)}\n\n{content}\n\n"
+        f"{identity_line}{'\n'.join(metadata_lines)}\n\n{content}\n\n"
     )
 
     with ExclusiveFileLock(root / "scripts" / "memory-writer.lock"):
         if __package__:
-            from .staging import recover_incomplete_apply_unlocked
+            from .staging import (
+                _commit_replacements_unlocked,
+                recover_incomplete_apply_unlocked,
+            )
         else:
-            from staging import recover_incomplete_apply_unlocked
+            from staging import _commit_replacements_unlocked, recover_incomplete_apply_unlocked
 
         recover_incomplete_apply_unlocked(root)
         if daily_dir.is_symlink():
             raise ValueError("daily directory must not be a symlink")
+        if daily_dir.exists() and not daily_dir.is_dir():
+            raise ValueError("daily path must be a directory")
+        if capture_identity is not None and daily_dir.exists():
+            marker = f"<!-- @capture-id:{capture_identity} -->".encode()
+            for candidate in sorted(daily_dir.glob("*.md")):
+                data, baseline = _read_file_with_baseline(candidate)
+                if not baseline.exists or data is None:
+                    continue
+                if marker in data:
+                    return candidate
+        daily_dir_created = not daily_dir.exists()
         created = not log_path.exists() and not log_path.is_symlink()
         if created:
             daily_dir.mkdir(parents=True, exist_ok=True)
+            original = b""
         else:
-            info = log_path.lstat()
-            if stat.S_ISLNK(info.st_mode):
-                raise ValueError("daily log must not be a symlink")
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError("daily log must be a regular file")
-            if info.st_nlink != 1:
-                raise ValueError("daily log must not be hard-linked")
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise ValueError("daily log has an unsafe owner")
-        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        flags |= os.O_CREAT | os.O_EXCL if created else 0
-        descriptor = os.open(log_path, flags, 0o600)
-        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            if created:
-                handle.write(
-                    f"# Daily Log: {timestamp.strftime('%Y-%m-%d')}\n\n"
-                    "## Sessions\n\n## Memory Maintenance\n\n"
-                )
-            handle.write(entry)
-            handle.flush()
-            os.fsync(handle.fileno())
+            data, baseline = _read_file_with_baseline(log_path)
+            if not baseline.exists or data is None:
+                raise ValueError("daily log disappeared before append")
+            original = data
+        header = (
+            f"# Daily Log: {timestamp.strftime('%Y-%m-%d')}\n\n"
+            "## Sessions\n\n## Memory Maintenance\n\n"
+        ).encode() if created else b""
+        relative = log_path.relative_to(root).as_posix()
+        _commit_replacements_unlocked(root, {relative: original + header + entry.encode()})
+        if created:
+            _fsync_directory(daily_dir)
+            if daily_dir_created:
+                _fsync_directory(root)
     return log_path
 
 

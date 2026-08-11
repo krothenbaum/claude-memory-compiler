@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +24,7 @@ from staging import (
     snapshot_manifest,
     validate_stage,
 )
-from utils import capture_file_baseline
+from utils import ExclusiveFileLock, FileBaseline, capture_file_baseline
 
 
 ARTICLE = """---
@@ -73,6 +76,7 @@ def _compile_stage(memory_home: Path, *, attempt_id: str = "attempt-1"):
         attempt_id,
         daily_source="daily/2026-08-11.md",
         relevant_articles=("knowledge/concepts/original.md",),
+        include_state=True,
     )
     article = stage.root / "knowledge/concepts/original.md"
     article.write_text(ARTICLE.replace('title: "Original"', 'title: "Updated"'), encoding="utf-8")
@@ -135,6 +139,7 @@ def test_create_stage_copies_only_selected_files_and_records_private_manifest(me
         "attempt/../../unsafe",
         daily_source="daily/2026-08-11.md",
         relevant_articles=("knowledge/concepts/original.md",),
+        include_state=True,
     )
 
     assert stage.root.parent == memory_home / "scripts/staging"
@@ -308,7 +313,7 @@ def test_validation_rejects_malformed_utf8_in_unchanged_selected_source(memory_h
 
 def test_validation_rejects_incompatible_staged_state(memory_home):
     (memory_home / "scripts/state.json").write_text("[]", encoding="utf-8")
-    stage = create_stage(memory_home, "job", "state")
+    stage = create_stage(memory_home, "job", "state", include_state=True)
 
     with pytest.raises(StageValidationError, match="state"):
         validate_stage(
@@ -433,7 +438,8 @@ def test_article_frontmatter_enforces_schema_required_keys(memory_home, relative
     with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
         handle.write(f"| [[{slug}]] | memory | Added | daily/source.md | 2026-08-11 |\n")
     with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
-        handle.write(f"## [now] compile | source\n- Created: [[{slug}]]\n")
+        log_task = "file_answer" if relative.startswith("knowledge/qa/") else "compile"
+        handle.write(f"## [now] {log_task} | source\n- Created: [[{slug}]]\n")
 
     if relative.startswith("knowledge/qa/"):
         validate_stage(
@@ -873,7 +879,7 @@ def test_compiled_marker_compare_and_swap_rejects_concurrent_daily_append(memory
 
 
 def test_state_cannot_bypass_compare_and_swap_through_stage_or_extra_updates(memory_home):
-    stage = create_stage(memory_home, "job", "state-edit")
+    stage = create_stage(memory_home, "job", "state-edit", include_state=True)
     (stage.root / "scripts/state.json").write_text('{"model": "edit"}', encoding="utf-8")
     with pytest.raises(StageValidationError, match="state.json"):
         validate_stage(
@@ -911,7 +917,7 @@ def test_reconcile_recovers_before_reading_state_or_build_log(monkeypatch):
         "files_mentioned_in_log_md",
         lambda: events.append("log") or set(),
     )
-    monkeypatch.setattr("sys.argv", [str(path), "--dry-run"])
+    monkeypatch.setattr("sys.argv", [str(path)])
 
     module.main()
     assert events == ["recover", "state", "log"]
@@ -979,3 +985,526 @@ def test_bookkeeping_is_immutable_between_validation_and_apply(memory_home):
     tampered = replace(validated, changed_paths=validated.changed_paths + ("scripts/state.json",))
     with pytest.raises(StageValidationError):
         apply_validated_stage(tampered, stage.baseline, ApplyBookkeeping())
+
+
+@pytest.mark.parametrize("attack", ["content", "symlink", "hardlink"])
+def test_apply_reads_exact_validated_stage_bytes_without_toctou(
+    memory_home, tmp_path, monkeypatch, attack
+):
+    import staging
+
+    stage = _compile_stage(memory_home, attempt_id=f"toctou-{attack}")
+    validated = validate_stage(
+        stage,
+        allowed_paths=("knowledge/concepts/*.md", "knowledge/index.md", "knowledge/log.md"),
+        task="compile",
+    )
+    target = stage.root / "knowledge/concepts/original.md"
+    outside = tmp_path / f"outside-{attack}.md"
+    outside.write_text("attacker bytes", encoding="utf-8")
+    original_reader = getattr(staging, "_read_safe_regular", lambda _root, rel: (stage.root / rel).read_bytes())
+    attacked = False
+
+    def mutate_after_snapshot(root, relative):
+        nonlocal attacked
+        if relative == "knowledge/concepts/original.md" and not attacked:
+            attacked = True
+            if attack == "content":
+                target.write_text("changed after snapshot", encoding="utf-8")
+            else:
+                target.unlink()
+                if attack == "symlink":
+                    target.symlink_to(outside)
+                else:
+                    target.hardlink_to(outside)
+        return original_reader(root, relative)
+
+    monkeypatch.setattr(staging, "_read_safe_regular", mutate_after_snapshot, raising=False)
+    real_before = (memory_home / "knowledge/concepts/original.md").read_bytes()
+    with pytest.raises(StageValidationError, match="stage|symlink|hard-linked"):
+        apply_validated_stage(validated, stage.baseline, ApplyBookkeeping())
+    assert (memory_home / "knowledge/concepts/original.md").read_bytes() == real_before
+    assert outside.read_text(encoding="utf-8") == "attacker bytes"
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("transition", ["prepared", "applying", "complete"])
+def test_journal_transition_crash_leaves_recoverable_atomic_record(
+    memory_home, transition
+):
+    from staging import apply_host_bookkeeping
+
+    state_path = memory_home / "scripts/state.json"
+    original = state_path.read_bytes()
+
+    def crash(phase):
+        if phase == transition:
+            raise SimulatedCrash(phase)
+
+    with pytest.raises(SimulatedCrash):
+        apply_host_bookkeeping(
+            memory_home,
+            ApplyBookkeeping(
+                state={"ingested": {}, "transition": transition},
+                state_baseline=capture_file_baseline(state_path),
+                journal_transition_injector=crash,
+            ),
+        )
+
+    journals = list((memory_home / "scripts/memory-apply-journal").glob("*.json"))
+    if journals:
+        payload = json.loads(journals[0].read_text(encoding="utf-8"))
+        assert payload["state"] in {"prepared", "applying", "complete"}
+    recover_incomplete_apply(memory_home)
+    expected_new = (json.dumps({"ingested": {}, "transition": transition}, indent=2) + "\n").encode()
+    assert state_path.read_bytes() in {original, expected_new}
+    assert list((memory_home / "scripts/memory-apply-journal").glob("*")) == []
+
+
+def test_recovery_removes_orphan_atomic_journal_temps(memory_home):
+    directory = memory_home / "scripts/memory-apply-journal"
+    directory.mkdir(mode=0o700)
+    orphan = directory / ".apply-dead.json.partial.tmp"
+    orphan.write_bytes(b"torn")
+    orphan.chmod(0o600)
+
+    assert recover_incomplete_apply(memory_home) is False
+    assert not orphan.exists()
+
+
+def test_failed_atomic_journal_publish_retains_prior_valid_record(memory_home, monkeypatch):
+    import staging
+
+    directory = memory_home / "scripts/memory-apply-journal"
+    directory.mkdir(mode=0o700)
+    journal = directory / "apply-test.json"
+    prior = b'{"state":"prepared","version":1}\n'
+    journal.write_bytes(prior)
+    journal.chmod(0o600)
+    real_replace = staging.os.replace
+
+    def fail_journal_replace(source, destination):
+        if Path(destination) == journal:
+            raise OSError("simulated power loss before publish")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(staging.os, "replace", fail_journal_replace)
+    with pytest.raises(OSError, match="power loss"):
+        staging._atomic_journal_transition(journal, b'{"state":"applying"}\n')
+    assert journal.read_bytes() == prior
+    assert list(directory.glob(".*.tmp")) == []
+
+
+def test_compile_without_article_requires_valid_append_only_build_log(memory_home):
+    stage = create_stage(memory_home, "job", "no-article")
+    with pytest.raises(StageValidationError, match="build log"):
+        validate_stage(
+            stage,
+            allowed_paths=("knowledge/index.md", "knowledge/log.md"),
+            task="compile",
+        )
+
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "## [2026-08-11T12:00:00+00:00] compile | 2026-08-11.md\n"
+            "- Articles created: (none)\n"
+        )
+    validate_stage(
+        stage,
+        allowed_paths=("knowledge/index.md", "knowledge/log.md"),
+        task="compile",
+    )
+
+
+@pytest.mark.parametrize("corrupt", ["index", "log"])
+def test_validation_rejects_total_index_or_log_corruption_without_article_changes(
+    memory_home, corrupt
+):
+    stage = create_stage(memory_home, "job", f"corrupt-{corrupt}")
+    (stage.root / "knowledge/index.md").write_text(
+        "totally corrupt\n" if corrupt == "index" else stage.root.joinpath("knowledge/index.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (stage.root / "knowledge/log.md").write_text(
+        "rewritten history\n"
+        if corrupt == "log"
+        else stage.root.joinpath("knowledge/log.md").read_text(encoding="utf-8")
+        + "## [now] compile | source.md\n- Articles created: (none)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(StageValidationError, match=corrupt):
+        validate_stage(
+            stage,
+            allowed_paths=("knowledge/index.md", "knowledge/log.md"),
+            task="compile",
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        '"unterminated',
+        "'unterminated",
+        "[one, 'unterminated]",
+        "[one,,two]",
+        "[one, two",
+        "null",
+        "~",
+        "&anchor value",
+        "*alias",
+        "!tag value",
+        "{nested: value}",
+        "plain: mapping",
+    ],
+)
+def test_frontmatter_safe_yaml_subset_rejects_ambiguous_constructs(
+    memory_home, bad_value
+):
+    relative, body, task = _schema_article("concept")
+    body = body.replace('title: "Original"', f"title: {bad_value}")
+    stage = create_stage(memory_home, "job", f"yaml-{hashlib.sha256(bad_value.encode()).hexdigest()[:8]}")
+    _write(stage.root / relative, body)
+    slug = relative.removeprefix("knowledge/").removesuffix(".md")
+    with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"| [[{slug}]] | memory | Added | source | 2026-08-11 |\n")
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"## [now] {task} | source\n- Created: [[{slug}]]\n")
+    with pytest.raises(StageValidationError, match="frontmatter|title"):
+        validate_stage(
+            stage,
+            allowed_paths=(relative, "knowledge/index.md", "knowledge/log.md"),
+            task=task,
+        )
+
+
+def test_create_stage_rejects_scripts_ancestor_symlink_without_external_write(tmp_path):
+    home = tmp_path / "memory"
+    external = tmp_path / "external"
+    home.mkdir()
+    external.mkdir()
+    _write(home / "AGENTS.md", "# schema\n")
+    _write(home / "knowledge/index.md", "# Index\n")
+    _write(home / "knowledge/log.md", "# Build Log\n")
+    (home / "scripts").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(StageValidationError, match="symlink"):
+        create_stage(home, "job", "attempt")
+    assert list(external.iterdir()) == []
+
+
+def test_apply_rejects_stage_and_bookkeeping_destination_collision(memory_home):
+    stage = _compile_stage(memory_home, attempt_id="collision")
+    validated = validate_stage(
+        stage,
+        allowed_paths=("knowledge/concepts/*.md", "knowledge/index.md", "knowledge/log.md"),
+        task="compile",
+    )
+    relative = "knowledge/concepts/original.md"
+    with pytest.raises(StageValidationError, match="collision"):
+        apply_validated_stage(
+            validated,
+            stage.baseline,
+            ApplyBookkeeping(
+                extra_updates={relative: b"host overwrite"},
+                input_baselines={relative: capture_file_baseline(memory_home / relative)},
+            ),
+        )
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_extra_updates_require_exact_destination_baseline(memory_home, exists):
+    from staging import apply_host_bookkeeping
+
+    relative = "scripts/provider-usage.json"
+    destination = memory_home / relative
+    if exists:
+        destination.write_bytes(b"owner-current")
+    with pytest.raises(StageValidationError, match="baseline"):
+        apply_host_bookkeeping(
+            memory_home,
+            ApplyBookkeeping(extra_updates={relative: b"replacement"}),
+        )
+
+    baseline = capture_file_baseline(destination)
+    if exists:
+        destination.write_bytes(b"concurrent")
+    else:
+        destination.write_bytes(b"created concurrently")
+    with pytest.raises(RetryableApplyError, match="baseline"):
+        apply_host_bookkeeping(
+            memory_home,
+            ApplyBookkeeping(
+                extra_updates={relative: b"replacement"},
+                input_baselines={relative: baseline},
+            ),
+        )
+
+
+def _capture_job() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=7,
+        kind="capture",
+        source_agent="codex",
+        session_id="private-session-id",
+        source_hash="source-hash",
+        project="memory",
+        cwd="/tmp/memory",
+    )
+
+
+def test_worker_daily_capture_identity_makes_retry_exactly_once(tmp_path, monkeypatch):
+    from worker import daily_writer_boundary
+
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    job = _capture_job()
+    daily_writer_boundary(job, "persist once")
+    daily_writer_boundary(job, "persist once")
+
+    content = next((tmp_path / "daily").glob("*.md")).read_text(encoding="utf-8")
+    assert content.count("persist once") == 1
+    assert content.count("@capture-id:") == 1
+    marker = content.split("@capture-id:", 1)[1].split(" ", 1)[0]
+    assert len(marker) == 64
+    assert job.session_id not in marker
+
+
+def _successful_router(text):
+    from providers import ProviderResult, RoutedResult, TaskKind
+
+    result = ProviderResult("codex", "luna", TaskKind.EXTRACT, "success", text=text)
+
+    class Router:
+        async def generate_text(self, _request):
+            return RoutedResult.from_result(result, (result,), None)
+
+    return Router()
+
+
+def test_worker_crash_after_append_before_queue_complete_retries_without_duplicate(
+    tmp_path, monkeypatch
+):
+    from worker import MemoryWorker
+
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    job = _capture_job()
+    job.payload = {"rendered_context": "capture"}
+    job.attempt_count = 1
+    job.status = "leased"
+    job.lease_owner = "worker"
+
+    class Queue:
+        completes = 0
+
+        def renew(self, *_args):
+            return True
+
+        def record_attempt(self, *_args):
+            return None
+
+        def complete(self, *_args):
+            self.completes += 1
+            if self.completes == 1:
+                raise RuntimeError("crash after append")
+
+        def get_job(self, _job_id):
+            return job
+
+        def retry(self, *_args):
+            return None
+
+    queue = Queue()
+    worker = MemoryWorker(queue, _successful_router("crash-gap"), owner="worker")
+    asyncio.run(worker.process(job))
+    asyncio.run(worker.process(job))
+
+    content = next((tmp_path / "daily").glob("*.md")).read_text(encoding="utf-8")
+    assert queue.completes == 2
+    assert content.count("crash-gap") == 1
+
+
+def test_lease_loss_after_append_allows_thread_to_finish_without_duplicate(
+    tmp_path, monkeypatch
+):
+    from worker import MemoryWorker, daily_writer_boundary
+
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    job = _capture_job()
+    job.payload = {"rendered_context": "capture"}
+    job.attempt_count = 1
+    job.status = "leased"
+    job.lease_owner = "worker"
+    appended = threading.Event()
+    renewals = iter((True, False))
+
+    def append_then_pause(current_job, text):
+        daily_writer_boundary(current_job, text)
+        appended.set()
+        time.sleep(0.05)
+
+    class Queue:
+        completed = False
+
+        def renew(self, *_args):
+            return next(renewals)
+
+        def record_attempt(self, *_args):
+            return None
+
+        def complete(self, *_args):
+            self.completed = True
+
+        def get_job(self, _job_id):
+            return job
+
+        def retry(self, *_args):
+            return None
+
+    async def wait_for_append(_seconds):
+        while not appended.is_set():
+            await asyncio.sleep(0)
+
+    queue = Queue()
+    worker = MemoryWorker(
+        queue,
+        _successful_router("lease-gap"),
+        daily_writer=append_then_pause,
+        owner="worker",
+        heartbeat_sleeper=wait_for_append,
+    )
+    asyncio.run(worker.process(job))
+    daily_writer_boundary(job, "lease-gap")
+
+    content = next((tmp_path / "daily").glob("*.md")).read_text(encoding="utf-8")
+    assert queue.completed is False
+    assert content.count("lease-gap") == 1
+
+
+def test_sync_daily_writer_does_not_block_heartbeat_event_loop():
+    from worker import MemoryWorker
+
+    events = []
+
+    def blocking_writer(_job, _text):
+        time.sleep(0.05)
+        events.append("writer-finished")
+
+    worker = MemoryWorker(
+        SimpleNamespace(),
+        router=SimpleNamespace(),
+        daily_writer=blocking_writer,
+    )
+
+    async def exercise():
+        async def heartbeat_tick():
+            await asyncio.sleep(0.005)
+            events.append("heartbeat")
+
+        await asyncio.gather(worker._write(_capture_job(), "text"), heartbeat_tick())
+
+    asyncio.run(exercise())
+    assert events == ["heartbeat", "writer-finished"]
+
+
+def test_cancel_after_daily_append_then_retry_is_exactly_once(tmp_path, monkeypatch):
+    from worker import MemoryWorker, daily_writer_boundary
+
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    appended = threading.Event()
+    release = threading.Event()
+    job = _capture_job()
+
+    def append_then_block(current_job, text):
+        daily_writer_boundary(current_job, text)
+        appended.set()
+        release.wait(timeout=1)
+
+    worker = MemoryWorker(SimpleNamespace(), router=SimpleNamespace(), daily_writer=append_then_block)
+
+    async def cancel_and_retry():
+        first = asyncio.create_task(worker._write(job, "cancel-safe"))
+        assert await asyncio.to_thread(appended.wait, 0.5)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        await worker._write(job, "cancel-safe")
+
+    asyncio.run(cancel_and_retry())
+    content = next((tmp_path / "daily").glob("*.md")).read_text(encoding="utf-8")
+    assert content.count("cancel-safe") == 1
+
+
+def test_reconcile_dry_run_detects_journal_without_mutation(tmp_path, monkeypatch):
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "reconcile-state.py"
+    spec = importlib.util.spec_from_file_location("reconcile_state_dry_run_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    home = tmp_path / "memory"
+    journal_dir = home / "scripts/memory-apply-journal"
+    journal_dir.mkdir(parents=True)
+    journal = journal_dir / "crash.json"
+    journal.write_bytes(b'{"incomplete":true}\n')
+    before = journal.read_bytes()
+    monkeypatch.setattr(module, "DAILY_DIR", home / "daily")
+    monkeypatch.setattr(
+        module,
+        "load_state_with_baseline",
+        lambda: (_ for _ in ()).throw(AssertionError("must not read state")),
+    )
+    monkeypatch.setattr("sys.argv", [str(path), "--dry-run"])
+
+    with pytest.raises(SystemExit):
+        module.main()
+    assert journal.read_bytes() == before
+    assert not (home / "scripts/memory-writer.lock").exists()
+
+
+def test_atomic_replace_preserves_existing_mode(memory_home):
+    stage = _compile_stage(memory_home, attempt_id="mode")
+    validated = validate_stage(
+        stage,
+        allowed_paths=("knowledge/concepts/*.md", "knowledge/index.md", "knowledge/log.md"),
+        task="compile",
+    )
+    article = memory_home / "knowledge/concepts/original.md"
+    article.chmod(0o640)
+    apply_validated_stage(validated, stage.baseline, ApplyBookkeeping())
+    assert stat.S_IMODE(article.stat().st_mode) == 0o640
+
+
+def test_exclusive_file_lock_rejects_nested_acquire(tmp_path):
+    lock = ExclusiveFileLock(tmp_path / "writer.lock")
+    assert lock.acquire() is True
+    try:
+        with pytest.raises(RuntimeError, match="already acquired"):
+            lock.acquire()
+    finally:
+        lock.release()
+
+
+def test_create_stage_omits_state_by_default(memory_home):
+    stage = create_stage(memory_home, "job", "no-state")
+    assert "scripts/state.json" not in stage.baseline
+    assert not (stage.root / "scripts/state.json").exists()
+
+
+def test_new_daily_file_fsyncs_daily_directory_and_root(tmp_path, monkeypatch):
+    import utils
+
+    synced = []
+    monkeypatch.setattr(utils, "_fsync_directory", lambda path: synced.append(Path(path)))
+    timestamp = __import__("datetime").datetime(
+        2026, 8, 11, 12, tzinfo=__import__("datetime").timezone.utc
+    )
+    utils.append_daily_entry(tmp_path, "durable", now=timestamp)
+    assert synced == [tmp_path / "daily", tmp_path]

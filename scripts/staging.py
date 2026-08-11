@@ -60,7 +60,7 @@ class Stage:
     job_id: str = "unknown"
     attempt_id: str = "unknown"
     relevant_articles: tuple[str, ...] = ()
-    include_state: bool = True
+    include_state: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,7 @@ class ApplyBookkeeping:
     input_baselines: Mapping[str, FileBaseline] = field(default_factory=dict)
     extra_updates: Mapping[str, bytes | str] = field(default_factory=dict)
     failure_injector: Callable[[int, str], None] | None = None
+    journal_transition_injector: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,74 @@ def _safe_destination(root: Path, relative: str, *, allow_missing: bool = True) 
     except ValueError as exc:
         raise StageValidationError(f"path escapes staging root: {relative}") from exc
     return candidate
+
+
+def _validate_directory_identity(path: Path, *, mode: int | None = None) -> None:
+    if path.is_symlink():
+        raise StageValidationError(f"directory must not be a symlink: {path}")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise StageValidationError(f"path must be a directory: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise StageValidationError(f"directory has an unsafe owner: {path}")
+    if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+        raise StageValidationError(f"directory must have mode {mode:o}: {path}")
+
+
+def _prepare_stage_parent(home: Path) -> Path:
+    if not home.exists() or home.is_symlink():
+        raise StageValidationError("memory home must be an existing non-symlink directory")
+    _validate_directory_identity(home)
+    scripts = home / "scripts"
+    if scripts.exists() or scripts.is_symlink():
+        _validate_directory_identity(scripts)
+    else:
+        scripts.mkdir(mode=0o700)
+    stage_parent = scripts / "staging"
+    if stage_parent.exists() or stage_parent.is_symlink():
+        _validate_directory_identity(stage_parent)
+        stage_parent.chmod(0o700)
+    else:
+        stage_parent.mkdir(mode=0o700)
+    return stage_parent
+
+
+def _validate_stage_location(stage: Stage) -> None:
+    home = stage.memory_home
+    _validate_directory_identity(home)
+    scripts = home / "scripts"
+    stage_parent = scripts / "staging"
+    _validate_directory_identity(scripts)
+    _validate_directory_identity(stage_parent)
+    if stage.root.parent.absolute() != stage_parent.absolute():
+        raise StageValidationError("stage root is outside the private staging directory")
+    _validate_directory_identity(stage.root, mode=0o700)
+
+
+def _read_safe_regular(root: Path, relative: str) -> bytes:
+    """Read a root-relative regular file once through a no-follow descriptor."""
+    target = _safe_destination(root, relative, allow_missing=False)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        raise StageValidationError(f"stage file could not be opened safely: {relative}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise StageValidationError(f"stage file must be regular: {relative}")
+        if info.st_nlink != 1:
+            raise StageValidationError(f"stage file must not be hard-linked: {relative}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise StageValidationError(f"stage file has an unsafe owner: {relative}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
 
 
 def _private_directory(path: Path) -> None:
@@ -208,7 +277,12 @@ def _write_private_file(path: Path, data: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
-        os.write(descriptor, data)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("private file write made no progress")
+            view = view[written:]
         os.fsync(descriptor)
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
@@ -223,10 +297,10 @@ def create_stage(
     *,
     daily_source: str | Path | None = None,
     relevant_articles: Sequence[str | Path] = (),
-    include_state: bool = True,
+    include_state: bool = False,
 ) -> Stage:
     """Create a fresh owner-only stage containing the minimum requested files."""
-    home = Path(memory_home).expanduser().resolve()
+    home = Path(os.path.abspath(Path(memory_home).expanduser()))
     normalized_daily = _relative_path(daily_source) if daily_source is not None else None
     if normalized_daily is not None and not normalized_daily.startswith("daily/"):
         raise StageValidationError("daily source must be below daily/")
@@ -238,8 +312,7 @@ def create_stage(
                 "knowledge/connections, or knowledge/qa"
             )
 
-    stage_parent = home / "scripts" / "staging"
-    _private_directory(stage_parent)
+    stage_parent = _prepare_stage_parent(home)
     stage_root = stage_parent / f"{_safe_identifier(job_id)}-{_safe_identifier(attempt_id)}"
     if stage_root.exists() or stage_root.is_symlink():
         raise StageValidationError(f"stage must be fresh: {stage_root.name}")
@@ -336,6 +409,101 @@ def _validate_utf8(stage_root: Path, paths: Sequence[str]) -> None:
             raise StageValidationError(f"malformed UTF-8 in {relative}") from exc
 
 
+def _parse_yaml_scalar(raw: str, key: str, relative: str) -> str:
+    value = raw.strip()
+    if not value or value.lower() in {"null", "~"}:
+        raise StageValidationError(f"article frontmatter {key} has an invalid scalar: {relative}")
+    if value.startswith(("&", "*", "!", "<<")):
+        raise StageValidationError(
+            f"article frontmatter {key} uses forbidden YAML syntax: {relative}"
+        )
+    if value[0] == '"':
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise StageValidationError(
+                f"article frontmatter {key} has malformed quotes: {relative}"
+            ) from exc
+        if not isinstance(decoded, str) or not decoded:
+            raise StageValidationError(
+                f"article frontmatter {key} must be a non-empty scalar: {relative}"
+            )
+        return decoded
+    if value[0] == "'":
+        if len(value) < 2 or value[-1] != "'":
+            raise StageValidationError(
+                f"article frontmatter {key} has malformed quotes: {relative}"
+            )
+        inner = value[1:-1]
+        if "'" in inner.replace("''", "") or not inner:
+            raise StageValidationError(
+                f"article frontmatter {key} has malformed quotes: {relative}"
+            )
+        return inner.replace("''", "'")
+    forbidden_prefixes = ("- ", "? ", "|", ">", "@", "`", "%", "---", "...")
+    if (
+        value.startswith(forbidden_prefixes)
+        or any(character in value for character in "\"'{}[]")
+        or ":" in value
+        or " #" in value
+        or re.search(r"(?:^|\s)[&*!]", value)
+    ):
+        raise StageValidationError(
+            f"article frontmatter {key} uses unsupported YAML syntax: {relative}"
+        )
+    return value
+
+
+def _parse_inline_yaml_list(raw: str, key: str, relative: str) -> list[str]:
+    if not raw.endswith("]"):
+        raise StageValidationError(f"article has malformed inline list for {key}: {relative}")
+    inner = raw[1:-1]
+    if not inner.strip():
+        return []
+    pieces: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(inner):
+        character = inner[index]
+        if quote == '"':
+            current.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif quote == "'":
+            current.append(character)
+            if character == "'":
+                if index + 1 < len(inner) and inner[index + 1] == "'":
+                    current.append(inner[index + 1])
+                    index += 1
+                else:
+                    quote = None
+        elif character in {'"', "'"}:
+            quote = character
+            current.append(character)
+        elif character == ",":
+            piece = "".join(current).strip()
+            if not piece:
+                raise StageValidationError(
+                    f"article has malformed inline list for {key}: {relative}"
+                )
+            pieces.append(piece)
+            current = []
+        else:
+            current.append(character)
+        index += 1
+    piece = "".join(current).strip()
+    if quote is not None or escaped or not piece:
+        raise StageValidationError(f"article has malformed inline list for {key}: {relative}")
+    pieces.append(piece)
+    return [_parse_yaml_scalar(piece, key, relative) for piece in pieces]
+
+
 def _validate_frontmatter(relative: str, content: str) -> None:
     if not content.startswith("---\n"):
         raise StageValidationError(f"article has malformed frontmatter: {relative}")
@@ -344,7 +512,7 @@ def _validate_frontmatter(relative: str, content: str) -> None:
         raise StageValidationError(f"article has malformed frontmatter: {relative}")
     frontmatter = content[4:boundary]
     lines = frontmatter.splitlines()
-    values: dict[str, str | list[str] | dict[str, object]] = {}
+    values: dict[str, str | list[str]] = {}
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -360,34 +528,18 @@ def _validate_frontmatter(relative: str, content: str) -> None:
         if inline:
             normalized = inline.strip()
             if normalized.startswith("["):
-                if not normalized.endswith("]"):
-                    raise StageValidationError(
-                        f"article has malformed inline list for {key}: {relative}"
-                    )
-                items = [
-                    item.strip().strip('"\'')
-                    for item in normalized[1:-1].split(",")
-                    if item.strip().strip('"\'')
-                ]
-                values[key] = items
-            elif normalized.startswith("{"):
-                if not normalized.endswith("}"):
-                    raise StageValidationError(
-                        f"article has malformed inline mapping for {key}: {relative}"
-                    )
-                values[key] = {"inline-mapping": normalized[1:-1]}
+                values[key] = _parse_inline_yaml_list(normalized, key, relative)
             else:
-                scalar = normalized.strip('"\'')
-                values[key] = scalar if scalar not in {"", "{}"} else ""
+                values[key] = _parse_yaml_scalar(normalized, key, relative)
             index += 1
             continue
         items: list[str] = []
         index += 1
         while index < len(lines) and lines[index].startswith((" ", "\t")):
-            nested = lines[index].strip()
-            if not nested.startswith("-") or not nested[1:].strip().strip('"\''):
+            nested = lines[index]
+            if "\t" in nested or re.match(r"^  -\s+\S", nested) is None:
                 raise StageValidationError(f"article has malformed list for {key}: {relative}")
-            items.append(nested[1:].strip().strip('"\''))
+            items.append(_parse_yaml_scalar(nested.split("-", 1)[1], key, relative))
             index += 1
         values[key] = items
 
@@ -447,6 +599,35 @@ def _added_lines(before: str, after: str) -> list[str]:
     return added
 
 
+def _validate_index_structure(content: str) -> None:
+    rows = [line for line in content.splitlines() if line.startswith("|")]
+    if len(rows) < 2:
+        raise StageValidationError("knowledge index is malformed")
+    parsed = [[column.strip() for column in row.strip("|").split("|")] for row in rows]
+    if any(len(columns) != 5 or not all(columns) for columns in parsed):
+        raise StageValidationError("knowledge index is malformed")
+    expected_header = ["article", "project", "summary", "compiled from", "updated"]
+    if [column.lower() for column in parsed[0]] != expected_header:
+        raise StageValidationError("knowledge index header is malformed")
+    if any(re.fullmatch(r":?-{3,}:?", column) is None for column in parsed[1]):
+        raise StageValidationError("knowledge index separator is malformed")
+    if any(re.fullmatch(r"\[\[[^\]]+\]\]", columns[0]) is None for columns in parsed[2:]):
+        raise StageValidationError("knowledge index article row is malformed")
+
+
+def _validate_log_append(baseline: str, content: str, task: str) -> list[str]:
+    if not content.startswith(baseline):
+        raise StageValidationError("knowledge log must remain an exact append-only prefix")
+    appended = content[len(baseline):]
+    added_lines = appended.splitlines()
+    nonblank = [line for line in added_lines if line.strip()]
+    task_suffix = r"\s+\|\s+\S+" if task == "compile" else r"(?:\s+\|\s+\S+)?"
+    heading = rf"##\s+\[[^\]]+\]\s+{re.escape(task)}{task_suffix}"
+    if not appended or not nonblank or re.fullmatch(heading, nonblank[0]) is None:
+        raise StageValidationError("knowledge build log appended entry is malformed")
+    return added_lines
+
+
 def _validate_task_contract(
     stage: Stage,
     after: Mapping[str, ManifestEntry],
@@ -463,9 +644,21 @@ def _validate_task_contract(
         content = (stage.root / relative).read_text(encoding="utf-8")
         _validate_frontmatter(relative, content)
 
+    index = (stage.root / "knowledge/index.md").read_text(encoding="utf-8")
+    build_log = (stage.root / "knowledge/log.md").read_text(encoding="utf-8")
+    baseline_index = stage.baseline_bytes.get("knowledge/index.md", b"").decode("utf-8")
+    baseline_log = stage.baseline_bytes.get("knowledge/log.md", b"").decode("utf-8")
+    if "knowledge/index.md" in changed:
+        _validate_index_structure(index)
+    added_log_lines: list[str] = []
+    if "knowledge/log.md" in changed:
+        added_log_lines = _validate_log_append(baseline_log, build_log, task)
+
     if not article_changes:
         if task in {"file_answer", "connections"}:
             raise StageValidationError(f"{task} requires an article")
+        if task == "compile" and "knowledge/log.md" not in changed:
+            raise StageValidationError("compile requires a valid build log update")
         return
 
     if "knowledge/index.md" not in changed:
@@ -473,16 +666,7 @@ def _validate_task_contract(
     if "knowledge/log.md" not in changed:
         raise StageValidationError(f"{task} article changes require a build log update")
 
-    index = (stage.root / "knowledge/index.md").read_text(encoding="utf-8")
-    build_log = (stage.root / "knowledge/log.md").read_text(encoding="utf-8")
-    if "|" not in index:
-        raise StageValidationError("knowledge index is malformed")
-    baseline_index = stage.baseline_bytes.get("knowledge/index.md", b"").decode("utf-8")
-    baseline_log = stage.baseline_bytes.get("knowledge/log.md", b"").decode("utf-8")
-    if not build_log.startswith(baseline_log):
-        raise StageValidationError("knowledge/log.md must remain append-only")
     added_index_lines = _added_lines(baseline_index, index)
-    added_log_lines = _added_lines(baseline_log, build_log)
     has_new_log_heading = any(
         re.match(r"^##\s+\[[^\]]+\]\s+\S+", line) for line in added_log_lines
     )
@@ -522,9 +706,7 @@ def validate_stage(
     task: object,
 ) -> ValidatedStage:
     """Validate an attempted model edit and return its immutable change set."""
-    expected_parent = stage.memory_home / "scripts" / "staging"
-    if stage.root.is_symlink() or stage.root.resolve().parent != expected_parent.resolve():
-        raise StageValidationError("stage root is outside the private staging directory")
+    _validate_stage_location(stage)
     manifest_file = stage.root / _MANIFEST_NAME
     if (
         manifest_file.is_symlink()
@@ -638,7 +820,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_replace(path: Path, data: bytes) -> None:
+def _atomic_replace(path: Path, data: bytes, *, mode: int | None = None) -> None:
     parent_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.parent.is_symlink():
@@ -647,11 +829,20 @@ def _atomic_replace(path: Path, data: bytes) -> None:
         path.parent.chmod(0o700)
     if path.is_symlink():
         raise StageValidationError(f"destination must not be a symlink: {path}")
+    replacement_mode = 0o600 if mode is None else mode
+    if path.exists():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise StageValidationError(f"destination has an unsafe identity: {path}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise StageValidationError(f"destination has an unsafe owner: {path}")
+        if mode is None:
+            replacement_mode = stat.S_IMODE(info.st_mode)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
         if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
+            os.fchmod(descriptor, replacement_mode)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(data)
             handle.flush()
@@ -669,10 +860,44 @@ def _journal_path(home: Path) -> Path:
     return directory / f"apply-{uuid.uuid4().hex}.json"
 
 
+def _atomic_journal_transition(path: Path, data: bytes) -> None:
+    """Publish one complete journal state without truncating the prior state."""
+    _private_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise StageValidationError("journal has an unsafe identity")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise StageValidationError("journal has an unsafe owner")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _journal_bytes(
     home: Path,
     state: str,
-    operations: Sequence[tuple[str, bytes | None, bytes]],
+    operations: Sequence[tuple[str, bytes | None, bytes, int | None]],
 ) -> bytes:
     return (
         json.dumps(
@@ -684,9 +909,10 @@ def _journal_bytes(
                     {
                         "path": path,
                         "original": original.hex() if original is not None else None,
+                        "original_mode": original_mode,
                         "replacement": replacement.hex(),
                     }
-                    for path, original, replacement in operations
+                    for path, original, replacement, original_mode in operations
                 ],
             },
             sort_keys=True,
@@ -712,7 +938,12 @@ def _restore_operations(home: Path, entries: Sequence[Mapping[str, object]]) -> 
             destination.unlink(missing_ok=True)
             _fsync_directory(destination.parent)
         else:
-            _atomic_replace(destination, bytes.fromhex(str(original)))
+            stored_mode = entry.get("original_mode")
+            _atomic_replace(
+                destination,
+                bytes.fromhex(str(original)),
+                mode=int(stored_mode) if stored_mode is not None else None,
+            )
 
 
 def recover_incomplete_apply_unlocked(memory_home: Path | str) -> bool:
@@ -721,8 +952,11 @@ def recover_incomplete_apply_unlocked(memory_home: Path | str) -> bool:
     directory = home / "scripts" / "memory-apply-journal"
     if not directory.exists():
         return False
-    if directory.is_symlink():
-        raise StageValidationError("journal directory must not be a symlink")
+    _validate_directory_identity(directory)
+    directory.chmod(0o700)
+    for orphan in sorted(directory.glob(".*.tmp")):
+        orphan.unlink(missing_ok=True)
+    _fsync_directory(directory)
     recovered = False
     for journal in sorted(directory.glob("*.json")):
         if journal.is_symlink() or not journal.is_file():
@@ -744,6 +978,17 @@ def recover_incomplete_apply_unlocked(memory_home: Path | str) -> bool:
             recovered = True
         _remove_journal(journal)
     return recovered
+
+
+def has_incomplete_apply(memory_home: Path | str) -> bool:
+    """Read-only journal presence check for diagnostic/dry-run callers."""
+    home = Path(memory_home).expanduser().resolve()
+    directory = home / "scripts" / "memory-apply-journal"
+    if not directory.exists():
+        return False
+    if directory.is_symlink() or not directory.is_dir():
+        raise StageValidationError("journal directory has an unsafe identity")
+    return any(directory.glob("*.json")) or any(directory.glob(".*.tmp"))
 
 
 def recover_incomplete_apply(memory_home: Path | str | None = None) -> bool:
@@ -776,6 +1021,13 @@ def _same_baseline(current: FileBaseline, expected: FileBaseline) -> bool:
 
 
 def _verify_input_baselines(home: Path, bookkeeping: ApplyBookkeeping) -> None:
+    normalized_inputs = {_relative_path(path) for path in bookkeeping.input_baselines}
+    for raw_path in bookkeeping.extra_updates:
+        relative = _relative_path(raw_path)
+        if relative not in normalized_inputs:
+            raise StageValidationError(
+                f"extra update requires an exact destination baseline: {relative}"
+            )
     for raw_path, expected in bookkeeping.input_baselines.items():
         relative = _relative_path(raw_path)
         current = capture_file_baseline(_safe_destination(home, relative))
@@ -804,8 +1056,7 @@ def _bookkeeping_updates(
         marker_relative = relative
         if not bookkeeping.compiled_at:
             raise StageValidationError("compiled_at is required with a compiled marker")
-        source = _safe_destination(home, relative, allow_missing=False)
-        updates[relative] = source.read_bytes() + (
+        updates[relative] = _read_safe_regular(home, relative) + (
             f"\n<!-- @compiled-through:{bookkeeping.compiled_at} -->\n"
         ).encode()
     if bookkeeping.state is not None:
@@ -842,23 +1093,34 @@ def _commit_replacements_unlocked(
     home: Path,
     replacements: Mapping[str, bytes],
     failure_injector: Callable[[int, str], None] | None = None,
+    journal_transition_injector: Callable[[str], None] | None = None,
 ) -> tuple[str, ...]:
-    operations: list[tuple[str, bytes | None, bytes]] = []
+    operations: list[tuple[str, bytes | None, bytes, int | None]] = []
     for relative, replacement in sorted(replacements.items()):
         destination = _safe_destination(home, relative)
-        original = destination.read_bytes() if destination.exists() else None
-        operations.append((relative, original, replacement))
+        if destination.exists():
+            original = _read_safe_regular(home, relative)
+            original_mode = stat.S_IMODE(destination.lstat().st_mode)
+        else:
+            original = None
+            original_mode = None
+        operations.append((relative, original, replacement, original_mode))
 
     journal = _journal_path(home)
-    _write_private_file(journal, _journal_bytes(home, "prepared", operations))
-    _fsync_directory(journal.parent)
+    _atomic_journal_transition(journal, _journal_bytes(home, "prepared", operations))
+    if journal_transition_injector is not None:
+        journal_transition_injector("prepared")
     try:
-        _write_private_file(journal, _journal_bytes(home, "applying", operations))
-        for step, (relative, _original, replacement) in enumerate(operations, 1):
+        _atomic_journal_transition(journal, _journal_bytes(home, "applying", operations))
+        if journal_transition_injector is not None:
+            journal_transition_injector("applying")
+        for step, (relative, _original, replacement, _mode) in enumerate(operations, 1):
             _atomic_replace(_safe_destination(home, relative), replacement)
             if failure_injector is not None:
                 failure_injector(step, relative)
-        _write_private_file(journal, _journal_bytes(home, "complete", operations))
+        _atomic_journal_transition(journal, _journal_bytes(home, "complete", operations))
+        if journal_transition_injector is not None:
+            journal_transition_injector("complete")
         _remove_journal(journal)
     except Exception as exc:
         try:
@@ -868,8 +1130,9 @@ def _commit_replacements_unlocked(
                     {
                         "path": relative,
                         "original": original.hex() if original is not None else None,
+                        "original_mode": original_mode,
                     }
-                    for relative, original, _replacement in operations
+                    for relative, original, _replacement, original_mode in operations
                 ],
             )
             _remove_journal(journal)
@@ -893,7 +1156,10 @@ def apply_host_bookkeeping(
         _verify_state_baseline(home, bookkeeping)
         replacements = _bookkeeping_updates(home, bookkeeping)
         changed = _commit_replacements_unlocked(
-            home, replacements, bookkeeping.failure_injector
+            home,
+            replacements,
+            bookkeeping.failure_injector,
+            bookkeeping.journal_transition_injector,
         )
     return ApplyResult(changed, recovered_journal=recovered)
 
@@ -908,6 +1174,7 @@ def apply_validated_stage(
         raise StageValidationError("apply requires a validated stage")
     if dict(baseline) != dict(stage.before):
         raise StageValidationError("baseline does not match the validated stage")
+    _validate_stage_location(stage.stage)
     after_manifest = stage.root / _AFTER_MANIFEST_NAME
     if (
         after_manifest.is_symlink()
@@ -925,6 +1192,14 @@ def apply_validated_stage(
     )
     if current_after != dict(stage.after) or current_changed != stage.changed_paths:
         raise StageValidationError("stage changed after validation")
+    stage_replacements: dict[str, bytes] = {}
+    for relative in stage.changed_paths:
+        data = _read_safe_regular(stage.root, relative)
+        expected = stage.after.get(relative)
+        if expected is None or _entry(data) != expected:
+            raise StageValidationError(f"stage file changed during apply: {relative}")
+        stage_replacements[relative] = data
+    _validate_stage_location(stage.stage)
 
     home = stage.memory_home
     recovered = False
@@ -943,13 +1218,19 @@ def apply_validated_stage(
         _verify_input_baselines(home, bookkeeping)
         _verify_state_baseline(home, bookkeeping)
 
-        replacements = {
-            relative: _safe_destination(stage.root, relative, allow_missing=False).read_bytes()
-            for relative in stage.changed_paths
-        }
-        replacements.update(_bookkeeping_updates(home, bookkeeping))
+        replacements = dict(stage_replacements)
+        host_updates = _bookkeeping_updates(home, bookkeeping)
+        collisions = sorted(set(replacements) & set(host_updates))
+        if collisions:
+            raise StageValidationError(
+                f"stage and bookkeeping destination collision: {', '.join(collisions)}"
+            )
+        replacements.update(host_updates)
         changed = _commit_replacements_unlocked(
-            home, replacements, bookkeeping.failure_injector
+            home,
+            replacements,
+            bookkeeping.failure_injector,
+            bookkeeping.journal_transition_injector,
         )
 
     discard_stage(stage)

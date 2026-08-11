@@ -28,12 +28,17 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from compile import COMPILED_MARKER_RE, commit_compiled_bookkeeping  # noqa: E402
 from config import DAILY_DIR, KNOWLEDGE_DIR, now_iso  # noqa: E402
-from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply  # noqa: E402
+from staging import (  # noqa: E402
+    ApplyBookkeeping,
+    apply_host_bookkeeping,
+    has_incomplete_apply,
+    recover_incomplete_apply,
+)
 from utils import load_state_with_baseline, read_text_with_baseline  # noqa: E402
 
 LOG_MD_PATH = KNOWLEDGE_DIR / "log.md"
+COMPILED_MARKER_RE = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
 COMPILE_ENTRY_RE = re.compile(r"^##\s+\[[^\]]+\]\s+compile\s+\|\s+(\S+\.md)", re.MULTILINE)
 
 
@@ -49,7 +54,16 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Report changes without writing")
     args = parser.parse_args()
 
-    recover_incomplete_apply(DAILY_DIR.parent)
+    if args.dry_run:
+        if has_incomplete_apply(DAILY_DIR.parent):
+            print(
+                "Cannot dry-run while a memory apply journal needs recovery; "
+                "run reconcile-state.py without --dry-run first.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    else:
+        recover_incomplete_apply(DAILY_DIR.parent)
     state, _initial_state_baseline = load_state_with_baseline()
     ingested = state.setdefault("ingested", {})
 
@@ -86,6 +100,8 @@ def main() -> None:
     if args.dry_run:
         print("\n(dry-run; no changes written)")
         return
+
+    from compile import commit_compiled_bookkeeping
 
     print("\nApplying...")
     now = now_iso()
