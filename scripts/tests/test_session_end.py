@@ -43,16 +43,22 @@ def test_claude_fixture_preserves_plain_turns(hook, fixture_dir):
 
 
 def test_claude_fixture_preserves_decisions_and_findings(hook, fixture_dir):
-    context, _ = hook.extract_conversation_context(
+    context, count = hook.extract_conversation_context(
         fixture_dir / "transcripts/claude-decisions.jsonl"
     )
     assert "[Decision requested]" in context
     assert "Resolved state" in context
-    assert "[Decision made]" in context
-    assert "On server resolution, Pill" in context
+    decision_result = next(
+        turn for turn in context.split("\n\n") if "[Decision made]" in turn
+    )
+    assert decision_result.startswith(
+        "**User:** [Decision made] Your questions have been answered"
+    )
+    assert "On server resolution, Pill" in decision_result
     assert "[Subagent result]" in context
     assert "SUBAGENT_FINDING" in context
     assert "TASK_FINDING" in context
     assert "SHOULD_NOT_APPEAR" not in context
     assert "Async agent launched" not in context
     assert "agentId" not in context
+    assert count == 5
