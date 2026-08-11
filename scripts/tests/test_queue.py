@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
 import sqlite3
+import stat
+import threading
 
 import pytest
 
@@ -109,6 +114,27 @@ def test_claim_is_atomic_and_cannot_be_claimed_twice(tmp_path):
         assert second.claim_next("worker-b", NOW, 120) is None
 
 
+def test_concurrent_claimers_observe_exactly_one_lease(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW) as repository:
+        job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    ready = threading.Barrier(3)
+
+    def claim(owner):
+        with QueueRepository(path, clock=lambda: NOW) as contender:
+            ready.wait()
+            job = contender.claim_next(owner, NOW, 120)
+            return job.id if job is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(claim, owner) for owner in ("worker-a", "worker-b")]
+        ready.wait()
+        claimed = [future.result(timeout=2) for future in futures]
+
+    assert sorted(result for result in claimed if result is not None) == [job_id]
+    assert claimed.count(None) == 1
+
+
 def test_renew_requires_the_current_owner(repository, tmp_path):
     job = repository.enqueue_capture(session(tmp_path))
     claimed = repository.claim_next("worker-a", NOW, 120)
@@ -164,3 +190,59 @@ def test_complete_and_dead_letter_transitions(tmp_path):
         assert dead.status == "dead"
         assert dead.completed_at == NOW
         assert dead.last_error == "second"
+
+
+def test_queue_database_and_sidecars_are_owner_only_with_typical_umask(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    previous = os.umask(0o022)
+    try:
+        with QueueRepository(path, clock=lambda: NOW) as repository:
+            repository.enqueue_capture(session(tmp_path))
+            present = [candidate for candidate in (
+                path,
+                Path(f"{path}-wal"),
+                Path(f"{path}-shm"),
+            ) if candidate.exists()]
+            assert len(present) == 3
+            assert all(stat.S_IMODE(candidate.stat().st_mode) == 0o600 for candidate in present)
+    finally:
+        os.umask(previous)
+
+
+def test_queue_rejects_symlink_database_target(tmp_path):
+    real = tmp_path / "attacker.sqlite3"
+    real.write_bytes(b"attacker bytes")
+    target = tmp_path / "jobs.sqlite3"
+    target.symlink_to(real)
+
+    with pytest.raises(ValueError, match="symlink"):
+        QueueRepository(target)
+
+    assert real.read_bytes() == b"attacker bytes"
+
+
+def test_persistence_errors_and_attempt_reasons_redact_credentials(tmp_path):
+    secret = "credential-value-never-persist"
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3",
+        clock=lambda: NOW,
+        redaction_env={"OPENAI_API_KEY": secret},
+    ) as repository:
+        job_id = repository.enqueue_capture(session(tmp_path)).job_id
+        repository.claim_next("worker", NOW, 30)
+        repository.record_attempt(
+            job_id,
+            ProviderResult(
+                "codex",
+                "luna",
+                TaskKind.EXTRACT,
+                "error",
+                reason=f"provider exposed {secret}\nacross lines",
+            ),
+        )
+        repository.retry(job_id, "worker", f"retry exposed {secret}\nacross lines", NOW)
+
+        assert secret not in repository.get_job(job_id).last_error
+        assert "[REDACTED]" in repository.get_job(job_id).last_error
+        assert secret not in repository.attempts_for(job_id)[0].reason
+        assert "[REDACTED]" in repository.attempts_for(job_id)[0].reason

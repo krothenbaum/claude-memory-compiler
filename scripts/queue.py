@@ -6,10 +6,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import sysconfig
-from typing import Callable, Literal
+from typing import Callable, Literal, Mapping
 
 try:
     from .providers import ProviderResult
@@ -42,10 +44,32 @@ JobStatus = Literal["pending", "leased", "succeeded", "failed", "dead"]
 SCHEMA_VERSION = 1
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
+_SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 
 
 class LeaseOwnershipError(RuntimeError):
     """Raised when a worker mutates a lease it does not own."""
+
+
+def normalize_persistence_reason(
+    reason: object,
+    env: Mapping[str, str],
+) -> str:
+    """Bound and redact metadata persisted at queue failure boundaries."""
+    normalized = " ".join(str(reason).split()) or "unspecified failure"
+    secrets = {
+        value
+        for name, value in env.items()
+        if value
+        and (
+            name in _SECRET_NAMES
+            or name.startswith("OPENAI_")
+            or name.startswith("AZURE_OPENAI_")
+        )
+    }
+    for secret in sorted(secrets, key=len, reverse=True):
+        normalized = normalized.replace(secret, "[REDACTED]")
+    return normalized[:MAX_ERROR_CHARS]
 
 
 def _utc_now() -> datetime:
@@ -141,25 +165,64 @@ class QueueRepository:
         busy_timeout_ms: int = 5_000,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clock: Callable[[], datetime] = _utc_now,
+        redaction_env: Mapping[str, str] | None = None,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
-        self.path = Path(path).expanduser().resolve()
+        self.path = Path(os.path.abspath(Path(path).expanduser()))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.parent.is_symlink():
+            raise ValueError("queue parent must not be a symlink")
+        self._prepare_private_database_files()
         self.max_attempts = max_attempts
         self._clock = clock
+        self._redaction_env = dict(os.environ if redaction_env is None else redaction_env)
         self._connection = sqlite3.connect(
             self.path,
             timeout=busy_timeout_ms / 1_000,
             isolation_level=None,
         )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._migrate()
+            self._secure_database_files()
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def _validate_private_file(self, path: Path) -> None:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"queue path must not be a symlink: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"queue path must be a regular file: {path}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"queue path is not owned by the current user: {path}")
+        if info.st_nlink != 1:
+            raise ValueError(f"queue path must not be hard-linked: {path}")
+        path.chmod(0o600)
+
+    def _prepare_private_database_files(self) -> None:
+        candidates = [self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")]
+        for candidate in candidates:
+            if candidate.exists() or candidate.is_symlink():
+                self._validate_private_file(candidate)
+        if not self.path.exists():
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.path, flags, 0o600)
+            os.close(descriptor)
+        self._validate_private_file(self.path)
+
+    def _secure_database_files(self) -> None:
+        for candidate in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            if candidate.exists() or candidate.is_symlink():
+                self._validate_private_file(candidate)
 
     def __enter__(self) -> "QueueRepository":
         return self
@@ -388,7 +451,11 @@ class QueueRepository:
                 _stored_time(started),
                 _stored_time(ended),
                 result.outcome,
-                result.reason[:MAX_ERROR_CHARS] if result.reason else None,
+                (
+                    normalize_persistence_reason(result.reason, self._redaction_env)
+                    if result.reason
+                    else None
+                ),
                 result.input_tokens,
                 result.output_tokens,
                 max(0, result.elapsed_ms),
@@ -439,7 +506,7 @@ class QueueRepository:
                 (
                     "dead" if dead else "failed",
                     _stored_time(available_at),
-                    " ".join(error.split())[:MAX_ERROR_CHARS],
+                    normalize_persistence_reason(error, self._redaction_env),
                     now,
                     now if dead else None,
                     job_id,
@@ -477,6 +544,15 @@ class QueueRepository:
 
     def count_jobs(self) -> int:
         return self._connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    def next_available_at(self) -> datetime | None:
+        row = self._connection.execute(
+            """
+            SELECT MIN(available_at) FROM jobs
+            WHERE status IN ('pending', 'failed')
+            """
+        ).fetchone()
+        return _loaded_time(row[0]) if row and row[0] is not None else None
 
     def attempts_for(self, job_id: int) -> list[ProviderAttempt]:
         rows = self._connection.execute(

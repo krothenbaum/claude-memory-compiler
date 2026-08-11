@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows exercises the msvcrt branch.
+    fcntl = None
 import json
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
+import time
 
 import pytest
 
+import capture as capture_module
 from capture import capture_transcript, enqueue_hook_input, launch_worker
-from providers import ProviderResult, RoutedResult, TaskKind
+from providers import ProviderResult, ProviderRouter, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
 from worker import MemoryWorker, SingletonDrainLock
 
@@ -142,6 +149,127 @@ def test_parser_failure_retains_private_safe_snapshot_without_queue_or_launch(tm
     assert launched == []
 
 
+def test_capture_fails_closed_under_database_contention_before_hook_deadline(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    database = home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(database, clock=lambda: NOW):
+        pass
+    locker = sqlite3.connect(database, isolation_level=None)
+    locker.execute("BEGIN IMMEDIATE")
+    launched = []
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            capture_transcript(
+                source,
+                source_agent="claude",
+                metadata={"trigger": "session_end"},
+                memory_home=home,
+                launcher=lambda root: launched.append(root),
+                env={},
+            )
+    finally:
+        elapsed = time.monotonic() - started
+        locker.execute("ROLLBACK")
+        locker.close()
+
+    assert elapsed < 1.0
+    assert launched == []
+    assert list((home / "scripts" / "spool").glob("*.jsonl"))
+
+
+def test_capture_rejects_symlinked_spool_component(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    home.mkdir()
+    (home / "scripts").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+            env={},
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("existing_kind", ["corrupt", "symlink"])
+def test_capture_rejects_unsafe_existing_deterministic_snapshot(tmp_path, existing_kind):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    spool = home / "scripts" / "spool"
+    spool.mkdir(parents=True)
+    normalized = capture_module.parse_claude_transcript(
+        source, {"trigger": "session_end"}
+    )
+    destination = spool / f"claude-{normalized.source_hash}.jsonl"
+    attacker = tmp_path / "attacker.jsonl"
+    attacker.write_bytes(b"attacker")
+    if existing_kind == "symlink":
+        destination.symlink_to(attacker)
+    else:
+        destination.write_bytes(b"attacker")
+
+    with pytest.raises(ValueError, match="snapshot"):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+            env={},
+        )
+
+    assert attacker.read_bytes() == b"attacker"
+    assert not (home / "scripts" / "jobs.sqlite3").exists()
+
+
+def test_snapshot_is_fsynced_before_directory_and_database_enqueue(tmp_path, monkeypatch):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    events = []
+
+    monkeypatch.setattr(
+        capture_module, "_fsync_file", lambda path: events.append(("file", Path(path)))
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_fsync_directory",
+        lambda path: events.append(("directory", Path(path))),
+    )
+
+    class RecordingQueue:
+        def enqueue_capture(self, normalized):
+            events.append(("enqueue", Path(normalized.source_path)))
+            return type("Result", (), {"created": True, "job": type(
+                "Job", (), {"id": 1, "source_path": normalized.source_path}
+            )()})()
+
+    capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        queue=RecordingQueue(),
+        launcher=lambda _: None,
+        env={},
+    )
+
+    names = [event[0] for event in events]
+    assert names.index("file") < names.index("directory") < names.index("enqueue")
+
+
 def test_launch_worker_is_detached_with_closed_standard_streams(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -174,6 +302,25 @@ def test_singleton_drain_lock_rejects_a_second_healthy_owner(tmp_path):
     first.release()
     assert second.acquire() is True
     second.release()
+
+
+def test_singleton_lock_respects_os_lock_even_with_incomplete_metadata(tmp_path):
+    if fcntl is None:
+        pytest.skip("POSIX advisory-lock adversary")
+    path = tmp_path / "memory-worker.lock"
+    with path.open("w+") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        contender = SingletonDrainLock(path)
+        assert contender.acquire() is False
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+
+def test_singleton_lock_ignores_stale_pid_text_without_an_os_lock(tmp_path):
+    path = tmp_path / "memory-worker.lock"
+    path.write_text(f"{__import__('os').getpid()}:old-token", encoding="utf-8")
+    lock = SingletonDrainLock(path)
+    assert lock.acquire() is True
+    lock.release()
 
 
 class FakeRouter:
@@ -246,7 +393,9 @@ def test_worker_retries_after_both_providers_fail_and_retains_spool(tmp_path):
             sleeper=lambda _: asyncio.sleep(0),
         )
 
-        assert asyncio.run(worker.drain()) == 1
+        claimed = repository.claim_next("worker", NOW, worker.lease_seconds)
+        assert claimed is not None
+        asyncio.run(worker.process(claimed))
         failed = repository.get_job(queued.job_id)
         assert failed.status == "failed"
         assert failed.available_at == NOW + timedelta(seconds=5)
@@ -270,3 +419,185 @@ def test_worker_exits_cleanly_when_another_drain_owns_lock(tmp_path):
             assert asyncio.run(worker.run_drain()) == 0
     finally:
         held.release()
+
+
+def test_worker_waits_for_future_retry_without_real_sleep(tmp_path):
+    current = [NOW]
+    sleeps = []
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        current[0] += timedelta(seconds=seconds)
+
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: current[0], max_attempts=2
+    ) as repository:
+        queued = enqueue_capture_job(repository, tmp_path)
+        failure = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "capacity", reason="full"
+        )
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(failure)),
+            daily_writer=lambda *_: None,
+            clock=lambda: current[0],
+            owner="worker",
+            jitter=lambda: 0,
+            sleeper=advance,
+        )
+
+        assert asyncio.run(worker.drain()) == 2
+        assert repository.get_job(queued.job_id).status == "dead"
+        assert sleeps == [1.0] * 5
+
+
+def test_contending_worker_waits_for_lock_handoff_and_drains_enqueued_job(tmp_path):
+    lock_path = tmp_path / "memory-worker.lock"
+    held = SingletonDrainLock(lock_path)
+    assert held.acquire()
+    released = []
+
+    async def handoff(_seconds):
+        if not released:
+            held.release()
+            released.append(True)
+        await asyncio.sleep(0)
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        enqueue_capture_job(repository, tmp_path)
+        success = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+        )
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(success)),
+            daily_writer=lambda *_: None,
+            clock=lambda: NOW,
+            lock_path=lock_path,
+            sleeper=handoff,
+        )
+        assert asyncio.run(worker.run_drain(wait_for_handoff=True)) == 1
+
+
+@pytest.mark.parametrize("renewal", [False, RuntimeError("database unavailable")])
+def test_heartbeat_lease_loss_cancels_provider_without_stale_transition(tmp_path, renewal):
+    cancelled = []
+
+    class HangingRouter:
+        async def generate_text(self, _request):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+    async def no_wait(_seconds):
+        await asyncio.sleep(0)
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        queued = enqueue_capture_job(repository, tmp_path)
+        job = repository.claim_next("worker", NOW, 30)
+
+        def renew(*_args):
+            if isinstance(renewal, Exception):
+                raise renewal
+            return renewal
+
+        repository.renew = renew
+        worker = MemoryWorker(
+            repository,
+            HangingRouter(),
+            daily_writer=lambda *_: (_ for _ in ()).throw(AssertionError("must not write")),
+            clock=lambda: NOW,
+            owner="worker",
+            lease_seconds=30,
+            sleeper=no_wait,
+            heartbeat_sleeper=no_wait,
+        )
+        asyncio.run(asyncio.wait_for(worker.process(job), timeout=0.2))
+
+        assert cancelled == [True]
+        assert repository.get_job(queued.job_id).status == "leased"
+
+
+def test_default_router_factory_persists_codex_before_hanging_fallback_is_cancelled(tmp_path):
+    codex_attempt = ProviderResult(
+        "codex", "luna", TaskKind.EXTRACT, "capacity", reason="full"
+    )
+
+    class Codex:
+        async def generate_text(self, _request):
+            return codex_attempt
+
+    class HangingClaude:
+        async def generate_text(self, _request):
+            await asyncio.Event().wait()
+
+    async def no_wait(_seconds):
+        await asyncio.sleep(0)
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        queued = enqueue_capture_job(repository, tmp_path)
+        job = repository.claim_next("worker", NOW, 30)
+        repository.renew = lambda *_: False
+        worker = MemoryWorker(
+            repository,
+            router_factory=lambda callback: ProviderRouter(
+                Codex(), HangingClaude(), attempt_callback=callback
+            ),
+            daily_writer=lambda *_: None,
+            clock=lambda: NOW,
+            owner="worker",
+            lease_seconds=30,
+            sleeper=no_wait,
+            heartbeat_sleeper=no_wait,
+        )
+
+        asyncio.run(asyncio.wait_for(worker.process(job), timeout=0.2))
+
+        attempts = repository.attempts_for(queued.job_id)
+        assert [(attempt.provider, attempt.outcome) for attempt in attempts] == [
+            ("codex", "capacity")
+        ]
+
+
+def test_heartbeat_lease_loss_cancels_writer_before_mutation(tmp_path):
+    renewal_results = iter([True, False])
+    writer_events = []
+    heartbeat_sleeps = []
+
+    async def blocking_writer(_job, _text):
+        writer_events.append("started")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            writer_events.append("cancelled")
+            raise
+
+    async def no_wait(_seconds):
+        heartbeat_sleeps.append(True)
+        if len(heartbeat_sleeps) == 1:
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        queued = enqueue_capture_job(repository, tmp_path)
+        job = repository.claim_next("worker", NOW, 30)
+        repository.renew = lambda *_: next(renewal_results)
+        success = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+        )
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(success)),
+            daily_writer=blocking_writer,
+            clock=lambda: NOW,
+            owner="worker",
+            lease_seconds=30,
+            heartbeat_sleeper=no_wait,
+        )
+
+        asyncio.run(asyncio.wait_for(worker.process(job), timeout=0.2))
+
+        assert writer_events == ["started", "cancelled"]
+        assert repository.get_job(queued.job_id).status == "leased"
