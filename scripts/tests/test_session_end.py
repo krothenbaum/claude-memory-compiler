@@ -5,7 +5,6 @@ a hyphen and so cannot be imported normally. Load it by path.
 """
 
 import importlib.util
-import json
 import os
 from pathlib import Path
 
@@ -29,119 +28,31 @@ def hook():
     return _load_hook_module()
 
 
-def _write_transcript(path: Path, entries: list[dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e) + "\n")
+@pytest.fixture
+def fixture_dir():
+    return Path(__file__).resolve().parent / "fixtures"
 
 
-def _tool_heavy_entries() -> list[dict]:
-    """A transcript whose substance lives in tools: a subagent result and an
-    AskUserQuestion decision, plus routine Read noise that must be dropped."""
-    return [
-        {"message": {"role": "user", "content": "Plan the confirmation card."}},
-        {"message": {"role": "assistant", "content": [
-            {"type": "text", "text": "Let me research Fabric."},
-            {"type": "tool_use", "id": "t1", "name": "Agent",
-             "input": {"description": "Research Fabric", "subagent_type": "Explore",
-                       "prompt": "..."}},
-        ]}},
-        {"message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1",
-             "content": "SUBAGENT_FINDING: Fabric Avatar is already a rounded "
-                        "square in Encore."},
-        ]}},
-        {"message": {"role": "assistant", "content": [
-            {"type": "text", "text": "Here are the options."},
-            {"type": "tool_use", "id": "t2", "name": "AskUserQuestion",
-             "input": {"questions": [
-                 {"question": "When should the card switch to the Confirmed state?",
-                  "header": "Resolved state",
-                  "multiSelect": False,
-                  "options": [
-                      {"label": "On server resolution, Pill", "description": "..."},
-                      {"label": "Optimistic on click", "description": "..."},
-                  ]},
-             ]}},
-        ]}},
-        {"message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t2",
-             "content": 'Your questions have been answered: "When should the card '
-                        'switch to the Confirmed state?"="On server resolution, '
-                        'Pill". You can now continue.'},
-        ]}},
-        # Routine Read whose large result must NOT leak into the flush context.
-        {"message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "t3", "name": "Read",
-             "input": {"file_path": "/x"}},
-        ]}},
-        {"message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t3",
-             "content": "line1 SHOULD_NOT_APPEAR big file dump"},
-        ]}},
-        {"message": {"role": "assistant", "content": [
-            {"type": "text", "text": "Great, proceeding to tickets."},
-        ]}},
-    ]
+def test_claude_fixture_preserves_plain_turns(hook, fixture_dir):
+    context, count = hook.extract_conversation_context(
+        fixture_dir / "transcripts/claude-basic.jsonl"
+    )
+    assert "Plan the confirmation card" in context
+    assert "Proceeding to tickets" in context
+    assert count == 2
 
 
-def test_decisions_and_subagent_results_survive(hook, tmp_path):
-    t = tmp_path / "transcript.jsonl"
-    _write_transcript(t, _tool_heavy_entries())
-
-    context, turn_count = hook.extract_conversation_context(t)
-
-    # The AskUserQuestion decision (question header + chosen answer) is preserved.
+def test_claude_fixture_preserves_decisions_and_findings(hook, fixture_dir):
+    context, _ = hook.extract_conversation_context(
+        fixture_dir / "transcripts/claude-decisions.jsonl"
+    )
+    assert "[Decision requested]" in context
     assert "Resolved state" in context
+    assert "[Decision made]" in context
     assert "On server resolution, Pill" in context
-    # The subagent's finding is preserved.
+    assert "[Subagent result]" in context
     assert "SUBAGENT_FINDING" in context
-    # Plain conversation text still works.
-    assert "Plan the confirmation card." in context
-    assert "Great, proceeding to tickets." in context
-    # Routine tool output (a Read result) is excluded.
+    assert "TASK_FINDING" in context
     assert "SHOULD_NOT_APPEAR" not in context
-    # Turn count includes the tool-bearing turns.
-    assert turn_count >= 5
-
-
-def test_routine_only_tool_output_is_dropped(hook, tmp_path):
-    entries = [
-        {"message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "r1", "name": "Bash",
-             "input": {"command": "ls"}},
-        ]}},
-        {"message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "r1",
-             "content": "file dump NOPE"},
-        ]}},
-    ]
-    t = tmp_path / "routine.jsonl"
-    _write_transcript(t, entries)
-
-    context, turn_count = hook.extract_conversation_context(t)
-
-    assert "NOPE" not in context
-    assert turn_count == 0
-
-
-def test_async_agent_launch_metadata_is_dropped(hook, tmp_path):
-    """The async 'Agent launched' tool_result is bookkeeping, not a finding."""
-    entries = [
-        {"message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "a1", "name": "Agent",
-             "input": {"description": "x", "subagent_type": "Explore"}},
-        ]}},
-        {"message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "a1",
-             "content": "Async agent launched successfully. agentId: abc123 "
-                        "internal metadata do not quote"},
-        ]}},
-    ]
-    t = tmp_path / "async.jsonl"
-    _write_transcript(t, entries)
-
-    context, _ = hook.extract_conversation_context(t)
-
     assert "Async agent launched" not in context
     assert "agentId" not in context
