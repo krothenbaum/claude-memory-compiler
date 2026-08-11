@@ -621,8 +621,11 @@ def _validate_log_append(baseline: str, content: str, task: str) -> list[str]:
     appended = content[len(baseline):]
     added_lines = appended.splitlines()
     nonblank = [line for line in added_lines if line.strip()]
-    task_suffix = r"\s+\|\s+\S+" if task == "compile" else r"(?:\s+\|\s+\S+)?"
-    heading = rf"##\s+\[[^\]]+\]\s+{re.escape(task)}{task_suffix}"
+    if task == "file_answer":
+        heading = r"##\s+\[[^\]]+\]\s+query\s+\(filed\)\s+\|\s+\S+(?:\s+\S+)+"
+    else:
+        task_suffix = r"\s+\|\s+\S+" if task == "compile" else r"(?:\s+\|\s+\S+)?"
+        heading = rf"##\s+\[[^\]]+\]\s+{re.escape(task)}{task_suffix}"
     if not appended or not nonblank or re.fullmatch(heading, nonblank[0]) is None:
         raise StageValidationError("knowledge build log appended entry is malformed")
     return added_lines

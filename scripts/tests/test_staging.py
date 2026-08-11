@@ -380,9 +380,53 @@ def test_specialized_tasks_require_article_index_row_and_log_entry(memory_home, 
         validate_stage(stage, allowed_paths=(article_path, "knowledge/index.md", "knowledge/log.md"), task=task)
 
     with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
-        handle.write(f"## [now] {task}\n- Filed to: [[{slug}]]\n")
+        heading = (
+            "## [now] query (filed) | Why this answer matters"
+            if task == "file_answer"
+            else f"## [now] {task}"
+        )
+        handle.write(f"{heading}\n- Filed to: [[{slug}]]\n")
     validated = validate_stage(stage, allowed_paths=(article_path, "knowledge/index.md", "knowledge/log.md"), task=task)
     assert article_path in validated.changed_paths
+
+
+@pytest.mark.parametrize(
+    ("heading", "valid"),
+    [
+        ("## [now] query (filed) | How auth redirects work", True),
+        ("## [now] query (filed) | ", False),
+        ("## [now] query (filed) | Summary", False),
+        ("## [now] file_answer | How auth redirects work", False),
+        ("## [now] query | How auth redirects work", False),
+    ],
+)
+def test_filed_answer_requires_canonical_query_filed_log_heading(
+    memory_home, heading, valid
+):
+    relative = "knowledge/qa/canonical-heading.md"
+    stage = create_stage(memory_home, "job", hashlib.sha256(heading.encode()).hexdigest()[:8])
+    _write(
+        stage.root / relative,
+        "---\ntitle: Canonical heading\nquestion: How does this work?\nconsulted:\n"
+        "  - concepts/original\nfiled: 2026-08-11\n---\n# Canonical heading\n",
+    )
+    with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "| [[qa/canonical-heading]] | memory | Answer | source | 2026-08-11 |\n"
+        )
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"{heading}\n- Filed to: [[qa/canonical-heading]]\n")
+
+    operation = lambda: validate_stage(
+        stage,
+        allowed_paths=(relative, "knowledge/index.md", "knowledge/log.md"),
+        task="file_answer",
+    )
+    if valid:
+        operation()
+    else:
+        with pytest.raises(StageValidationError, match="build log"):
+            operation()
 
 
 def test_compile_article_requires_both_index_and_build_log_changes(memory_home):
@@ -438,8 +482,12 @@ def test_article_frontmatter_enforces_schema_required_keys(memory_home, relative
     with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
         handle.write(f"| [[{slug}]] | memory | Added | daily/source.md | 2026-08-11 |\n")
     with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
-        log_task = "file_answer" if relative.startswith("knowledge/qa/") else "compile"
-        handle.write(f"## [now] {log_task} | source\n- Created: [[{slug}]]\n")
+        heading = (
+            "query (filed) | Why this answer matters"
+            if relative.startswith("knowledge/qa/")
+            else "compile | source"
+        )
+        handle.write(f"## [now] {heading}\n- Created: [[{slug}]]\n")
 
     if relative.startswith("knowledge/qa/"):
         validate_stage(
