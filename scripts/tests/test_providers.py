@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -81,6 +82,31 @@ def _chatgpt_login():
 
 def _run(awaitable):
     return asyncio.run(awaitable)
+
+
+def _answer_schema(tmp_path):
+    schema_path = tmp_path / "answer.schema.json"
+    schema_path.write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return schema_path
+
+
+def _unresolved_schema(tmp_path):
+    schema_path = tmp_path / "unresolved.schema.json"
+    schema_path.write_text(
+        json.dumps({"$ref": "private-schema-reference-must-not-leak"}),
+        encoding="utf-8",
+    )
+    return schema_path
 
 
 def test_task_kinds_are_exact():
@@ -244,6 +270,45 @@ def test_codex_rejects_unknown_login_output(fake_runner, text_request):
     assert len(runner.calls) == 1
 
 
+def test_codex_preflight_classifies_capacity(fake_runner, text_request):
+    runner = fake_runner(FakeCommandResult(1, stderr="usage limit exceeded"))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "capacity"
+    assert len(runner.calls) == 1
+
+
+def test_codex_preflight_classifies_unknown_nonzero_as_error(
+    fake_runner, text_request
+):
+    runner = fake_runner(FakeCommandResult(23, stderr="unexpected status failure"))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "error"
+    assert len(runner.calls) == 1
+
+
+def test_codex_unsupported_login_reason_is_bounded_and_redacted(
+    fake_runner, text_request
+):
+    secret = "tiny"
+    runner = fake_runner(
+        FakeCommandResult(stdout=f"unknown login {secret} " + "x" * 1000)
+    )
+
+    result = _run(
+        _codex_provider(runner, env={**os.environ, "OPENAI_API_KEY": secret})
+        .generate_text(text_request)
+    )
+
+    assert result.outcome == "auth_failed"
+    assert result.reason.startswith("unsupported Codex login:")
+    assert secret not in result.reason
+    assert len(result.reason) <= 500
+
+
 def test_codex_child_env_strips_api_keys(monkeypatch, fake_runner, text_request):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("OPENAI_ORG_ID", "org-secret")
@@ -370,6 +435,70 @@ def test_codex_empty_output_is_invalid(fake_runner, text_request):
     assert result.outcome == "invalid_output"
 
 
+def test_codex_command_propagates_output_schema(fake_runner, tmp_path):
+    schema_path = _answer_schema(tmp_path)
+    request = TextRequest(
+        TaskKind.QUERY, "structured answer", tmp_path, 5, schema_path
+    )
+    runner = fake_runner(
+        _chatgpt_login(), _write_codex_output('{"answer": "yes"}')
+    )
+
+    result = _run(_codex_provider(runner).generate_text(request))
+
+    command = runner.calls[1][0]
+    assert result.outcome == "success"
+    assert command[command.index("--output-schema") + 1] == str(schema_path)
+
+
+def test_codex_rejects_parseable_schema_invalid_output(fake_runner, tmp_path):
+    schema_path = _answer_schema(tmp_path)
+    prompt = "prompt-content-must-stay-private"
+    request = TextRequest(TaskKind.QUERY, prompt, tmp_path, 5, schema_path)
+    runner = fake_runner(
+        _chatgpt_login(), _write_codex_output('{"wrong": "field"}')
+    )
+
+    result = _run(_codex_provider(runner).generate_text(request))
+
+    assert result.outcome == "invalid_output"
+    assert "answer" not in result.reason
+    assert prompt not in result.reason
+    assert len(result.reason) <= 500
+
+
+def test_codex_malformed_schema_still_preflights_without_leaking_content(
+    fake_runner, tmp_path
+):
+    secret_content = "schema-content-must-stay-private"
+    schema_path = tmp_path / "malformed.schema.json"
+    schema_path.write_text(f"not-json {secret_content}", encoding="utf-8")
+    request = TextRequest(TaskKind.QUERY, "private prompt", tmp_path, 5, schema_path)
+    runner = fake_runner(_chatgpt_login())
+
+    result = _run(_codex_provider(runner).generate_text(request))
+
+    assert runner.calls[0][0] == ["codex", "login", "status"]
+    assert len(runner.calls) == 1
+    assert result.outcome == "error"
+    assert secret_content not in result.reason
+    assert request.prompt not in result.reason
+    assert len(result.reason) <= 500
+
+
+def test_codex_bounds_unresolved_schema_failure(fake_runner, tmp_path):
+    schema_path = _unresolved_schema(tmp_path)
+    request = TextRequest(TaskKind.QUERY, "private prompt", tmp_path, 5, schema_path)
+    runner = fake_runner(_chatgpt_login(), _write_codex_output("{}"))
+
+    result = _run(_codex_provider(runner).generate_text(request))
+
+    assert result.outcome == "invalid_output"
+    assert "private-schema-reference" not in result.reason
+    assert request.prompt not in result.reason
+    assert len(result.reason) <= 500
+
+
 class FakeClaudeQuery:
     def __init__(self, messages=(), error=None):
         self.messages = messages
@@ -454,6 +583,65 @@ def test_claude_empty_output_is_invalid(text_request):
     result = _run(_claude_provider(FakeClaudeQuery()).generate_text(text_request))
 
     assert result.outcome == "invalid_output"
+
+
+def test_claude_options_propagate_output_schema(tmp_path):
+    schema_path = _answer_schema(tmp_path)
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    request = TextRequest(
+        TaskKind.QUERY, "structured answer", tmp_path, 5, schema_path
+    )
+    query = FakeClaudeQuery([_assistant_text('{"answer": "yes"}')])
+
+    result = _run(_claude_provider(query).generate_text(request))
+
+    assert result.outcome == "success"
+    assert query.calls[0][1].output_format == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+
+
+def test_claude_rejects_parseable_schema_invalid_output(tmp_path):
+    schema_path = _answer_schema(tmp_path)
+    prompt = "prompt-content-must-stay-private"
+    request = TextRequest(TaskKind.QUERY, prompt, tmp_path, 5, schema_path)
+    query = FakeClaudeQuery([_assistant_text('{"wrong": "field"}')])
+
+    result = _run(_claude_provider(query).generate_text(request))
+
+    assert result.outcome == "invalid_output"
+    assert "answer" not in result.reason
+    assert prompt not in result.reason
+    assert len(result.reason) <= 500
+
+
+def test_claude_uses_final_structured_output(tmp_path):
+    schema_path = _answer_schema(tmp_path)
+    request = TextRequest(TaskKind.QUERY, "structured answer", tmp_path, 5, schema_path)
+    message = SimpleNamespace(
+        content=[], error=None, structured_output={"answer": "final"}
+    )
+
+    result = _run(
+        _claude_provider(FakeClaudeQuery([message])).generate_text(request)
+    )
+
+    assert result.outcome == "success"
+    assert json.loads(result.text) == {"answer": "final"}
+
+
+def test_claude_bounds_unresolved_schema_failure(tmp_path):
+    schema_path = _unresolved_schema(tmp_path)
+    request = TextRequest(TaskKind.QUERY, "private prompt", tmp_path, 5, schema_path)
+    query = FakeClaudeQuery([_assistant_text("{}")])
+
+    result = _run(_claude_provider(query).generate_text(request))
+
+    assert result.outcome == "invalid_output"
+    assert "private-schema-reference" not in result.reason
+    assert request.prompt not in result.reason
+    assert len(result.reason) <= 500
 
 
 @pytest.mark.parametrize(

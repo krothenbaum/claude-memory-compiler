@@ -17,6 +17,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, Protocol
 
+import jsonschema
+from referencing import Registry
+
 
 if __name__ == "providers":
     provider_module = sys.modules[__name__]
@@ -190,6 +193,7 @@ _AUTH_MARKERS = (
     "not authenticated",
     "not logged in",
     "unauthorized",
+    "api key",
     "invalid api key",
     "login required",
     "log in",
@@ -335,10 +339,16 @@ class CodexProvider:
         combined = "\n".join((status.stdout, status.stderr)).strip()
         if status.returncode == 0 and "Logged in using ChatGPT" in status.stdout:
             return None
-        reason = _safe_reason(combined or "codex login status failed", self._source_env)
         if status.returncode == 0:
-            reason = f"unsupported Codex login: {reason}"
-        return self._result(request, "auth_failed", started, reason=reason)
+            reason = _safe_reason(
+                f"unsupported Codex login: {combined or 'unknown status'}",
+                self._source_env,
+            )
+            return self._result(request, "auth_failed", started, reason=reason)
+        reason = _safe_reason(combined or "codex login status failed", self._source_env)
+        return self._result(
+            request, _failure_outcome(combined), started, reason=reason
+        )
 
     async def _generate(
         self, request: TextRequest, *, workspace: bool
@@ -347,6 +357,9 @@ class CodexProvider:
         preflight_failure = await self._preflight(request, started)
         if preflight_failure is not None:
             return preflight_failure
+        output_schema, schema_error = _load_output_schema(request.output_schema)
+        if schema_error is not None:
+            return self._result(request, "error", started, reason=schema_error)
 
         stage = request.cwd.resolve()
         temporary_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -373,6 +386,8 @@ class CodexProvider:
             "--output-last-message",
             str(output_path),
         ]
+        if request.output_schema is not None:
+            command.extend(["--output-schema", str(request.output_schema.resolve())])
         if workspace and not _is_git_worktree(stage):
             command.append("--skip-git-repo-check")
         command.append("-")
@@ -397,7 +412,7 @@ class CodexProvider:
                     started,
                     reason=_safe_reason(str(exc), self._source_env),
                 )
-            invalid_reason = _invalid_text_reason(text, request.output_schema)
+            invalid_reason = _invalid_text_reason(text, output_schema)
             if invalid_reason is not None:
                 return self._result(
                     request, "invalid_output", started, reason=invalid_reason
@@ -427,14 +442,41 @@ def _is_git_worktree(path: Path) -> bool:
     return any((candidate / ".git").exists() for candidate in (path, *path.parents))
 
 
-def _invalid_text_reason(text: str, output_schema: Path | None) -> str | None:
+def _load_output_schema(
+    output_schema: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if output_schema is None:
+        return None, None
+    try:
+        schema = json.loads(output_schema.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, "output schema could not be read"
+    if not isinstance(schema, dict):
+        return None, "output schema is invalid"
+    try:
+        jsonschema.validators.validator_for(schema).check_schema(schema)
+    except jsonschema.exceptions.SchemaError:
+        return None, "output schema is invalid"
+    return schema, None
+
+
+def _invalid_text_reason(
+    text: str, output_schema: dict[str, Any] | None
+) -> str | None:
     if not text:
         return "provider returned empty output"
     if output_schema is not None:
         try:
-            json.loads(text)
+            instance = json.loads(text)
         except json.JSONDecodeError:
             return "provider returned invalid structured output"
+        try:
+            validator_class = jsonschema.validators.validator_for(output_schema)
+            validator_class(output_schema, registry=Registry()).validate(instance)
+        except jsonschema.exceptions.ValidationError:
+            return "provider output did not match requested schema"
+        except Exception:
+            return "provider output could not be validated"
     return None
 
 
@@ -493,6 +535,9 @@ class ClaudeProvider:
         from claude_agent_sdk import ClaudeAgentOptions, query
 
         started = time.monotonic()
+        output_schema, schema_error = _load_output_schema(request.output_schema)
+        if schema_error is not None:
+            return self._result(request, "error", started, reason=schema_error)
         query_fn = self._query_fn or query
         options_factory = self._options_factory or ClaudeAgentOptions
         options = options_factory(
@@ -505,10 +550,16 @@ class ClaudeProvider:
             model=self._model,
             env=subscription_child_env(self._source_env),
             setting_sources=[],
+            output_format=(
+                {"type": "json_schema", "schema": output_schema}
+                if output_schema is not None
+                else None
+            ),
         )
         parts: list[str] = []
         errors: list[str] = []
         fallback_result_text = ""
+        structured_result_text = ""
         input_tokens = None
         output_tokens = None
         try:
@@ -529,6 +580,9 @@ class ClaudeProvider:
                             errors.append(str(result_text))
                     elif not parts and getattr(message, "result", None):
                         fallback_result_text = str(message.result)
+                    structured_output = getattr(message, "structured_output", None)
+                    if structured_output is not None:
+                        structured_result_text = json.dumps(structured_output)
                     usage = getattr(message, "usage", None) or {}
                     input_tokens = usage.get("input_tokens", input_tokens)
                     output_tokens = usage.get("output_tokens", output_tokens)
@@ -550,8 +604,12 @@ class ClaudeProvider:
             return self._result(
                 request, _failure_outcome(reason), started, reason=reason
             )
-        text = "".join(parts).strip() or fallback_result_text.strip()
-        invalid_reason = _invalid_text_reason(text, request.output_schema)
+        text = (
+            structured_result_text.strip()
+            or "".join(parts).strip()
+            or fallback_result_text.strip()
+        )
+        invalid_reason = _invalid_text_reason(text, output_schema)
         if invalid_reason is not None:
             return self._result(
                 request, "invalid_output", started, reason=invalid_reason
