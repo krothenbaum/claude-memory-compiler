@@ -25,10 +25,11 @@ from pathlib import Path
 
 from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, DAILY_DIR, KNOWLEDGE_DIR, now_iso
 from utils import (
+    FileBaseline,
     file_hash,
     list_raw_files,
     list_wiki_articles,
-    load_state,
+    load_state_with_baseline,
     notify_terminal,
     read_wiki_index,
 )
@@ -69,7 +70,12 @@ def append_compiled_marker(log_path: Path, when: str) -> None:
     )
 
 
-def commit_compiled_bookkeeping(log_path: Path, state: dict, when: str) -> None:
+def commit_compiled_bookkeeping(
+    log_path: Path,
+    state: dict,
+    when: str,
+    state_baseline: FileBaseline,
+) -> None:
     """Commit a compiled marker and state snapshot as one durable unit."""
     home = DAILY_DIR.parent.resolve()
     relative = log_path.resolve().relative_to(home).as_posix()
@@ -83,6 +89,7 @@ def commit_compiled_bookkeeping(log_path: Path, state: dict, when: str) -> None:
             compiled_marker_path=relative,
             compiled_at=when,
             state=next_state,
+            state_baseline=state_baseline,
         ),
     )
     state.clear()
@@ -96,7 +103,11 @@ _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(messag
 logger.addHandler(_file_handler)
 
 
-async def compile_daily_log(log_path: Path, state: dict) -> float:
+async def compile_daily_log(
+    log_path: Path,
+    state: dict,
+    state_baseline: FileBaseline,
+) -> float:
     """Compile a single daily log into knowledge articles.
 
     Returns the API cost of the compilation. Returns 0.0 on failure or partial
@@ -132,7 +143,7 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
                 "cost_usd": ingested[log_path.name].get("cost_usd", 0.0),
             }
             state["ingested"] = ingested
-            commit_compiled_bookkeeping(log_path, state, compiled_at)
+            commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
             return 0.0
         else:
             logger.info(
@@ -151,7 +162,7 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
             "cost_usd": ingested.get(log_path.name, {}).get("cost_usd", 0.0),
         }
         state["ingested"] = ingested
-        commit_compiled_bookkeeping(log_path, state, compiled_at)
+        commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
         return 0.0
 
     schema = AGENTS_FILE.read_text(encoding="utf-8")
@@ -378,7 +389,7 @@ sees the file was processed. Example:
         "cost_usd": cost,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + cost
-    commit_compiled_bookkeeping(log_path, state, compiled_at)
+    commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
 
     logger.info("Compile complete for %s", log_path.name)
     notify_terminal(f"compile complete — {log_path.name} (${cost:.4f})")
@@ -395,7 +406,7 @@ def main():
 
     if not args.dry_run:
         recover_incomplete_apply(DAILY_DIR.parent)
-    state = load_state()
+    state, _state_baseline = load_state_with_baseline()
 
     # Determine which files to compile
     if args.file:
@@ -436,7 +447,8 @@ def main():
     total_cost = 0.0
     for i, log_path in enumerate(to_compile, 1):
         print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
-        cost = asyncio.run(compile_daily_log(log_path, state))
+        state, state_baseline = load_state_with_baseline()
+        cost = asyncio.run(compile_daily_log(log_path, state, state_baseline))
         total_cost += cost
         print(f"  Done.")
 

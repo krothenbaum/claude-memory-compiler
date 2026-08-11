@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import os
@@ -17,10 +18,10 @@ import uuid
 
 try:
     from .config import ROOT_DIR
-    from .utils import ExclusiveFileLock
+    from .utils import ExclusiveFileLock, FileBaseline, capture_file_baseline
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from config import ROOT_DIR
-    from utils import ExclusiveFileLock
+    from utils import ExclusiveFileLock, FileBaseline, capture_file_baseline
 
 
 _MANIFEST_NAME = ".stage-manifest.json"
@@ -55,6 +56,10 @@ class Stage:
     baseline: Mapping[str, ManifestEntry]
     baseline_bytes: Mapping[str, bytes]
     daily_source: str | None = None
+    job_id: str = "unknown"
+    attempt_id: str = "unknown"
+    relevant_articles: tuple[str, ...] = ()
+    include_state: bool = True
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,7 @@ class ApplyBookkeeping:
     compiled_at: str | None = None
     state: Mapping[str, object] | None = None
     state_path: str = "scripts/state.json"
+    state_baseline: FileBaseline | None = None
     extra_updates: Mapping[str, bytes | str] = field(default_factory=dict)
     failure_injector: Callable[[int, str], None] | None = None
 
@@ -218,6 +224,17 @@ def create_stage(
 ) -> Stage:
     """Create a fresh owner-only stage containing the minimum requested files."""
     home = Path(memory_home).expanduser().resolve()
+    normalized_daily = _relative_path(daily_source) if daily_source is not None else None
+    if normalized_daily is not None and not normalized_daily.startswith("daily/"):
+        raise StageValidationError("daily source must be below daily/")
+    normalized_articles = tuple(_relative_path(path) for path in relevant_articles)
+    for relative in normalized_articles:
+        if not relative.endswith(".md") or not relative.startswith(_ARTICLE_PREFIXES):
+            raise StageValidationError(
+                "relevant article must be Markdown below knowledge/concepts, "
+                "knowledge/connections, or knowledge/qa"
+            )
+
     stage_parent = home / "scripts" / "staging"
     _private_directory(stage_parent)
     stage_root = stage_parent / f"{_safe_identifier(job_id)}-{_safe_identifier(attempt_id)}"
@@ -226,12 +243,9 @@ def create_stage(
     stage_root.mkdir(mode=0o700)
 
     selected: list[str] = ["AGENTS.md", "knowledge/index.md", "knowledge/log.md"]
-    normalized_daily = _relative_path(daily_source) if daily_source is not None else None
     if normalized_daily is not None:
-        if not normalized_daily.startswith("daily/"):
-            raise StageValidationError("daily source must be below daily/")
         selected.append(normalized_daily)
-    selected.extend(_relative_path(path) for path in relevant_articles)
+    selected.extend(normalized_articles)
     if include_state and (home / "scripts/state.json").exists():
         selected.append("scripts/state.json")
 
@@ -252,6 +266,10 @@ def create_stage(
         baseline=baseline,
         baseline_bytes=baseline_bytes,
         daily_source=normalized_daily,
+        job_id=str(job_id),
+        attempt_id=str(attempt_id),
+        relevant_articles=normalized_articles,
+        include_state=include_state,
     )
 
 
@@ -282,11 +300,25 @@ def snapshot_manifest(root: Path | str) -> dict[str, ManifestEntry]:
     return manifest
 
 
+def _glob_parts_match(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+    if not pattern_parts:
+        return not path_parts
+    head, *tail = pattern_parts
+    remaining = tuple(tail)
+    if head == "**":
+        return _glob_parts_match(path_parts, remaining) or bool(path_parts) and _glob_parts_match(
+            path_parts[1:], pattern_parts
+        )
+    return bool(path_parts) and fnmatchcase(path_parts[0], head) and _glob_parts_match(
+        path_parts[1:], remaining
+    )
+
+
 def _matches(path: str, patterns: Sequence[str]) -> bool:
-    subject = PurePosixPath(path)
+    path_parts = PurePosixPath(_relative_path(path)).parts
     for raw_pattern in patterns:
         pattern = _relative_path(raw_pattern)
-        if path == pattern or subject.match(pattern):
+        if _glob_parts_match(path_parts, PurePosixPath(pattern).parts):
             return True
     return False
 
@@ -308,14 +340,69 @@ def _validate_frontmatter(relative: str, content: str) -> None:
     if boundary < 0:
         raise StageValidationError(f"article has malformed frontmatter: {relative}")
     frontmatter = content[4:boundary]
-    required = {"title"}
-    if relative.startswith(("knowledge/concepts/", "knowledge/connections/")):
+    lines = frontmatter.splitlines()
+    values: dict[str, str | list[str]] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*):(?:\s*(.*))$", line)
+        if match is None:
+            raise StageValidationError(f"article has malformed frontmatter: {relative}")
+        key, inline = match.groups()
+        if key in values:
+            raise StageValidationError(f"article has duplicate frontmatter key {key}: {relative}")
+        if inline:
+            normalized = inline.strip()
+            if normalized.startswith("["):
+                if not normalized.endswith("]"):
+                    raise StageValidationError(
+                        f"article has malformed inline list for {key}: {relative}"
+                    )
+                items = [
+                    item.strip().strip('"\'')
+                    for item in normalized[1:-1].split(",")
+                    if item.strip().strip('"\'')
+                ]
+                values[key] = items
+            else:
+                scalar = normalized.strip('"\'')
+                values[key] = scalar if scalar not in {"", "{}"} else ""
+            index += 1
+            continue
+        items: list[str] = []
+        index += 1
+        while index < len(lines) and lines[index].startswith((" ", "\t")):
+            nested = lines[index].strip()
+            if not nested.startswith("-") or not nested[1:].strip().strip('"\''):
+                raise StageValidationError(f"article has malformed list for {key}: {relative}")
+            items.append(nested[1:].strip().strip('"\''))
+            index += 1
+        values[key] = items
+
+    required = {"title", "sources", "created", "updated"}
+    if relative.startswith("knowledge/concepts/"):
         required.add("project")
-    missing = [name for name in required if not re.search(rf"(?m)^{name}:\s*\S", frontmatter)]
+    elif relative.startswith("knowledge/connections/"):
+        required.update({"project", "connects"})
+    elif relative.startswith("knowledge/qa/"):
+        required = {"title", "question", "consulted", "filed"}
+    missing = [name for name in sorted(required) if not values.get(name)]
     if missing:
         raise StageValidationError(
             f"article frontmatter missing {', '.join(missing)}: {relative}"
         )
+    list_minimums = {"sources": 1, "connects": 2, "consulted": 1}
+    for key, minimum in list_minimums.items():
+        if key not in required:
+            continue
+        value = values.get(key)
+        if not isinstance(value, list) or len(value) < minimum:
+            raise StageValidationError(
+                f"article frontmatter {key} must be a non-empty YAML list: {relative}"
+            )
 
 
 def _article_slug(relative: str) -> str:
@@ -339,10 +426,13 @@ def _validate_task_contract(
     changed: tuple[str, ...],
     task: str,
 ) -> None:
+    all_articles = tuple(
+        path for path in after if path.endswith(".md") and path.startswith(_ARTICLE_PREFIXES)
+    )
     article_changes = tuple(
         path for path in changed if path.endswith(".md") and path.startswith(_ARTICLE_PREFIXES)
     )
-    for relative in article_changes:
+    for relative in all_articles:
         content = (stage.root / relative).read_text(encoding="utf-8")
         _validate_frontmatter(relative, content)
 
@@ -362,6 +452,8 @@ def _validate_task_contract(
         raise StageValidationError("knowledge index is malformed")
     baseline_index = stage.baseline_bytes.get("knowledge/index.md", b"").decode("utf-8")
     baseline_log = stage.baseline_bytes.get("knowledge/log.md", b"").decode("utf-8")
+    if not build_log.startswith(baseline_log):
+        raise StageValidationError("knowledge/log.md must remain append-only")
     added_index_lines = _added_lines(baseline_index, index)
     added_log_lines = _added_lines(baseline_log, build_log)
     has_new_log_heading = any(
@@ -424,11 +516,26 @@ def validate_stage(
     changed = tuple(
         sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
     )
+    if "AGENTS.md" in changed:
+        raise StageValidationError("AGENTS.md schema must remain unchanged")
+    if "scripts/state.json" in changed:
+        raise StageValidationError("scripts/state.json is host-owned and cannot be model-edited")
     if stage.daily_source is not None and stage.daily_source in changed:
         raise StageValidationError("daily source content cannot be model-edited")
     forbidden = tuple(path for path in changed if not _matches(path, allowed_paths))
     if forbidden:
         raise StageValidationError(f"changed paths outside allowlist: {', '.join(forbidden)}")
+    unexpected_knowledge = tuple(
+        path
+        for path in changed
+        if path.startswith("knowledge/")
+        and path not in {"knowledge/index.md", "knowledge/log.md"}
+        and not path.startswith(_ARTICLE_PREFIXES)
+    )
+    if unexpected_knowledge:
+        raise StageValidationError(
+            f"unexpected knowledge paths: {', '.join(unexpected_knowledge)}"
+        )
     _validate_utf8(stage.root, tuple(after))
     if "scripts/state.json" in after:
         try:
@@ -467,6 +574,27 @@ def discard_stage(stage: Stage | ValidatedStage) -> None:
     if target.resolve().parent != expected_parent:
         raise StageValidationError("refusing to discard a path outside the staging directory")
     shutil.rmtree(target)
+
+
+def create_fallback_stage(failed_stage: Stage, *, attempt_id: object) -> Stage:
+    """Discard a contaminated attempt and rebuild a fallback from host files."""
+    memory_home = failed_stage.memory_home
+    job_id = failed_stage.job_id
+    daily_source = failed_stage.daily_source
+    relevant_articles = failed_stage.relevant_articles
+    include_state = failed_stage.include_state
+    next_name = f"{_safe_identifier(job_id)}-{_safe_identifier(attempt_id)}"
+    if next_name == failed_stage.root.name:
+        raise StageValidationError("fallback attempt must use a fresh stage identity")
+    discard_stage(failed_stage)
+    return create_stage(
+        memory_home,
+        job_id,
+        attempt_id,
+        daily_source=daily_source,
+        relevant_articles=relevant_articles,
+        include_state=include_state,
+    )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -560,7 +688,9 @@ def _restore_operations(home: Path, entries: Sequence[Mapping[str, object]]) -> 
             _atomic_replace(destination, bytes.fromhex(str(original)))
 
 
-def _recover_unlocked(home: Path) -> bool:
+def recover_incomplete_apply_unlocked(memory_home: Path | str) -> bool:
+    """Recover a journal while the caller already owns the writer lock."""
+    home = Path(memory_home).expanduser().resolve()
     directory = home / "scripts" / "memory-apply-journal"
     if not directory.exists():
         return False
@@ -593,7 +723,25 @@ def recover_incomplete_apply(memory_home: Path | str | None = None) -> bool:
     """Restore any prepared/applying transaction left by an interrupted writer."""
     home = Path(memory_home or ROOT_DIR).expanduser().resolve()
     with ExclusiveFileLock(home / "scripts" / "memory-writer.lock"):
-        return _recover_unlocked(home)
+        return recover_incomplete_apply_unlocked(home)
+
+
+def _verify_state_baseline(home: Path, bookkeeping: ApplyBookkeeping) -> None:
+    if bookkeeping.state is None:
+        if bookkeeping.state_baseline is not None:
+            raise StageValidationError("state baseline requires a state update")
+        return
+    if bookkeeping.state_baseline is None:
+        raise StageValidationError("state update requires an exact state baseline")
+    state_path = _safe_destination(home, _relative_path(bookkeeping.state_path))
+    current = capture_file_baseline(state_path)
+    expected = bookkeeping.state_baseline
+    if (current.exists, current.size, current.sha256) != (
+        expected.exists,
+        expected.size,
+        expected.sha256,
+    ):
+        raise RetryableApplyError("state baseline changed before apply")
 
 
 def _bookkeeping_updates(
@@ -615,6 +763,10 @@ def _bookkeeping_updates(
         updates[relative] = (json.dumps(bookkeeping.state, indent=2) + "\n").encode()
     for raw_path, value in bookkeeping.extra_updates.items():
         relative = _relative_path(raw_path)
+        if relative == _relative_path(bookkeeping.state_path):
+            raise StageValidationError(
+                "state updates must use state with an exact state baseline"
+            )
         if relative in updates:
             raise StageValidationError(f"duplicate bookkeeping destination: {relative}")
         updates[relative] = value.encode() if isinstance(value, str) else bytes(value)
@@ -671,7 +823,8 @@ def apply_host_bookkeeping(
     """Commit marker/state/usage updates with the same journal as stage writes."""
     home = Path(memory_home).expanduser().resolve()
     with ExclusiveFileLock(home / "scripts" / "memory-writer.lock"):
-        recovered = _recover_unlocked(home)
+        recovered = recover_incomplete_apply_unlocked(home)
+        _verify_state_baseline(home, bookkeeping)
         replacements = _bookkeeping_updates(home, bookkeeping)
         changed = _commit_replacements_unlocked(
             home, replacements, bookkeeping.failure_injector
@@ -710,7 +863,7 @@ def apply_validated_stage(
     home = stage.memory_home
     recovered = False
     with ExclusiveFileLock(home / "scripts" / "memory-writer.lock"):
-        recovered = _recover_unlocked(home)
+        recovered = recover_incomplete_apply_unlocked(home)
         for relative, expected in baseline.items():
             real = _safe_destination(home, relative)
             if not real.exists() or _entry(real.read_bytes()) != expected:
@@ -720,6 +873,8 @@ def apply_validated_stage(
                 real = _safe_destination(home, relative)
                 if real.exists() or real.is_symlink():
                     raise RetryableApplyError(f"real baseline changed before apply: {relative}")
+
+        _verify_state_baseline(home, bookkeeping)
 
         replacements = {
             relative: _safe_destination(stage.root, relative, allow_missing=False).read_bytes()

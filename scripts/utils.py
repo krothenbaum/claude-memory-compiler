@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
@@ -30,6 +31,48 @@ from config import (
     QA_DIR,
     STATE_FILE,
 )
+
+
+@dataclass(frozen=True)
+class FileBaseline:
+    """Identity of one regular file for compare-and-swap writes."""
+
+    exists: bool
+    size: int
+    sha256: str | None
+
+
+def _baseline_for_bytes(data: bytes) -> FileBaseline:
+    return FileBaseline(True, len(data), hashlib.sha256(data).hexdigest())
+
+
+def _read_file_with_baseline(path: Path | str) -> tuple[bytes | None, FileBaseline]:
+    target = Path(path)
+    if not target.exists() and not target.is_symlink():
+        return None, FileBaseline(False, 0, None)
+    if target.is_symlink():
+        raise ValueError(f"baseline path must not be a symlink: {target}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"baseline path must be a regular file: {target}")
+        if info.st_nlink != 1:
+            raise ValueError(f"baseline path must not be hard-linked: {target}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"baseline path has an unsafe owner: {target}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read()
+    finally:
+        os.close(descriptor)
+    return data, _baseline_for_bytes(data)
+
+
+def capture_file_baseline(path: Path | str) -> FileBaseline:
+    """Capture a file identity without following unsafe file types."""
+    _data, baseline = _read_file_with_baseline(path)
+    return baseline
 
 
 class ExclusiveFileLock:
@@ -161,6 +204,12 @@ def append_daily_entry(
     )
 
     with ExclusiveFileLock(root / "scripts" / "memory-writer.lock"):
+        if __package__:
+            from .staging import recover_incomplete_apply_unlocked
+        else:
+            from staging import recover_incomplete_apply_unlocked
+
+        recover_incomplete_apply_unlocked(root)
         if daily_dir.is_symlink():
             raise ValueError("daily directory must not be a symlink")
         created = not log_path.exists() and not log_path.is_symlink()
@@ -305,9 +354,23 @@ def notify_terminal(msg: str) -> None:
 
 def load_state() -> dict:
     """Load persistent state from state.json."""
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"ingested": {}, "query_count": 0, "last_lint": None, "total_cost": 0.0}
+    state, _baseline = load_state_with_baseline()
+    return state
+
+
+def load_state_with_baseline() -> tuple[dict, FileBaseline]:
+    """Read state bytes once and return parsed state plus the same-byte baseline."""
+    data, baseline = _read_file_with_baseline(STATE_FILE)
+    if baseline.exists:
+        assert data is not None
+        state = json.loads(data.decode("utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("state.json must contain an object")
+        return state, baseline
+    return (
+        {"ingested": {}, "query_count": 0, "last_lint": None, "total_cost": 0.0},
+        FileBaseline(False, 0, None),
+    )
 
 
 def save_state(state: dict) -> None:

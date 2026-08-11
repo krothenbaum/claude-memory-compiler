@@ -31,7 +31,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from compile import COMPILED_MARKER_RE, commit_compiled_bookkeeping  # noqa: E402
 from config import DAILY_DIR, KNOWLEDGE_DIR, now_iso  # noqa: E402
 from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply  # noqa: E402
-from utils import file_hash, load_state  # noqa: E402
+from utils import file_hash, load_state_with_baseline  # noqa: E402
 
 LOG_MD_PATH = KNOWLEDGE_DIR / "log.md"
 COMPILE_ENTRY_RE = re.compile(r"^##\s+\[[^\]]+\]\s+compile\s+\|\s+(\S+\.md)", re.MULTILINE)
@@ -49,7 +49,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Report changes without writing")
     args = parser.parse_args()
 
-    state = load_state()
+    recover_incomplete_apply(DAILY_DIR.parent)
+    state, _initial_state_baseline = load_state_with_baseline()
     ingested = state.setdefault("ingested", {})
 
     mentioned = files_mentioned_in_log_md()
@@ -87,9 +88,10 @@ def main() -> None:
         return
 
     print("\nApplying...")
-    recover_incomplete_apply(DAILY_DIR.parent)
     now = now_iso()
     for log_path in to_reconcile:
+        state, state_baseline = load_state_with_baseline()
+        ingested = state.setdefault("ingested", {})
         content = log_path.read_text(encoding="utf-8")
         needs_marker = not COMPILED_MARKER_RE.search(content)
         prior = ingested.get(log_path.name, {})
@@ -100,11 +102,11 @@ def main() -> None:
             "reconciled_at": now,
         }
         if needs_marker:
-            commit_compiled_bookkeeping(log_path, state, now)
+            commit_compiled_bookkeeping(log_path, state, now, state_baseline)
         else:
             apply_host_bookkeeping(
                 DAILY_DIR.parent,
-                ApplyBookkeeping(state=state),
+                ApplyBookkeeping(state=state, state_baseline=state_baseline),
             )
         ingested = state.setdefault("ingested", {})
     print(f"Done. state.json now tracks {len(ingested)} ingested file(s).")
