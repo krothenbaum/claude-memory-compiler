@@ -675,6 +675,16 @@ def _safe_provider_reason(
     return _safe_reason(without_prompt, source_env)
 
 
+def _safe_router_reason(
+    message: str, provider: GenerationProvider, prompt: str
+) -> str:
+    reason = _safe_provider_reason(message, os.environ, prompt)
+    provider_env = getattr(provider, "_source_env", None)
+    if isinstance(provider_env, Mapping):
+        reason = _safe_reason(reason, provider_env)
+    return reason
+
+
 class ClaudeProvider:
     """Subscription-only Claude Agent SDK adapter."""
 
@@ -816,7 +826,9 @@ class ClaudeProvider:
             )
 
         if errors:
-            reason = _safe_reason("; ".join(errors), self._source_env)
+            reason = _safe_provider_reason(
+                "; ".join(errors), self._source_env, request.prompt
+            )
             return self._result(
                 request, _failure_outcome(reason), started, reason=reason
             )
@@ -976,10 +988,30 @@ class ProviderRouter:
         fallback_reason = _fallback_reason(codex_attempt)
         fallback_request = request
         if self._fallback_workspace_factory is not None:
-            made_request = self._fallback_workspace_factory(request)
-            fallback_request = (
-                await made_request if inspect.isawaitable(made_request) else made_request
-            )
+            try:
+                made_request = self._fallback_workspace_factory(request)
+                fallback_request = (
+                    await made_request
+                    if inspect.isawaitable(made_request)
+                    else made_request
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                claude_attempt = ProviderResult(
+                    provider="claude",
+                    model=getattr(self._claude, "_model", None) or "unknown",
+                    task=request.task,
+                    outcome="error",
+                    reason=_safe_router_reason(
+                        str(exc), self._claude, request.prompt
+                    ),
+                )
+                attempts.append(claude_attempt)
+                await self._record(claude_attempt)
+                return RoutedResult.from_result(
+                    claude_attempt, attempts, fallback_reason
+                )
             invalid_reason = _invalid_fallback_workspace_reason(
                 request, fallback_request
             )

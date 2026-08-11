@@ -878,6 +878,36 @@ def test_claude_normalizes_transport_factory_failure(text_request):
     assert "transport setup failed" in result.reason
 
 
+@pytest.mark.parametrize("error_source", ["error", "errors", "result"])
+def test_claude_redacts_message_level_errors(
+    tmp_path, error_source
+):
+    prompt = "prompt-content-must-stay-private"
+    secret = "anthropic-secret-must-stay-private"
+    leaked = f"provider failed: {prompt} {secret} {'detail ' * 200}"
+    attributes = {"content": [], "error": None, "is_error": False}
+    if error_source == "error":
+        attributes["error"] = leaked
+    else:
+        attributes["is_error"] = True
+        attributes["errors"] = [leaked] if error_source == "errors" else []
+        attributes["result"] = leaked if error_source == "result" else None
+    request = TextRequest(TaskKind.QUERY, prompt, tmp_path, 5)
+    query = FakeClaudeQuery([SimpleNamespace(**attributes)])
+
+    result = _run(
+        _claude_provider(
+            query, env={"HOME": str(tmp_path), "ANTHROPIC_API_KEY": secret}
+        ).generate_text(request)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert prompt not in result.reason
+    assert secret not in result.reason
+    assert len(result.reason) <= 500
+
+
 def test_claude_empty_output_is_invalid(text_request):
     result = _run(_claude_provider(FakeClaudeQuery()).generate_text(text_request))
 
@@ -1199,3 +1229,111 @@ def test_router_rejects_invalid_fallback_workspace(
     assert seen == list(result.attempts)
     assert claude.workspace_requests == []
     assert original.prompt not in result.reason
+
+
+def _failed_workspace_fallback(tmp_path):
+    stage = tmp_path / "stale"
+    stage.mkdir()
+    request = WorkspaceRequest(
+        TaskKind.COMPILE, "private prompt must stay private", stage, 5
+    )
+    codex_attempt = ProviderResult(
+        "codex",
+        "model",
+        request.task,
+        "invalid_output",
+        reason="staged validation failed",
+    )
+    return request, codex_attempt
+
+
+def test_router_normalizes_sync_fallback_factory_exception(tmp_path):
+    import providers
+
+    request, failed = _failed_workspace_fallback(tmp_path)
+    secret = "fallback-secret-must-stay-private"
+    query = FakeClaudeQuery([_assistant_text("saved")])
+    claude = providers.ClaudeProvider(
+        query_fn=query,
+        env={"HOME": str(tmp_path), "ANTHROPIC_API_KEY": secret},
+    )
+    seen = []
+
+    def broken_factory(_request):
+        raise RuntimeError(
+            f"factory failed: {request.prompt} {secret} {'detail ' * 200}"
+        )
+
+    result = _run(
+        providers.ProviderRouter(
+            FakeProvider(success_result("codex", "unused")),
+            claude,
+            attempt_callback=seen.append,
+            fallback_workspace_factory=broken_factory,
+        ).edit_workspace(request, codex_attempt=failed)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert result.fallback_reason == "codex:invalid_output:staged validation failed"
+    assert seen == list(result.attempts)
+    assert [attempt.provider for attempt in result.attempts] == ["codex", "claude"]
+    assert request.prompt not in result.reason
+    assert secret not in result.reason
+    assert len(result.reason) <= 500
+    assert query.calls == []
+
+
+def test_router_normalizes_async_fallback_factory_exception(tmp_path):
+    import providers
+
+    request, failed = _failed_workspace_fallback(tmp_path)
+    claude = FakeProvider(
+        ProviderResult("claude", "model", request.task, "success", text="saved")
+    )
+    seen = []
+
+    async def broken_factory(_request):
+        raise RuntimeError("async fallback factory failed")
+
+    result = _run(
+        providers.ProviderRouter(
+            FakeProvider(success_result("codex", "unused")),
+            claude,
+            attempt_callback=seen.append,
+            fallback_workspace_factory=broken_factory,
+        ).edit_workspace(request, codex_attempt=failed)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert seen == list(result.attempts)
+    assert [attempt.provider for attempt in result.attempts] == ["codex", "claude"]
+    assert "async fallback factory failed" in result.reason
+    assert claude.workspace_requests == []
+
+
+def test_router_reraises_fallback_factory_cancellation(tmp_path):
+    import providers
+
+    request, failed = _failed_workspace_fallback(tmp_path)
+    claude = FakeProvider(
+        ProviderResult("claude", "model", request.task, "success", text="saved")
+    )
+    seen = []
+
+    async def cancelled_factory(_request):
+        raise asyncio.CancelledError
+
+    router = providers.ProviderRouter(
+        FakeProvider(success_result("codex", "unused")),
+        claude,
+        attempt_callback=seen.append,
+        fallback_workspace_factory=cancelled_factory,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(router.edit_workspace(request, codex_attempt=failed))
+
+    assert seen == [failed]
+    assert claude.workspace_requests == []
