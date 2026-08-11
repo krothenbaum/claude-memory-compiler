@@ -99,41 +99,46 @@ async def run_flush(context: str, project_key: str = "unknown", cwd: str = "") -
     if cwd:
         project_block += f"\n**CWD:** {cwd}"
 
-    prompt = f"""Review the conversation context below and respond with a concise summary
-of important items that should be preserved in the daily log.
-Do NOT use any tools — just return plain text.
+    prompt = f"""Review the conversation context below and extract everything worth preserving
+in the daily log. Do NOT use any tools, return plain text only.
 
 This conversation took place in the following project:
 
 {project_block}
 
-Treat the project key as the canonical scope for everything you extract. Anything
-project-specific (e.g. a coding pattern, a bug, a decision) should be described
-as belonging to "{project_key}" so it can be filtered later by project.
+Scope everything to "{project_key}" so it can be filtered later by project.
 
-Format your response as a structured daily log entry with these sections:
+The context is pre-filtered to signal. Lines marked [Decision requested],
+[Decision made], and [Subagent result] are high-value: they carry decisions the
+user made and findings from research. Always preserve these together with the
+reasoning behind them. Never discard them as small talk.
 
-**Context:** [One line about what the user was working on]
+Format your response as a daily-log entry, using only the sections that have
+real content:
 
-**Key Exchanges:**
-- [Important Q&A or discussions]
+**Context:** One line on what the user was working on.
 
 **Decisions Made:**
-- [Any decisions with rationale]
+- Each decision with its reasoning. Capture every [Decision made]: the question,
+  the option chosen, and why.
 
-**Lessons Learned:**
-- [Gotchas, patterns, or insights discovered]
+**Findings & Lessons:**
+- Research results ([Subagent result]), gotchas, root causes, and patterns.
 
 **Action Items:**
-- [Follow-ups or TODOs mentioned]
+- Follow-ups, TODOs, and unresolved questions.
 
-Skip anything that is:
-- Routine tool calls or file reads
-- Content that's trivial or obvious
-- Trivial back-and-forth or clarification exchanges
+Skip only genuinely disposable content:
+- Routine tool calls, file reads, and command output
+- Trivial confirmations ("looks good", "yes", "go ahead")
+- Restating something already captured earlier
 
-Only include sections that have actual content. If nothing is worth saving,
-respond with exactly: FLUSH_OK
+Do NOT skip a decision, a design choice, a bug root cause, or a research finding
+just because it arrived through a question-and-answer exchange.
+
+Respond with exactly FLUSH_OK and nothing else ONLY if the session contains no
+decisions, no findings, no blockers, and no durable facts. A session that made
+design or architecture decisions, or resolved a bug, is never FLUSH_OK.
 
 ## Conversation Context
 
@@ -148,6 +153,11 @@ respond with exactly: FLUSH_OK
                 cwd=str(ROOT),
                 allowed_tools=[],
                 max_turns=2,
+                # Pin the model: the bundled SDK CLI lags interactive Claude
+                # Code, so a global settings.json model (e.g. "fable") it
+                # doesn't support would otherwise break every flush.
+                model="claude-sonnet-5",
+                setting_sources=[],
             ),
         ):
             if isinstance(message, AssistantMessage):
@@ -338,7 +348,7 @@ def main():
     response = asyncio.run(run_flush(context, project_key, cwd))
 
     # Append to daily log
-    if "FLUSH_OK" in response:
+    if response.strip() == "FLUSH_OK":
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
             "FLUSH_OK - Nothing worth saving from this session",
@@ -351,6 +361,14 @@ def main():
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush", project_key, cwd)
         result_summary = "FLUSH_ERROR (see flush.log)"
+        # Keep the context file so the flush can be retried by hand:
+        #   uv run python scripts/flush.py <context_file> <session_id> [project] [cwd]
+        # No dedup-state update here: the dedup path deletes the context
+        # file, which would defeat an immediate retry.
+        logging.error("Context file preserved for retry: %s", context_file)
+        notify_terminal(f"flush FAILED — context preserved at {context_file.name}")
+        maybe_trigger_compilation()
+        return
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session", project_key, cwd)
