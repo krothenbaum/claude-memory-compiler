@@ -4,9 +4,12 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import stat
 import subprocess
 
-from capture import capture_transcript, launch_worker
+import pytest
+
+from capture import capture_transcript, enqueue_hook_input, launch_worker
 from providers import ProviderResult, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
 from worker import MemoryWorker, SingletonDrainLock
@@ -46,6 +49,47 @@ def test_capture_snapshots_parses_enqueues_and_launches(tmp_path):
     assert launched == [home]
 
 
+@pytest.mark.parametrize(
+    ("guard", "reason"),
+    [
+        ({"AI_MEMORY_INTERNAL_JOB": "1"}, "internal_job"),
+        ({"CLAUDE_INVOKED_BY": ""}, "legacy_internal_job"),
+    ],
+)
+def test_capture_guard_skips_before_transcript_or_runtime_work(tmp_path, guard, reason):
+    home = tmp_path / "must-not-exist"
+
+    result = capture_transcript(
+        tmp_path / "missing-transcript.jsonl",
+        source_agent="claude",
+        metadata={},
+        memory_home=home,
+        launcher=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        env=guard,
+    )
+
+    assert result.status == "skipped"
+    assert result.reason == reason
+    assert result.created is False
+    assert result.job is None
+    assert result.job_id is None
+    assert not home.exists()
+
+
+def test_hook_capture_guard_precedes_payload_resolution(tmp_path):
+    result = enqueue_hook_input(
+        {},
+        source_agent="claude",
+        trigger="session_end",
+        memory_home=tmp_path / "must-not-exist",
+        env={"AI_MEMORY_INTERNAL_JOB": "1"},
+    )
+
+    assert result.status == "skipped"
+    assert result.job is None
+    assert not (tmp_path / "must-not-exist").exists()
+
+
 def test_capture_never_uses_session_id_as_a_spool_path(tmp_path):
     source = tmp_path / "outside.jsonl"
     source.write_text(
@@ -70,6 +114,32 @@ def test_capture_never_uses_session_id_as_a_spool_path(tmp_path):
     assert snapshot.parent == home / "scripts" / "spool"
     assert snapshot.name.startswith("claude-")
     assert "escape" not in snapshot.name
+
+
+def test_parser_failure_retains_private_safe_snapshot_without_queue_or_launch(tmp_path):
+    source = tmp_path / "sensitive-name.jsonl"
+    source.write_bytes(b'\xff{"private":"content"}\n')
+    home = tmp_path / "memory"
+    launched = []
+
+    with pytest.raises(UnicodeDecodeError):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda root: launched.append(root),
+            env={},
+        )
+
+    retained = list((home / "scripts" / "spool").iterdir())
+    assert len(retained) == 1
+    assert retained[0].name.startswith("failed-claude-")
+    assert "sensitive" not in retained[0].name
+    assert retained[0].read_bytes() == source.read_bytes()
+    assert stat.S_IMODE(retained[0].stat().st_mode) == 0o600
+    assert not (home / "scripts" / "jobs.sqlite3").exists()
+    assert launched == []
 
 
 def test_launch_worker_is_detached_with_closed_standard_streams(tmp_path, monkeypatch):

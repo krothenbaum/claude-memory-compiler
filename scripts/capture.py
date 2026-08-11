@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -11,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,8 +20,41 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.config import load_config
-from scripts.queue import EnqueueResult, QueueRepository
+from scripts.queue import EnqueueResult, Job, QueueRepository
 from scripts.transcripts import parse_claude_transcript, parse_codex_transcript
+
+
+@dataclass(frozen=True)
+class CaptureOutcome:
+    """Discriminated result for an enqueue, deduplication, or guarded skip."""
+
+    status: Literal["enqueued", "deduplicated", "skipped"]
+    job: Job | None = None
+    reason: str | None = None
+
+    @classmethod
+    def from_enqueue(cls, result: EnqueueResult) -> "CaptureOutcome":
+        return cls("enqueued" if result.created else "deduplicated", result.job)
+
+    @property
+    def created(self) -> bool:
+        return self.status == "enqueued"
+
+    @property
+    def inserted(self) -> bool:
+        return self.created
+
+    @property
+    def job_id(self) -> int | None:
+        return self.job.id if self.job is not None else None
+
+
+def _guarded_outcome(env: Mapping[str, str]) -> CaptureOutcome | None:
+    if env.get("AI_MEMORY_INTERNAL_JOB") == "1":
+        return CaptureOutcome("skipped", reason="internal_job")
+    if "CLAUDE_INVOKED_BY" in env:
+        return CaptureOutcome("skipped", reason="legacy_internal_job")
+    return None
 
 
 def launch_worker(memory_home: Path | str) -> None:
@@ -79,7 +113,8 @@ def _publish_snapshot(temporary: Path, destination: Path) -> None:
     try:
         os.link(temporary, destination)
     except FileExistsError:
-        pass
+        temporary.unlink(missing_ok=True)
+        return
     except OSError:
         try:
             with temporary.open("rb") as source, destination.open("xb") as target:
@@ -91,9 +126,20 @@ def _publish_snapshot(temporary: Path, destination: Path) -> None:
             except OSError:
                 pass
         except FileExistsError:
-            pass
-    finally:
+            temporary.unlink(missing_ok=True)
+            return
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
         temporary.unlink(missing_ok=True)
+    else:
+        temporary.unlink(missing_ok=True)
+
+
+def _retain_failed_snapshot(temporary: Path, source_agent: str) -> None:
+    digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+    destination = temporary.with_name(f"failed-{source_agent}-{digest}.jsonl")
+    _publish_snapshot(temporary, destination)
 
 
 def capture_transcript(
@@ -106,8 +152,13 @@ def capture_transcript(
     launcher: Callable[[Path], None] = launch_worker,
     clock: Callable[[], datetime] | None = None,
     limits: object = None,
-) -> EnqueueResult:
+    env: Mapping[str, str] | None = None,
+) -> CaptureOutcome:
     """Snapshot, normalize, enqueue, and wake a worker without invoking a model."""
+    source_env = os.environ if env is None else env
+    guarded = _guarded_outcome(source_env)
+    if guarded is not None:
+        return guarded
     if source_agent not in {"claude", "codex"}:
         raise ValueError("source_agent must be claude or codex")
     source = Path(transcript_path).expanduser().resolve(strict=True)
@@ -132,7 +183,7 @@ def capture_transcript(
         if queue is None:
             queue_config = load_config(
                 {
-                    **os.environ,
+                    **source_env,
                     "AI_MEMORY_HOME": str(root),
                     "CLAUDE_MEMORY_HOME": str(root),
                 }
@@ -149,11 +200,15 @@ def capture_transcript(
             if owns_queue:
                 repository.close()
         launcher(root)
-        return result
+        return CaptureOutcome.from_enqueue(result)
     except BaseException:
-        # Once renamed, the snapshot is intentionally retained for recovery.
+        # A private snapshot is the recovery boundary even when parsing fails.
         if temporary.exists():
-            temporary.unlink()
+            try:
+                _retain_failed_snapshot(temporary, source_agent)
+            except Exception:
+                # Keep the already-private random temporary file when publishing fails.
+                pass
         raise
 
 
@@ -163,9 +218,14 @@ def enqueue_hook_input(
     source_agent: str,
     trigger: str,
     memory_home: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
     **kwargs: object,
-) -> EnqueueResult:
+) -> CaptureOutcome:
     """Resolve the common hook payload fields and enqueue its transcript."""
+    source_env = os.environ if env is None else env
+    guarded = _guarded_outcome(source_env)
+    if guarded is not None:
+        return guarded
     transcript = hook_input.get("transcript_path")
     if not isinstance(transcript, str) or not transcript:
         raise ValueError("hook input has no transcript_path")
@@ -181,5 +241,6 @@ def enqueue_hook_input(
         source_agent=source_agent,
         metadata=metadata,
         memory_home=memory_home,
+        env=source_env,
         **kwargs,
     )
