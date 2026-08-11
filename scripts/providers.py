@@ -3,6 +3,7 @@
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import ModuleType
 from typing import Literal, Protocol
@@ -12,8 +13,12 @@ if __name__ == "providers":
     provider_module = sys.modules[__name__]
     scripts_package = sys.modules.get("scripts")
     if scripts_package is None:
+        scripts_path = str(Path(__file__).resolve().parent)
+        scripts_spec = ModuleSpec("scripts", loader=None, is_package=True)
+        scripts_spec.submodule_search_locations = [scripts_path]
         scripts_package = ModuleType("scripts")
-        scripts_package.__path__ = [str(Path(__file__).resolve().parent)]
+        scripts_package.__spec__ = scripts_spec
+        scripts_package.__path__ = scripts_spec.submodule_search_locations
         scripts_package.__package__ = "scripts"
         sys.modules["scripts"] = scripts_package
     scripts_package.providers = provider_module

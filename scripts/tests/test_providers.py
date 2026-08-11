@@ -114,6 +114,7 @@ def test_provider_contract_identity_is_stable_across_import_order(
 ):
     code = f"""
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -128,8 +129,12 @@ importlib.import_module({second_module!r})
 direct = importlib.import_module("providers")
 package = importlib.import_module("scripts.providers")
 scripts = importlib.import_module("scripts")
+scripts_spec = importlib.util.find_spec("scripts")
 assert direct is package
 assert scripts.providers is package
+assert scripts.__spec__ is scripts_spec
+assert scripts_spec.submodule_search_locations is not None
+assert str(root / "scripts") in scripts_spec.submodule_search_locations
 assert direct.TaskKind is package.TaskKind
 assert direct.TextRequest is package.TextRequest
 assert direct.ProviderResult is package.ProviderResult
