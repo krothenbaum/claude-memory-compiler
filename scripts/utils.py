@@ -75,6 +75,14 @@ def capture_file_baseline(path: Path | str) -> FileBaseline:
     return baseline
 
 
+def read_text_with_baseline(path: Path | str) -> tuple[str, FileBaseline]:
+    """Read one UTF-8 file and return a baseline for those exact bytes."""
+    data, baseline = _read_file_with_baseline(path)
+    if data is None:
+        raise FileNotFoundError(path)
+    return data.decode("utf-8"), baseline
+
+
 class ExclusiveFileLock:
     """Owner-only cross-platform advisory file lock.
 

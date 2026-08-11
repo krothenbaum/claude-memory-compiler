@@ -31,7 +31,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from compile import COMPILED_MARKER_RE, commit_compiled_bookkeeping  # noqa: E402
 from config import DAILY_DIR, KNOWLEDGE_DIR, now_iso  # noqa: E402
 from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply  # noqa: E402
-from utils import file_hash, load_state_with_baseline  # noqa: E402
+from utils import load_state_with_baseline, read_text_with_baseline  # noqa: E402
 
 LOG_MD_PATH = KNOWLEDGE_DIR / "log.md"
 COMPILE_ENTRY_RE = re.compile(r"^##\s+\[[^\]]+\]\s+compile\s+\|\s+(\S+\.md)", re.MULTILINE)
@@ -63,9 +63,9 @@ def main() -> None:
             print(f"  SKIP {name}: file missing from daily/")
             continue
         if name in ingested:
-            current_hash = file_hash(log_path)
+            content, log_baseline = read_text_with_baseline(log_path)
+            current_hash = log_baseline.sha256[:16] if log_baseline.sha256 else ""
             recorded_hash = ingested[name].get("hash")
-            content = log_path.read_text(encoding="utf-8")
             has_marker = bool(COMPILED_MARKER_RE.search(content))
             if recorded_hash == current_hash and has_marker:
                 continue  # already healthy
@@ -92,21 +92,34 @@ def main() -> None:
     for log_path in to_reconcile:
         state, state_baseline = load_state_with_baseline()
         ingested = state.setdefault("ingested", {})
-        content = log_path.read_text(encoding="utf-8")
+        content, log_baseline = read_text_with_baseline(log_path)
         needs_marker = not COMPILED_MARKER_RE.search(content)
         prior = ingested.get(log_path.name, {})
         ingested[log_path.name] = {
-            "hash": "pending-transaction" if needs_marker else file_hash(log_path),
+            "hash": (
+                "pending-transaction"
+                if needs_marker
+                else (log_baseline.sha256[:16] if log_baseline.sha256 else "")
+            ),
             "compiled_at": prior.get("compiled_at", now),
             "cost_usd": prior.get("cost_usd", 0.0),
             "reconciled_at": now,
         }
         if needs_marker:
-            commit_compiled_bookkeeping(log_path, state, now, state_baseline)
+            commit_compiled_bookkeeping(
+                log_path, state, now, state_baseline, log_baseline
+            )
         else:
+            relative = (
+                log_path.resolve().relative_to(DAILY_DIR.parent.resolve()).as_posix()
+            )
             apply_host_bookkeeping(
                 DAILY_DIR.parent,
-                ApplyBookkeeping(state=state, state_baseline=state_baseline),
+                ApplyBookkeeping(
+                    state=state,
+                    state_baseline=state_baseline,
+                    input_baselines={relative: log_baseline},
+                ),
             )
         ingested = state.setdefault("ingested", {})
     print(f"Done. state.json now tracks {len(ingested)} ingested file(s).")

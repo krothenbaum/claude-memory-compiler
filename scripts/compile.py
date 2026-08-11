@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
-import hashlib
 import logging
 import re
 import sys
@@ -31,6 +29,7 @@ from utils import (
     list_wiki_articles,
     load_state_with_baseline,
     notify_terminal,
+    read_text_with_baseline,
     read_wiki_index,
 )
 from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply
@@ -64,9 +63,14 @@ def append_compiled_marker(log_path: Path, when: str) -> None:
     """Append a marker through the shared writer journal."""
     home = DAILY_DIR.parent.resolve()
     relative = log_path.resolve().relative_to(home).as_posix()
+    _content, log_baseline = read_text_with_baseline(log_path)
     apply_host_bookkeeping(
         home,
-        ApplyBookkeeping(compiled_marker_path=relative, compiled_at=when),
+        ApplyBookkeeping(
+            compiled_marker_path=relative,
+            compiled_marker_baseline=log_baseline,
+            compiled_at=when,
+        ),
     )
 
 
@@ -75,25 +79,25 @@ def commit_compiled_bookkeeping(
     state: dict,
     when: str,
     state_baseline: FileBaseline,
+    log_baseline: FileBaseline,
 ) -> None:
     """Commit a compiled marker and state snapshot as one durable unit."""
     home = DAILY_DIR.parent.resolve()
     relative = log_path.resolve().relative_to(home).as_posix()
-    marker = f"\n<!-- @compiled-through:{when} -->\n".encode()
-    post_marker_hash = hashlib.sha256(log_path.read_bytes() + marker).hexdigest()[:16]
-    next_state = copy.deepcopy(state)
-    next_state.setdefault("ingested", {}).setdefault(log_path.name, {})["hash"] = post_marker_hash
     apply_host_bookkeeping(
         home,
         ApplyBookkeeping(
             compiled_marker_path=relative,
+            compiled_marker_baseline=log_baseline,
             compiled_at=when,
-            state=next_state,
+            state=state,
             state_baseline=state_baseline,
         ),
     )
+    next_state, _persisted_baseline = load_state_with_baseline()
     state.clear()
     state.update(next_state)
+
 
 logger = logging.getLogger("compile")
 logger.setLevel(logging.DEBUG)
@@ -121,7 +125,7 @@ async def compile_daily_log(
         query,
     )
 
-    full_content = log_path.read_text(encoding="utf-8")
+    full_content, log_baseline = read_text_with_baseline(log_path)
     offset = find_last_compiled_offset(full_content)
     new_content = full_content[offset:].strip()
     ingested = state.get("ingested", {})
@@ -132,7 +136,7 @@ async def compile_daily_log(
     # go through a real compile, not get silently marked as done.
     if offset == 0 and log_path.name in ingested:
         prior_hash = ingested[log_path.name].get("hash")
-        current_hash = file_hash(log_path)
+        current_hash = log_baseline.sha256[:16] if log_baseline.sha256 else ""
         if prior_hash == current_hash:
             logger.info("Backfilling marker for %s (unchanged since last compile)", log_path.name)
             notify_terminal(f"compile backfill — {log_path.name} (seeding marker, no new content)")
@@ -143,7 +147,9 @@ async def compile_daily_log(
                 "cost_usd": ingested[log_path.name].get("cost_usd", 0.0),
             }
             state["ingested"] = ingested
-            commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
+            commit_compiled_bookkeeping(
+                log_path, state, compiled_at, state_baseline, log_baseline
+            )
             return 0.0
         else:
             logger.info(
@@ -162,7 +168,9 @@ async def compile_daily_log(
             "cost_usd": ingested.get(log_path.name, {}).get("cost_usd", 0.0),
         }
         state["ingested"] = ingested
-        commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
+        commit_compiled_bookkeeping(
+            log_path, state, compiled_at, state_baseline, log_baseline
+        )
         return 0.0
 
     schema = AGENTS_FILE.read_text(encoding="utf-8")
@@ -389,7 +397,9 @@ sees the file was processed. Example:
         "cost_usd": cost,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + cost
-    commit_compiled_bookkeeping(log_path, state, compiled_at, state_baseline)
+    commit_compiled_bookkeeping(
+        log_path, state, compiled_at, state_baseline, log_baseline
+    )
 
     logger.info("Compile complete for %s", log_path.name)
     notify_terminal(f"compile complete — {log_path.name} (${cost:.4f})")

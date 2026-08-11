@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -83,6 +84,45 @@ def _compile_stage(memory_home: Path, *, attempt_id: str = "attempt-1"):
             "- Articles updated: [[concepts/original]]\n"
         )
     return stage
+
+
+def _schema_article(kind: str) -> tuple[str, str, str]:
+    if kind == "concept":
+        return "knowledge/concepts/scalar.md", ARTICLE, "compile"
+    if kind == "connection":
+        return (
+            "knowledge/connections/scalar.md",
+            ARTICLE.replace(
+                'title: "Original"',
+                'title: "Connection"\nconnects:\n  - concepts/a\n  - concepts/b',
+            ),
+            "connections",
+        )
+    return (
+        "knowledge/qa/scalar.md",
+        "---\ntitle: Q\nquestion: Why?\nconsulted:\n"
+        "  - concepts/original\nfiled: 2026-08-11\n---\n# Q\n",
+        "file_answer",
+    )
+
+
+_SCALAR_ORIGINALS = {
+    "title": {'concept': '"Original"', "connection": '"Connection"', "qa": "Q"},
+    "question": {"qa": "Why?"},
+    "created": {"concept": "2026-08-11", "connection": "2026-08-11"},
+    "updated": {"concept": "2026-08-11", "connection": "2026-08-11"},
+    "filed": {"qa": "2026-08-11"},
+}
+_SCALAR_MATRIX = [
+    (kind, field, bad)
+    for kind, fields in {
+        "concept": ("title", "created", "updated"),
+        "connection": ("title", "created", "updated"),
+        "qa": ("title", "question", "filed"),
+    }.items()
+    for field in fields
+    for bad in ('""', "[not-a-scalar]", "{nested: value}")
+]
 
 
 def test_create_stage_copies_only_selected_files_and_records_private_manifest(memory_home):
@@ -450,6 +490,65 @@ def test_frontmatter_list_fields_reject_scalar_values(memory_home, relative, bod
         )
 
 
+@pytest.mark.parametrize(("kind", "field", "bad_value"), _SCALAR_MATRIX)
+def test_frontmatter_scalar_fields_reject_empty_list_and_map_values(
+    memory_home, kind, field, bad_value
+):
+    relative, body, task = _schema_article(kind)
+    original = _SCALAR_ORIGINALS[field][kind]
+    body = body.replace(f"{field}: {original}", f"{field}: {bad_value}")
+    stage = create_stage(memory_home, "job", f"{kind}-{field}-{bad_value}")
+    _write(stage.root / relative, body)
+    slug = relative.removeprefix("knowledge/").removesuffix(".md")
+    with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"| [[{slug}]] | memory | Added | source | 2026-08-11 |\n")
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"## [now] {task} | source\n- Created: [[{slug}]]\n")
+    with pytest.raises(StageValidationError, match=field):
+        validate_stage(
+            stage,
+            allowed_paths=(relative, "knowledge/index.md", "knowledge/log.md"),
+            task=task,
+        )
+
+
+@pytest.mark.parametrize("kind", ["concept", "connection"])
+def test_project_accepts_nonempty_scalar_or_nonempty_list(memory_home, kind):
+    relative, body, task = _schema_article(kind)
+    body = body.replace("project: memory", "project: [memory, shared]")
+    stage = create_stage(memory_home, "job", f"project-list-{kind}")
+    _write(stage.root / relative, body)
+    slug = relative.removeprefix("knowledge/").removesuffix(".md")
+    with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"| [[{slug}]] | memory | Added | source | 2026-08-11 |\n")
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"## [now] {task} | source\n- Created: [[{slug}]]\n")
+    validate_stage(
+        stage,
+        allowed_paths=(relative, "knowledge/index.md", "knowledge/log.md"),
+        task=task,
+    )
+
+
+@pytest.mark.parametrize(("kind", "bad_value"), [("concept", '""'), ("connection", "{x: y}")])
+def test_project_rejects_empty_or_mapping_values(memory_home, kind, bad_value):
+    relative, body, task = _schema_article(kind)
+    body = body.replace("project: memory", f"project: {bad_value}")
+    stage = create_stage(memory_home, "job", f"bad-project-{kind}")
+    _write(stage.root / relative, body)
+    slug = relative.removeprefix("knowledge/").removesuffix(".md")
+    with (stage.root / "knowledge/index.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"| [[{slug}]] | memory | Added | source | 2026-08-11 |\n")
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"## [now] {task} | source\n- Created: [[{slug}]]\n")
+    with pytest.raises(StageValidationError, match="project"):
+        validate_stage(
+            stage,
+            allowed_paths=(relative, "knowledge/index.md", "knowledge/log.md"),
+            task=task,
+        )
+
+
 def test_unchanged_relevant_article_must_also_match_frontmatter_schema(memory_home):
     article = memory_home / "knowledge/concepts/original.md"
     article.write_text(ARTICLE.replace("updated: 2026-08-11\n", ""), encoding="utf-8")
@@ -580,6 +679,9 @@ def test_apply_failure_after_each_replace_restores_every_real_file(memory_home, 
 
     bookkeeping = ApplyBookkeeping(
         compiled_marker_path="daily/2026-08-11.md",
+        compiled_marker_baseline=capture_file_baseline(
+            memory_home / "daily/2026-08-11.md"
+        ),
         compiled_at="2026-08-11T12:00:00+00:00",
         state={"ingested": {"2026-08-11.md": {"hash": "new"}}},
         state_baseline=capture_file_baseline(memory_home / "scripts/state.json"),
@@ -604,6 +706,9 @@ def test_apply_commits_stage_marker_and_state_together(memory_home):
         stage.baseline,
         ApplyBookkeeping(
             compiled_marker_path="daily/2026-08-11.md",
+            compiled_marker_baseline=capture_file_baseline(
+                memory_home / "daily/2026-08-11.md"
+            ),
             compiled_at="2026-08-11T12:00:00+00:00",
             state={"ingested": {"2026-08-11.md": {"hash": "new"}}},
             state_baseline=capture_file_baseline(memory_home / "scripts/state.json"),
@@ -613,6 +718,13 @@ def test_apply_commits_stage_marker_and_state_together(memory_home):
     assert 'title: "Updated"' in (memory_home / "knowledge/concepts/original.md").read_text(encoding="utf-8")
     assert "@compiled-through:2026-08-11T12:00:00+00:00" in (memory_home / "daily/2026-08-11.md").read_text(encoding="utf-8")
     assert json.loads((memory_home / "scripts/state.json").read_text(encoding="utf-8"))["ingested"]
+    expected_hash = hashlib.sha256(
+        (memory_home / "daily/2026-08-11.md").read_bytes()
+    ).hexdigest()[:16]
+    persisted_state = json.loads(
+        (memory_home / "scripts/state.json").read_text(encoding="utf-8")
+    )
+    assert persisted_state["ingested"]["2026-08-11.md"]["hash"] == expected_hash
     assert set(result.changed_paths) >= set(validated.changed_paths)
     assert list((memory_home / "scripts/memory-apply-journal").glob("*.json")) == []
 
@@ -724,6 +836,40 @@ def test_state_compare_and_swap_rejects_concurrent_writer_without_data_loss(memo
         (memory_home / "scripts/state.json").read_text(encoding="utf-8")
     )
     assert persisted == concurrent
+
+
+def test_compiled_marker_compare_and_swap_rejects_concurrent_daily_append(memory_home):
+    from staging import apply_host_bookkeeping
+
+    daily = memory_home / "daily/2026-08-11.md"
+    daily_baseline = capture_file_baseline(daily)
+    state = memory_home / "scripts/state.json"
+    state_before = state.read_bytes()
+    daily.write_text(
+        daily.read_text(encoding="utf-8") + "\nconcurrent session\n",
+        encoding="utf-8",
+    )
+    concurrent_bytes = daily.read_bytes()
+
+    with pytest.raises(RetryableApplyError, match="compiled marker baseline"):
+        apply_host_bookkeeping(
+            memory_home,
+            ApplyBookkeeping(
+                compiled_marker_path="daily/2026-08-11.md",
+                compiled_marker_baseline=daily_baseline,
+                compiled_at="2026-08-11T12:00:00+00:00",
+                state={
+                    "ingested": {
+                        "2026-08-11.md": {"hash": "must-be-derived-in-transaction"}
+                    }
+                },
+                state_baseline=capture_file_baseline(state),
+            ),
+        )
+
+    assert daily.read_bytes() == concurrent_bytes
+    assert b"@compiled-through" not in concurrent_bytes
+    assert state.read_bytes() == state_before
 
 
 def test_state_cannot_bypass_compare_and_swap_through_stage_or_extra_updates(memory_home):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import copy
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 import hashlib
@@ -85,10 +86,12 @@ class ApplyBookkeeping:
     """Host-owned updates committed after validated model replacements."""
 
     compiled_marker_path: str | None = None
+    compiled_marker_baseline: FileBaseline | None = None
     compiled_at: str | None = None
     state: Mapping[str, object] | None = None
     state_path: str = "scripts/state.json"
     state_baseline: FileBaseline | None = None
+    input_baselines: Mapping[str, FileBaseline] = field(default_factory=dict)
     extra_updates: Mapping[str, bytes | str] = field(default_factory=dict)
     failure_injector: Callable[[int, str], None] | None = None
 
@@ -341,7 +344,7 @@ def _validate_frontmatter(relative: str, content: str) -> None:
         raise StageValidationError(f"article has malformed frontmatter: {relative}")
     frontmatter = content[4:boundary]
     lines = frontmatter.splitlines()
-    values: dict[str, str | list[str]] = {}
+    values: dict[str, str | list[str] | dict[str, object]] = {}
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -367,6 +370,12 @@ def _validate_frontmatter(relative: str, content: str) -> None:
                     if item.strip().strip('"\'')
                 ]
                 values[key] = items
+            elif normalized.startswith("{"):
+                if not normalized.endswith("}"):
+                    raise StageValidationError(
+                        f"article has malformed inline mapping for {key}: {relative}"
+                    )
+                values[key] = {"inline-mapping": normalized[1:-1]}
             else:
                 scalar = normalized.strip('"\'')
                 values[key] = scalar if scalar not in {"", "{}"} else ""
@@ -402,6 +411,24 @@ def _validate_frontmatter(relative: str, content: str) -> None:
         if not isinstance(value, list) or len(value) < minimum:
             raise StageValidationError(
                 f"article frontmatter {key} must be a non-empty YAML list: {relative}"
+            )
+    scalar_fields = required & {"title", "question", "created", "updated", "filed"}
+    for key in sorted(scalar_fields):
+        value = values.get(key)
+        if not isinstance(value, str) or not value:
+            raise StageValidationError(
+                f"article frontmatter {key} must be a non-empty YAML scalar: {relative}"
+            )
+    if "project" in required:
+        project = values.get("project")
+        if not (
+            isinstance(project, str)
+            and bool(project)
+            or isinstance(project, list)
+            and bool(project)
+        ):
+            raise StageValidationError(
+                f"article frontmatter project must be a non-empty YAML scalar or list: {relative}"
             )
 
 
@@ -736,20 +763,45 @@ def _verify_state_baseline(home: Path, bookkeeping: ApplyBookkeeping) -> None:
     state_path = _safe_destination(home, _relative_path(bookkeeping.state_path))
     current = capture_file_baseline(state_path)
     expected = bookkeeping.state_baseline
-    if (current.exists, current.size, current.sha256) != (
+    if not _same_baseline(current, expected):
+        raise RetryableApplyError("state baseline changed before apply")
+
+
+def _same_baseline(current: FileBaseline, expected: FileBaseline) -> bool:
+    return (current.exists, current.size, current.sha256) == (
         expected.exists,
         expected.size,
         expected.sha256,
-    ):
-        raise RetryableApplyError("state baseline changed before apply")
+    )
+
+
+def _verify_input_baselines(home: Path, bookkeeping: ApplyBookkeeping) -> None:
+    for raw_path, expected in bookkeeping.input_baselines.items():
+        relative = _relative_path(raw_path)
+        current = capture_file_baseline(_safe_destination(home, relative))
+        if not _same_baseline(current, expected):
+            raise RetryableApplyError(f"input baseline changed before apply: {relative}")
+
+    if bookkeeping.compiled_marker_path is None:
+        if bookkeeping.compiled_marker_baseline is not None:
+            raise StageValidationError("compiled marker baseline requires a compiled marker")
+        return
+    if bookkeeping.compiled_marker_baseline is None:
+        raise StageValidationError("compiled marker requires an exact file baseline")
+    relative = _relative_path(bookkeeping.compiled_marker_path)
+    current = capture_file_baseline(_safe_destination(home, relative))
+    if not _same_baseline(current, bookkeeping.compiled_marker_baseline):
+        raise RetryableApplyError("compiled marker baseline changed before apply")
 
 
 def _bookkeeping_updates(
     home: Path, bookkeeping: ApplyBookkeeping
 ) -> dict[str, bytes]:
     updates: dict[str, bytes] = {}
+    marker_relative: str | None = None
     if bookkeeping.compiled_marker_path is not None:
         relative = _relative_path(bookkeeping.compiled_marker_path)
+        marker_relative = relative
         if not bookkeeping.compiled_at:
             raise StageValidationError("compiled_at is required with a compiled marker")
         source = _safe_destination(home, relative, allow_missing=False)
@@ -760,7 +812,20 @@ def _bookkeeping_updates(
         relative = _relative_path(bookkeeping.state_path)
         if relative in updates:
             raise StageValidationError(f"duplicate bookkeeping destination: {relative}")
-        updates[relative] = (json.dumps(bookkeeping.state, indent=2) + "\n").encode()
+        next_state = copy.deepcopy(bookkeeping.state)
+        if marker_relative is not None:
+            ingested = next_state.get("ingested")
+            entry = (
+                ingested.get(PurePosixPath(marker_relative).name)
+                if isinstance(ingested, dict)
+                else None
+            )
+            if not isinstance(entry, dict):
+                raise StageValidationError(
+                    "compiled marker state requires an ingested entry for the daily file"
+                )
+            entry["hash"] = _sha256(updates[marker_relative])[:16]
+        updates[relative] = (json.dumps(next_state, indent=2) + "\n").encode()
     for raw_path, value in bookkeeping.extra_updates.items():
         relative = _relative_path(raw_path)
         if relative == _relative_path(bookkeeping.state_path):
@@ -824,6 +889,7 @@ def apply_host_bookkeeping(
     home = Path(memory_home).expanduser().resolve()
     with ExclusiveFileLock(home / "scripts" / "memory-writer.lock"):
         recovered = recover_incomplete_apply_unlocked(home)
+        _verify_input_baselines(home, bookkeeping)
         _verify_state_baseline(home, bookkeeping)
         replacements = _bookkeeping_updates(home, bookkeeping)
         changed = _commit_replacements_unlocked(
@@ -874,6 +940,7 @@ def apply_validated_stage(
                 if real.exists() or real.is_symlink():
                     raise RetryableApplyError(f"real baseline changed before apply: {relative}")
 
+        _verify_input_baselines(home, bookkeeping)
         _verify_state_baseline(home, bookkeeping)
 
         replacements = {
