@@ -264,6 +264,64 @@ def test_codex_parser_keeps_decisions_and_selected_subagent_findings():
     ]
 
 
+def _parse_collaboration_envelope(tmp_path, sender_lines):
+    transcript = tmp_path / "collaboration-envelope.jsonl"
+    envelope_lines = [
+        "Message Type: FINAL_ANSWER",
+        "Task name: /root/research",
+        *sender_lines,
+        "Payload:",
+        "EXACT_SENDER_FINDING",
+    ]
+    record = {
+        "type": "response_item",
+        "payload": {
+            "type": "agent_message",
+            "id": "collaboration-result",
+            "author": "/root/research",
+            "recipient": "/root",
+            "content": [
+                {"type": "input_text", "text": "\n".join(envelope_lines)}
+            ],
+        },
+    }
+    transcript.write_text(json.dumps(record), encoding="utf-8")
+    return parse_codex_transcript(transcript, {})
+
+
+def test_codex_collaboration_sender_exactly_matches_author(tmp_path):
+    session = _parse_collaboration_envelope(
+        tmp_path, ["Sender: /root/research"]
+    )
+
+    assert session.turns == (
+        Turn(
+            "assistant",
+            "[Subagent result] EXACT_SENDER_FINDING",
+            "subagent_finding",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "sender_lines",
+    [
+        ["Sender: /evil/root/research"],
+        ["Sender: /root/research-evil"],
+        ["Sender: /root/research", "Sender: /root/research"],
+        [],
+    ],
+    ids=["prefix", "suffix", "duplicate", "missing"],
+)
+def test_codex_collaboration_rejects_inexact_sender_fields(
+    tmp_path, sender_lines
+):
+    session = _parse_collaboration_envelope(tmp_path, sender_lines)
+
+    assert session.turns == ()
+    assert render_turns(session) == ""
+
+
 @pytest.mark.parametrize(
     "output",
     [

@@ -403,6 +403,16 @@ def _completed_finding(value: object) -> str:
     return ""
 
 
+def _parse_agent_message_header(header: str) -> dict[str, str] | None:
+    fields: dict[str, str] = {}
+    for line in header.split("\n"):
+        name, separator, value = line.partition(": ")
+        if not separator or not name or name in fields:
+            return None
+        fields[name] = value
+    return fields
+
+
 def _codex_agent_message_finding(payload: Mapping[str, object]) -> str:
     author = _nonempty_string(payload.get("author"))
     recipient = _nonempty_string(payload.get("recipient"))
@@ -415,10 +425,12 @@ def _codex_agent_message_finding(payload: Mapping[str, object]) -> str:
             continue
         text = _nonempty_string(block.get("text"))
         header, marker, finding = text.partition("\nPayload:\n")
+        fields = _parse_agent_message_header(header)
         if (
             marker
-            and header.startswith("Message Type: FINAL_ANSWER\n")
-            and f"\nSender: {author}" in header
+            and fields is not None
+            and fields.get("Message Type") == "FINAL_ANSWER"
+            and fields.get("Sender") == author
             and finding.strip()
         ):
             return finding.strip()
