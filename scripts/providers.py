@@ -285,10 +285,13 @@ def subscription_child_env(source: Mapping[str, str] | None = None) -> dict[str,
     return child
 
 
-def _safe_reason(message: str, source_env: Mapping[str, str]) -> str:
+def _safe_reason(
+    message: str, *source_envs: Mapping[str, str]
+) -> str:
     safe = " ".join(message.strip().split())
     secret_values = {
         value
+        for source_env in source_envs
         for name, value in source_env.items()
         if value
         and (
@@ -298,7 +301,10 @@ def _safe_reason(message: str, source_env: Mapping[str, str]) -> str:
         )
     }
     redactable_values = secret_values | {
-        value for value in source_env.values() if len(value) >= 4
+        value
+        for source_env in source_envs
+        for value in source_env.values()
+        if len(value) >= 4
     }
     for value in sorted(redactable_values, key=len, reverse=True):
         safe = safe.replace(value, "[REDACTED]")
@@ -669,20 +675,24 @@ def _load_claude_sdk() -> tuple[Any, Callable[..., Any]]:
 
 
 def _safe_provider_reason(
-    message: str, source_env: Mapping[str, str], prompt: str
+    message: str,
+    source_env: Mapping[str, str],
+    prompt: str,
+    *additional_source_envs: Mapping[str, str],
 ) -> str:
     without_prompt = message.replace(prompt, "[REDACTED]") if prompt else message
-    return _safe_reason(without_prompt, source_env)
+    return _safe_reason(without_prompt, source_env, *additional_source_envs)
 
 
 def _safe_router_reason(
     message: str, provider: GenerationProvider, prompt: str
 ) -> str:
-    source_env = dict(os.environ)
     provider_env = getattr(provider, "_source_env", None)
     if isinstance(provider_env, Mapping):
-        source_env.update(provider_env)
-    return _safe_provider_reason(message, source_env, prompt)
+        return _safe_provider_reason(
+            message, os.environ, prompt, provider_env
+        )
+    return _safe_provider_reason(message, os.environ, prompt)
 
 
 class ClaudeProvider:

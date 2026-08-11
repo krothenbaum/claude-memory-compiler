@@ -1146,6 +1146,47 @@ def test_router_redacts_provider_owned_secrets_from_unexpected_exceptions(
     assert len(reason) <= 500
 
 
+@pytest.mark.parametrize(
+    ("ambient_secret", "provider_secret"),
+    [
+        ("ambient-short-secret", "provider-long-secret-" + "x" * 600),
+        ("ambient-long-secret-" + "x" * 600, "provider-short-secret"),
+    ],
+    ids=["ambient-short", "ambient-long"],
+)
+def test_router_redacts_colliding_ambient_and_provider_credentials(
+    monkeypatch, text_request, ambient_secret, provider_secret
+):
+    import providers
+
+    prompt = "router prompt must stay private"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_secret)
+    request = TextRequest(
+        text_request.task,
+        prompt,
+        text_request.cwd,
+        text_request.timeout_seconds,
+    )
+    crashing = FakeProvider(
+        RuntimeError(
+            f"adapter crashed: {ambient_secret} {provider_secret} {prompt}"
+        )
+    )
+    crashing._source_env = {"ANTHROPIC_API_KEY": provider_secret}
+
+    result = _run(
+        providers.ProviderRouter(
+            crashing, FakeProvider(success_result("claude", "done"))
+        ).generate_text(request)
+    )
+
+    reason = result.attempts[0].reason
+    assert ambient_secret[:100] not in reason
+    assert provider_secret[:100] not in reason
+    assert prompt not in reason
+    assert len(reason) <= 500
+
+
 @pytest.mark.parametrize("callback_kind", ["sync", "async"])
 def test_router_fails_closed_when_attempt_callback_fails(
     text_request, callback_kind
