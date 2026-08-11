@@ -457,6 +457,77 @@ def test_claude_later_reuse_invalidates_an_earlier_tool_output(tmp_path):
     assert "[Decision made]" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "first_output", "replayed_output", "expected_kind"),
+    [
+        (
+            "AskUserQuestion",
+            "FIRST_DECISION",
+            "REPLAYED_DECISION_SHOULD_NOT_APPEAR",
+            "decision",
+        ),
+        (
+            "Agent",
+            "FIRST_FINDING",
+            "REPLAYED_FINDING_SHOULD_NOT_APPEAR",
+            "subagent_finding",
+        ),
+    ],
+)
+def test_claude_accepts_only_first_durable_output_per_call(
+    tmp_path, tool_name, first_output, replayed_output, expected_kind
+):
+    transcript = tmp_path / "claude-replayed-output.jsonl"
+    records = [
+        {
+            "message": {
+                "role": "assistant",
+                "content": [_claude_tool_use(tool_name, call_id="unique-id")],
+            }
+        },
+        {
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "unique-id",
+                        "content": first_output,
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "unique-id",
+                        "content": replayed_output,
+                    }
+                ],
+            }
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_claude_transcript(transcript, {})
+    rendered = render_turns(session)
+
+    durable_outputs = [
+        turn
+        for turn in session.turns
+        if first_output in turn.text or replayed_output in turn.text
+    ]
+    assert len(durable_outputs) == 1
+    assert durable_outputs[0].kind == expected_kind
+    assert first_output in rendered
+    assert replayed_output not in rendered
+
+
 @pytest.mark.parametrize("max_chars", [0, 1, 5, len("**User:** \n")])
 def test_max_chars_drops_turn_when_no_text_can_fit(tmp_path, max_chars):
     transcript = tmp_path / "one-turn.jsonl"
@@ -878,6 +949,87 @@ def test_codex_later_reuse_invalidates_an_earlier_call_output(
 
     assert session.turns == ()
     assert "LEAKED_CHOICE" not in render_turns(session)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "first_output", "replayed_output", "expected_kind"),
+    [
+        (
+            "request_user_input",
+            {"answers": {"Choice": {"answers": ["FIRST_DECISION"]}}},
+            {
+                "answers": {
+                    "Choice": {"answers": ["REPLAYED_DECISION_SHOULD_NOT_APPEAR"]}
+                }
+            },
+            "decision",
+        ),
+        (
+            "wait_agent",
+            {"status": "completed", "message": "FIRST_FINDING"},
+            {
+                "status": "completed",
+                "message": "REPLAYED_FINDING_SHOULD_NOT_APPEAR",
+            },
+            "subagent_finding",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("call_type", "output_type"),
+    [
+        ("function_call", "function_call_output"),
+        ("custom_tool_call", "custom_tool_call_output"),
+    ],
+)
+def test_codex_accepts_only_first_durable_output_per_call(
+    tmp_path,
+    tool_name,
+    first_output,
+    replayed_output,
+    expected_kind,
+    call_type,
+    output_type,
+):
+    transcript = tmp_path / "codex-replayed-output.jsonl"
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": call_type,
+                "name": tool_name,
+                "call_id": "unique-id",
+                "arguments": "{}",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": output_type,
+                "call_id": "unique-id",
+                "output": json.dumps(first_output),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": output_type,
+                "call_id": "unique-id",
+                "output": json.dumps(replayed_output),
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    session = parse_codex_transcript(transcript, {})
+    rendered = render_turns(session)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].kind == expected_kind
+    assert "FIRST_" in rendered
+    assert "REPLAYED_" not in rendered
 
 
 def test_chunk_session_preserves_turns_and_deterministic_provenance():

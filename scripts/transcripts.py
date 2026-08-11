@@ -357,15 +357,15 @@ def parse_claude_transcript(
                             parts.append(rendered)
                             kind = "decision"
                 elif block_type == "tool_result":
-                    tool_name = tool_names.get(
-                        _nonempty_string(block.get("tool_use_id"))
-                    )
+                    tool_id = _nonempty_string(block.get("tool_use_id"))
+                    tool_name = tool_names.get(tool_id)
                     rendered = (
                         _claude_tool_result(tool_name, block.get("content"))
                         if tool_name is not None
                         else None
                     )
                     if rendered is not None:
+                        tool_names[tool_id] = None
                         text, result_kind = rendered
                         parts.append(text)
                         kind = result_kind
@@ -618,10 +618,12 @@ def parse_codex_transcript(
             if tool_name in CODEX_DECISION_TOOLS:
                 text = _render_codex_decision(output)
                 if text:
+                    calls[call_id] = None
                     turns.append(Turn("user", text, "decision", timestamp))
             elif tool_name in CODEX_SUBAGENT_RESULT_TOOLS:
                 finding_turn = _codex_subagent_turn(output, timestamp)
                 if finding_turn is not None:
+                    calls[call_id] = None
                     turns.append(finding_turn)
 
     return _make_session(
