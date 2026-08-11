@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import json
 import os
+import platform
+import subprocess
 import signal
 import sys
 import tempfile
@@ -105,6 +107,21 @@ class CommandResult:
 class AsyncCommandRunner:
     """Run a subprocess in its own session and kill that session on timeout."""
 
+    def __init__(
+        self,
+        *,
+        process_factory: Callable[..., Awaitable[Any]] | None = None,
+        platform_name: str | None = None,
+        windows_tree_terminator: Callable[..., Awaitable[None]] | None = None,
+        grace_seconds: float = 2,
+    ) -> None:
+        self._process_factory = process_factory or asyncio.create_subprocess_exec
+        self._platform_name = platform_name or platform.system()
+        self._windows_tree_terminator = (
+            windows_tree_terminator or self._taskkill_windows_tree
+        )
+        self._grace_seconds = grace_seconds
+
     async def __call__(
         self,
         command: Sequence[str],
@@ -116,44 +133,97 @@ class AsyncCommandRunner:
         start_new_session: bool,
         terminate_process_group_on_timeout: bool,
     ) -> CommandResult:
-        process = await asyncio.create_subprocess_exec(
+        windows = self._platform_name == "Windows"
+        process = await self._process_factory(
             *command,
             cwd=cwd,
             env=dict(env),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=start_new_session,
+            start_new_session=start_new_session and not windows,
+            creationflags=(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if windows and start_new_session
+                else 0
+            ),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(stdin.encode()), timeout=timeout_seconds
             )
-        except TimeoutError:
-            if terminate_process_group_on_timeout and start_new_session:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-            else:
-                process.terminate()
+        except BaseException:
+            cleanup = asyncio.create_task(
+                self._cleanup_process_tree(
+                    process,
+                    terminate_process_group=(
+                        terminate_process_group_on_timeout and start_new_session
+                    ),
+                )
+            )
             try:
-                await asyncio.wait_for(process.wait(), timeout=2)
-            except TimeoutError:
-                if terminate_process_group_on_timeout and start_new_session:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                else:
-                    process.kill()
-                await process.wait()
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
             raise
         return CommandResult(
             process.returncode,
             stdout.decode(errors="replace"),
             stderr.decode(errors="replace"),
         )
+
+    async def _cleanup_process_tree(
+        self, process: Any, *, terminate_process_group: bool
+    ) -> None:
+        await self._signal_process_tree(
+            process, force=False, process_group=terminate_process_group
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(process.wait()), timeout=self._grace_seconds
+            )
+        except (TimeoutError, OSError):
+            pass
+        finally:
+            await self._signal_process_tree(
+                process, force=True, process_group=terminate_process_group
+            )
+        try:
+            await asyncio.shield(process.wait())
+        except (OSError, ProcessLookupError):
+            pass
+
+    async def _signal_process_tree(
+        self, process: Any, *, force: bool, process_group: bool
+    ) -> None:
+        try:
+            if process_group and self._platform_name == "Windows":
+                await self._windows_tree_terminator(process.pid, force=force)
+            elif process_group:
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif force:
+                process.kill()
+            else:
+                process.terminate()
+        except (OSError, ProcessLookupError, PermissionError):
+            if not process_group:
+                return
+            try:
+                process.kill() if force else process.terminate()
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
+
+    @staticmethod
+    async def _taskkill_windows_tree(pid: int, *, force: bool) -> None:
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            command.append("/F")
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await process.communicate()
 
 
 _ENV_NAMES = {
@@ -371,6 +441,8 @@ class CodexProvider:
 
         command = [
             "codex",
+            "--ask-for-approval",
+            "never",
             "exec",
             "--ephemeral",
             "--ignore-user-config",
@@ -379,8 +451,6 @@ class CodexProvider:
             self._task_models[request.task],
             "--sandbox",
             "workspace-write" if workspace else "read-only",
-            "--ask-for-approval",
-            "never",
             "--cd",
             str(stage),
             "--output-last-message",
@@ -480,6 +550,131 @@ def _invalid_text_reason(
     return None
 
 
+def ExactEnvironmentClaudeTransport(
+    *,
+    prompt: str,
+    options: Any,
+    env: Mapping[str, str],
+    process_opener: Callable[..., Awaitable[Any]] | None = None,
+    tree_terminator: Callable[..., Awaitable[None]] | None = None,
+) -> Any:
+    """Create an SDK transport whose process receives only the supplied environment."""
+    import anyio
+    from anyio.streams.text import TextReceiveStream, TextSendStream
+    from claude_agent_sdk._errors import (
+        CLIConnectionError,
+        CLINotFoundError,
+    )
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+    from claude_agent_sdk._version import __version__ as sdk_version
+
+    open_process = process_opener or anyio.open_process
+    exact_env = dict(env)
+
+    async def default_tree_terminator(pid: int, *, force: bool) -> None:
+        if os.name == "nt":
+            await AsyncCommandRunner._taskkill_windows_tree(pid, force=force)
+            return
+        try:
+            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+    terminate_tree = tree_terminator or default_tree_terminator
+
+    class _ExactEnvironmentTransport(SubprocessCLITransport):
+        async def connect(self) -> None:
+            if self._process:
+                return
+            if self._cli_path is None:
+                self._cli_path = await anyio.to_thread.run_sync(self._find_cli)
+
+            command = self._build_command()
+            process_env = {
+                **exact_env,
+                "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+                "CLAUDE_AGENT_SDK_VERSION": sdk_version,
+            }
+            if self._options.enable_file_checkpointing:
+                process_env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
+            if self._cwd:
+                process_env["PWD"] = self._cwd
+
+            should_pipe_stderr = (
+                self._options.stderr is not None
+                or "debug-to-stderr" in self._options.extra_args
+            )
+            try:
+                self._process = await open_process(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE if should_pipe_stderr else None,
+                    cwd=self._cwd,
+                    env=process_env,
+                    user=self._options.user,
+                    start_new_session=os.name != "nt",
+                    creationflags=(
+                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        if os.name == "nt"
+                        else 0
+                    ),
+                )
+                if self._process.stdout:
+                    self._stdout_stream = TextReceiveStream(self._process.stdout)
+                if should_pipe_stderr and self._process.stderr:
+                    self._stderr_stream = TextReceiveStream(self._process.stderr)
+                    self._stderr_task_group = anyio.create_task_group()
+                    await self._stderr_task_group.__aenter__()
+                    self._stderr_task_group.start_soon(self._handle_stderr)
+                if self._process.stdin:
+                    self._stdin_stream = TextSendStream(self._process.stdin)
+                self._ready = True
+            except FileNotFoundError as exc:
+                if self._cwd and not Path(self._cwd).exists():
+                    error = CLIConnectionError(
+                        f"Working directory does not exist: {self._cwd}"
+                    )
+                else:
+                    error = CLINotFoundError(
+                        f"Claude Code not found at: {self._cli_path}"
+                    )
+                self._exit_error = error
+                raise error from exc
+            except Exception as exc:
+                error = CLIConnectionError("Failed to start Claude Code")
+                self._exit_error = error
+                raise error from exc
+
+        async def close(self) -> None:
+            pid = self._process.pid if self._process is not None else None
+            try:
+                await super().close()
+            finally:
+                if pid is not None:
+                    try:
+                        await terminate_tree(pid, force=True)
+                    except (OSError, ProcessLookupError, PermissionError):
+                        pass
+
+    return _ExactEnvironmentTransport(prompt=prompt, options=options)
+
+
+def _load_claude_sdk() -> tuple[Any, Callable[..., Any]]:
+    from claude_agent_sdk import ClaudeAgentOptions, query
+
+    return ClaudeAgentOptions, query
+
+
+def _safe_provider_reason(
+    message: str, source_env: Mapping[str, str], prompt: str
+) -> str:
+    without_prompt = message.replace(prompt, "[REDACTED]") if prompt else message
+    return _safe_reason(without_prompt, source_env)
+
+
 class ClaudeProvider:
     """Subscription-only Claude Agent SDK adapter."""
 
@@ -488,11 +683,15 @@ class ClaudeProvider:
         *,
         query_fn: Callable[..., Any] | None = None,
         options_factory: Callable[..., Any] | None = None,
+        transport_factory: Callable[..., Any] | None = None,
+        sdk_loader: Callable[[], tuple[Any, Callable[..., Any]]] | None = None,
         model: str | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
         self._query_fn = query_fn
         self._options_factory = options_factory
+        self._transport_factory = transport_factory
+        self._sdk_loader = sdk_loader or _load_claude_sdk
         self._source_env = dict(os.environ if env is None else env)
         self._model = model or self._source_env.get(
             "AI_MEMORY_CLAUDE_MODEL", "claude-sonnet-5"
@@ -532,30 +731,7 @@ class ClaudeProvider:
     async def _generate(
         self, request: TextRequest, *, workspace: bool
     ) -> ProviderResult:
-        from claude_agent_sdk import ClaudeAgentOptions, query
-
         started = time.monotonic()
-        output_schema, schema_error = _load_output_schema(request.output_schema)
-        if schema_error is not None:
-            return self._result(request, "error", started, reason=schema_error)
-        query_fn = self._query_fn or query
-        options_factory = self._options_factory or ClaudeAgentOptions
-        options = options_factory(
-            cwd=str(request.cwd.resolve()),
-            allowed_tools=(
-                ["Read", "Write", "Edit", "Glob", "Grep"] if workspace else []
-            ),
-            permission_mode="acceptEdits" if workspace else "dontAsk",
-            max_turns=80 if workspace else 20,
-            model=self._model,
-            env=subscription_child_env(self._source_env),
-            setting_sources=[],
-            output_format=(
-                {"type": "json_schema", "schema": output_schema}
-                if output_schema is not None
-                else None
-            ),
-        )
         parts: list[str] = []
         errors: list[str] = []
         fallback_result_text = ""
@@ -563,8 +739,46 @@ class ClaudeProvider:
         input_tokens = None
         output_tokens = None
         try:
+            ClaudeAgentOptions, sdk_query = self._sdk_loader()
+            output_schema, schema_error = _load_output_schema(request.output_schema)
+            if schema_error is not None:
+                return self._result(request, "error", started, reason=schema_error)
+            query_fn = self._query_fn or sdk_query
+            options_factory = self._options_factory or ClaudeAgentOptions
+            tools = ["Read", "Write", "Edit", "Glob", "Grep"] if workspace else []
+            child_env = subscription_child_env(self._source_env)
+            options = options_factory(
+                cwd=str(request.cwd.resolve()),
+                tools=tools,
+                allowed_tools=tools,
+                permission_mode="acceptEdits" if workspace else "dontAsk",
+                max_turns=80 if workspace else 20,
+                model=self._model,
+                env=child_env,
+                setting_sources=[],
+                output_format=(
+                    {"type": "json_schema", "schema": output_schema}
+                    if output_schema is not None
+                    else None
+                ),
+            )
+            transport_factory = self._transport_factory
+            if transport_factory is None and self._query_fn is None:
+                transport_factory = ExactEnvironmentClaudeTransport
+            transport = (
+                transport_factory(
+                    prompt=request.prompt,
+                    options=options,
+                    env=child_env,
+                )
+                if transport_factory is not None
+                else None
+            )
+            query_arguments = {"prompt": request.prompt, "options": options}
+            if transport is not None:
+                query_arguments["transport"] = transport
             async with asyncio.timeout(request.timeout_seconds):
-                async for message in query_fn(prompt=request.prompt, options=options):
+                async for message in query_fn(**query_arguments):
                     error = getattr(message, "error", None)
                     if error:
                         errors.append(str(error))
@@ -594,7 +808,9 @@ class ClaudeProvider:
                 reason=_safe_reason(str(exc) or "Claude execution timed out", self._source_env),
             )
         except Exception as exc:
-            reason = _safe_reason(str(exc), self._source_env)
+            reason = _safe_provider_reason(
+                str(exc), self._source_env, request.prompt
+            )
             return self._result(
                 request, _failure_outcome(reason), started, reason=reason
             )
@@ -693,13 +909,44 @@ class ProviderRouter:
         if inspect.isawaitable(callback_result):
             await callback_result
 
+    async def _attempt(
+        self,
+        provider_name: Literal["codex", "claude"],
+        provider: GenerationProvider,
+        operation: Literal["generate_text", "edit_workspace"],
+        request: TextRequest,
+    ) -> ProviderResult:
+        started = time.monotonic()
+        try:
+            method = getattr(provider, operation)
+            return await method(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            model = getattr(provider, "_model", None)
+            if provider_name == "codex":
+                task_models = getattr(provider, "_task_models", {})
+                model = task_models.get(request.task, model)
+            return ProviderResult(
+                provider=provider_name,
+                model=model or "unknown",
+                task=request.task,
+                outcome="error",
+                elapsed_ms=max(0, round((time.monotonic() - started) * 1000)),
+                reason=_safe_provider_reason(str(exc), os.environ, request.prompt),
+            )
+
     async def generate_text(self, request: TextRequest) -> RoutedResult:
-        codex_attempt = await self._codex.generate_text(request)
+        codex_attempt = await self._attempt(
+            "codex", self._codex, "generate_text", request
+        )
         await self._record(codex_attempt)
         if codex_attempt.outcome == "success":
             return RoutedResult.from_result(codex_attempt, [codex_attempt], None)
         fallback_reason = _fallback_reason(codex_attempt)
-        claude_attempt = await self._claude.generate_text(request)
+        claude_attempt = await self._attempt(
+            "claude", self._claude, "generate_text", request
+        )
         await self._record(claude_attempt)
         return RoutedResult.from_result(
             claude_attempt, [codex_attempt, claude_attempt], fallback_reason
@@ -713,7 +960,9 @@ class ProviderRouter:
     ) -> RoutedResult:
         attempts: list[ProviderResult] = []
         if codex_attempt is None:
-            codex_attempt = await self._codex.edit_workspace(request)
+            codex_attempt = await self._attempt(
+                "codex", self._codex, "edit_workspace", request
+            )
         else:
             if codex_attempt.provider != "codex" or codex_attempt.outcome == "success":
                 raise ValueError("codex_attempt must be an explicit failed Codex attempt")
@@ -731,7 +980,25 @@ class ProviderRouter:
             fallback_request = (
                 await made_request if inspect.isawaitable(made_request) else made_request
             )
-        claude_attempt = await self._claude.edit_workspace(fallback_request)
+            invalid_reason = _invalid_fallback_workspace_reason(
+                request, fallback_request
+            )
+            if invalid_reason is not None:
+                claude_attempt = ProviderResult(
+                    provider="claude",
+                    model=getattr(self._claude, "_model", "unknown"),
+                    task=request.task,
+                    outcome="error",
+                    reason=invalid_reason,
+                )
+                attempts.append(claude_attempt)
+                await self._record(claude_attempt)
+                return RoutedResult.from_result(
+                    claude_attempt, attempts, fallback_reason
+                )
+        claude_attempt = await self._attempt(
+            "claude", self._claude, "edit_workspace", fallback_request
+        )
         attempts.append(claude_attempt)
         await self._record(claude_attempt)
         return RoutedResult.from_result(claude_attempt, attempts, fallback_reason)
@@ -740,3 +1007,25 @@ class ProviderRouter:
 def _fallback_reason(attempt: ProviderResult) -> str:
     reason = attempt.reason or attempt.outcome
     return f"codex:{attempt.outcome}:{reason}"
+
+
+def _invalid_fallback_workspace_reason(
+    original: WorkspaceRequest, candidate: object
+) -> str | None:
+    if not isinstance(candidate, WorkspaceRequest):
+        return "fallback workspace factory returned an invalid request type"
+    if candidate.cwd.resolve() == original.cwd.resolve():
+        return "fallback workspace factory did not create a fresh stage"
+    if candidate.task != original.task:
+        return "fallback workspace request changed the task"
+    if _resolved_path(candidate.output_schema) != _resolved_path(
+        original.output_schema
+    ):
+        return "fallback workspace request changed the output schema"
+    if candidate.allowed_paths != original.allowed_paths:
+        return "fallback workspace request changed the allowed paths"
+    return None
+
+
+def _resolved_path(path: Path | None) -> Path | None:
+    return path.resolve() if path is not None else None

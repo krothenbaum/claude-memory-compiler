@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, dataclass
@@ -340,13 +341,13 @@ def test_codex_text_command_is_ephemeral_read_only_and_noninteractive(
     _run(_codex_provider(runner).generate_text(text_request))
 
     command, kwargs = runner.calls[1]
-    assert command[:2] == ["codex", "exec"]
+    assert command[:4] == ["codex", "--ask-for-approval", "never", "exec"]
+    assert "--ask-for-approval" not in command[4:]
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
     assert command[command.index("--model") + 1] == "model-query"
     assert command[command.index("--sandbox") + 1] == "read-only"
-    assert command[command.index("--ask-for-approval") + 1] == "never"
     assert command[command.index("--cd") + 1] == str(text_request.cwd)
     assert command[-1] == "-"
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
@@ -388,6 +389,137 @@ def test_codex_timeout_terminates_process_group(fake_runner, text_request):
     assert result.outcome == "timeout"
     assert runner.calls[1][1]["start_new_session"] is True
     assert runner.calls[1][1]["terminate_process_group_on_timeout"] is True
+
+
+class FakeBoundaryProcess:
+    def __init__(self, communicate_error):
+        self.pid = 4321
+        self.returncode = None
+        self.communicate_error = communicate_error
+        self.wait_calls = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    async def communicate(self, _stdin):
+        raise self.communicate_error
+
+    async def wait(self):
+        self.wait_calls += 1
+        self.returncode = 0
+        return 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+
+def _run_boundary_runner(runner, tmp_path):
+    return _run(
+        runner(
+            ["fake-command"],
+            cwd=tmp_path,
+            env={},
+            stdin="prompt",
+            timeout_seconds=1,
+            start_new_session=True,
+            terminate_process_group_on_timeout=True,
+        )
+    )
+
+
+def test_command_runner_force_kills_group_after_timeout_even_if_leader_exits(
+    monkeypatch, tmp_path
+):
+    import providers
+
+    process = FakeBoundaryProcess(TimeoutError("timed out"))
+    signals = []
+
+    async def fake_process_factory(*_command, **_kwargs):
+        return process
+
+    monkeypatch.setattr(providers.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    runner = providers.AsyncCommandRunner(
+        process_factory=fake_process_factory, platform_name="Linux", grace_seconds=0
+    )
+
+    with pytest.raises(TimeoutError):
+        _run_boundary_runner(runner, tmp_path)
+
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def test_command_runner_cancellation_cleans_group_and_reraises(monkeypatch, tmp_path):
+    import providers
+
+    process = FakeBoundaryProcess(asyncio.CancelledError())
+    signals = []
+
+    async def fake_process_factory(*_command, **_kwargs):
+        return process
+
+    monkeypatch.setattr(providers.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    runner = providers.AsyncCommandRunner(
+        process_factory=fake_process_factory, platform_name="Linux", grace_seconds=0
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        _run_boundary_runner(runner, tmp_path)
+
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def test_command_runner_communicate_error_cleans_group_and_reraises(
+    monkeypatch, tmp_path
+):
+    import providers
+
+    process = FakeBoundaryProcess(RuntimeError("pipe failed"))
+    signals = []
+
+    async def fake_process_factory(*_command, **_kwargs):
+        return process
+
+    monkeypatch.setattr(providers.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    runner = providers.AsyncCommandRunner(
+        process_factory=fake_process_factory, platform_name="Linux", grace_seconds=0
+    )
+
+    with pytest.raises(RuntimeError, match="pipe failed"):
+        _run_boundary_runner(runner, tmp_path)
+
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def test_command_runner_uses_windows_tree_termination(tmp_path):
+    import providers
+
+    process = FakeBoundaryProcess(TimeoutError("timed out"))
+    opened = {}
+    tree_calls = []
+
+    async def fake_process_factory(*_command, **kwargs):
+        opened.update(kwargs)
+        return process
+
+    async def fake_tree_terminator(pid, *, force):
+        tree_calls.append((pid, force))
+
+    runner = providers.AsyncCommandRunner(
+        process_factory=fake_process_factory,
+        platform_name="Windows",
+        windows_tree_terminator=fake_tree_terminator,
+        grace_seconds=0,
+    )
+
+    with pytest.raises(TimeoutError):
+        _run_boundary_runner(runner, tmp_path)
+
+    assert opened["start_new_session"] is False
+    assert "creationflags" in opened
+    assert tree_calls == [(process.pid, False), (process.pid, True)]
 
 
 def test_codex_error_reason_is_bounded_and_redacts_credentials(
@@ -527,6 +659,16 @@ def _claude_provider(query, **kwargs):
     return providers.ClaudeProvider(query_fn=query, **kwargs)
 
 
+def _serialized_sdk_command(options):
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    transport = SubprocessCLITransport(prompt="", options=options)
+    transport._cli_path = "claude"
+    return transport._build_command()
+
+
 def test_claude_text_success_uses_subscription_safe_options(monkeypatch, text_request):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
@@ -538,6 +680,7 @@ def test_claude_text_success_uses_subscription_safe_options(monkeypatch, text_re
     assert result.text == "claude answer"
     prompt, options = query.calls[0]
     assert prompt == text_request.prompt
+    assert options.tools == []
     assert options.allowed_tools == []
     assert options.model == "claude-sonnet-5"
     assert options.setting_sources == []
@@ -545,6 +688,9 @@ def test_claude_text_success_uses_subscription_safe_options(monkeypatch, text_re
     assert options.env["AI_MEMORY_INTERNAL_JOB"] == "1"
     assert "OPENAI_API_KEY" not in options.env
     assert "ANTHROPIC_API_KEY" not in options.env
+    command = _serialized_sdk_command(options)
+    assert command[command.index("--tools") + 1] == ""
+    assert "--allowedTools" not in command
 
 
 def test_claude_workspace_uses_existing_staged_tool_set(tmp_path):
@@ -557,9 +703,109 @@ def test_claude_workspace_uses_existing_staged_tool_set(tmp_path):
 
     assert result.outcome == "success"
     options = query.calls[0][1]
+    expected_tools = ["Read", "Write", "Edit", "Glob", "Grep"]
+    assert options.tools == expected_tools
     assert options.allowed_tools == ["Read", "Write", "Edit", "Glob", "Grep"]
     assert options.permission_mode == "acceptEdits"
     assert options.cwd == str(stage)
+    command = _serialized_sdk_command(options)
+    assert command[command.index("--tools") + 1] == ",".join(expected_tools)
+    assert command[command.index("--allowedTools") + 1] == ",".join(expected_tools)
+
+
+class FakeOpenedProcess:
+    def __init__(self):
+        self.pid = 4242
+        self.returncode = 0
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+
+
+def test_claude_transport_passes_exact_scrubbed_environment(
+    monkeypatch, tmp_path
+):
+    import providers
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    secrets = {
+        "OPENAI_API_KEY": "openai-secret",
+        "OPENAI_ORGANIZATION": "openai-org-secret",
+        "AZURE_OPENAI_API_KEY": "azure-secret",
+        "AZURE_OPENAI_ENDPOINT": "azure-endpoint-secret",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "CLAUDE_API_KEY": "claude-secret",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    clean_env = providers.subscription_child_env()
+    opened = {}
+
+    async def fake_open_process(command, **kwargs):
+        opened["command"] = list(command)
+        opened.update(kwargs)
+        return FakeOpenedProcess()
+
+    options = ClaudeAgentOptions(
+        cli_path="/fake/claude",
+        cwd=str(tmp_path),
+        tools=[],
+        allowed_tools=[],
+        env=clean_env,
+        setting_sources=[],
+    )
+    transport = providers.ExactEnvironmentClaudeTransport(
+        prompt="private prompt",
+        options=options,
+        env=clean_env,
+        process_opener=fake_open_process,
+    )
+
+    _run(transport.connect())
+
+    final_env = opened["env"]
+    assert final_env["AI_MEMORY_INTERNAL_JOB"] == "1"
+    assert not any(name.startswith("OPENAI_") for name in final_env)
+    assert not any(name.startswith("AZURE_OPENAI_") for name in final_env)
+    assert "ANTHROPIC_API_KEY" not in final_env
+    assert "CLAUDE_API_KEY" not in final_env
+    assert not set(secrets.values()) & set(final_env.values())
+
+
+def test_claude_transport_force_cleans_descendants_after_leader_exit(tmp_path):
+    import providers
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    process = FakeOpenedProcess()
+    tree_calls = []
+
+    async def fake_open_process(_command, **_kwargs):
+        return process
+
+    async def fake_tree_terminator(pid, *, force):
+        tree_calls.append((pid, force))
+
+    options = ClaudeAgentOptions(
+        cli_path="/fake/claude",
+        cwd=str(tmp_path),
+        tools=[],
+        env=providers.subscription_child_env(),
+    )
+    transport = providers.ExactEnvironmentClaudeTransport(
+        prompt="private prompt",
+        options=options,
+        env=providers.subscription_child_env(),
+        process_opener=fake_open_process,
+        tree_terminator=fake_tree_terminator,
+    )
+
+    async def connect_and_close():
+        await transport.connect()
+        await transport.close()
+
+    _run(connect_and_close())
+
+    assert tree_calls == [(process.pid, True)]
 
 
 @pytest.mark.parametrize(
@@ -577,6 +823,59 @@ def test_claude_classifies_exception_paths(text_request, error, outcome):
     )
 
     assert result.outcome == outcome
+
+
+def test_claude_normalizes_options_factory_failure(text_request):
+    prompt = "prompt-content-must-stay-private"
+    request = TextRequest(
+        text_request.task, prompt, text_request.cwd, text_request.timeout_seconds
+    )
+
+    def broken_options_factory(**_kwargs):
+        raise RuntimeError(f"options setup failed {prompt}")
+
+    result = _run(
+        _claude_provider(
+            FakeClaudeQuery(), options_factory=broken_options_factory
+        ).generate_text(request)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert prompt not in result.reason
+    assert len(result.reason) <= 500
+
+
+def test_claude_normalizes_sdk_import_failure(text_request):
+    import providers
+
+    def broken_sdk_loader():
+        raise ImportError("claude SDK unavailable")
+
+    result = _run(
+        providers.ClaudeProvider(sdk_loader=broken_sdk_loader).generate_text(
+            text_request
+        )
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert "unavailable" in result.reason
+
+
+def test_claude_normalizes_transport_factory_failure(text_request):
+    def broken_transport_factory(**_kwargs):
+        raise RuntimeError("transport setup failed")
+
+    result = _run(
+        _claude_provider(
+            FakeClaudeQuery(), transport_factory=broken_transport_factory
+        ).generate_text(text_request)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert "transport setup failed" in result.reason
 
 
 def test_claude_empty_output_is_invalid(text_request):
@@ -666,10 +965,14 @@ class FakeProvider:
 
     async def generate_text(self, request):
         self.text_requests.append(request)
+        if isinstance(self.result, BaseException):
+            raise self.result
         return self.result
 
     async def edit_workspace(self, request):
         self.workspace_requests.append(request)
+        if isinstance(self.result, BaseException):
+            raise self.result
         return self.result
 
 
@@ -740,6 +1043,42 @@ def test_router_returns_failed_result_when_both_providers_fail(text_request):
     assert len(result.attempts) == 2
 
 
+def test_router_normalizes_unexpected_codex_exception_and_falls_back(text_request):
+    import providers
+
+    seen = []
+    codex = FakeProvider(RuntimeError("codex adapter crashed"))
+    claude = FakeProvider(success_result("claude", "done"))
+
+    result = _run(
+        providers.ProviderRouter(
+            codex, claude, attempt_callback=seen.append
+        ).generate_text(text_request)
+    )
+
+    assert result.outcome == "success"
+    assert [attempt.outcome for attempt in seen] == ["error", "success"]
+    assert result.fallback_reason == "codex:error:codex adapter crashed"
+
+
+def test_router_normalizes_unexpected_claude_exception(text_request):
+    import providers
+
+    seen = []
+    codex = FakeProvider(_provider_result("codex", "capacity", "limit"))
+    claude = FakeProvider(RuntimeError("claude adapter crashed"))
+
+    result = _run(
+        providers.ProviderRouter(
+            codex, claude, attempt_callback=seen.append
+        ).generate_text(text_request)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert [attempt.provider for attempt in seen] == ["codex", "claude"]
+
+
 def test_router_accepts_failed_validation_attempt_with_fresh_stage(tmp_path):
     import providers
 
@@ -771,3 +1110,92 @@ def test_router_accepts_failed_validation_attempt_with_fresh_stage(tmp_path):
     assert [attempt.provider for attempt in result.attempts] == ["codex", "claude"]
     assert codex.workspace_requests == []
     assert claude.workspace_requests[0].cwd == fresh_stage
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ["wrong_type", "same_stage", "changed_task", "changed_schema", "changed_allowlist"],
+)
+def test_router_rejects_invalid_fallback_workspace(
+    tmp_path, invalid_kind
+):
+    import providers
+
+    stale_stage = tmp_path / "stale"
+    fresh_stage = tmp_path / "fresh"
+    stale_stage.mkdir()
+    fresh_stage.mkdir()
+    schema_path = _answer_schema(tmp_path)
+    other_schema = tmp_path / "other.schema.json"
+    other_schema.write_text(schema_path.read_text(encoding="utf-8"), encoding="utf-8")
+    original = WorkspaceRequest(
+        TaskKind.COMPILE,
+        "private prompt",
+        stale_stage,
+        5,
+        schema_path,
+        ("knowledge/index.md",),
+    )
+    candidates = {
+        "wrong_type": TextRequest(TaskKind.COMPILE, "prompt", fresh_stage, 5),
+        "same_stage": WorkspaceRequest(
+            TaskKind.COMPILE,
+            "prompt",
+            stale_stage,
+            5,
+            schema_path,
+            original.allowed_paths,
+        ),
+        "changed_task": WorkspaceRequest(
+            TaskKind.QUERY,
+            "prompt",
+            fresh_stage,
+            5,
+            schema_path,
+            original.allowed_paths,
+        ),
+        "changed_schema": WorkspaceRequest(
+            TaskKind.COMPILE,
+            "prompt",
+            fresh_stage,
+            5,
+            other_schema,
+            original.allowed_paths,
+        ),
+        "changed_allowlist": WorkspaceRequest(
+            TaskKind.COMPILE,
+            "prompt",
+            fresh_stage,
+            5,
+            schema_path,
+            ("knowledge/log.md",),
+        ),
+    }
+    failed = ProviderResult(
+        "codex",
+        "model",
+        TaskKind.COMPILE,
+        "invalid_output",
+        reason="staged validation failed",
+    )
+    codex = FakeProvider(success_result("codex", "unused"))
+    claude = FakeProvider(
+        ProviderResult("claude", "model", TaskKind.COMPILE, "success", text="saved")
+    )
+    seen = []
+
+    result = _run(
+        providers.ProviderRouter(
+            codex,
+            claude,
+            attempt_callback=seen.append,
+            fallback_workspace_factory=lambda _request: candidates[invalid_kind],
+        ).edit_workspace(original, codex_attempt=failed)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert [attempt.provider for attempt in result.attempts] == ["codex", "claude"]
+    assert seen == list(result.attempts)
+    assert claude.workspace_requests == []
+    assert original.prompt not in result.reason
