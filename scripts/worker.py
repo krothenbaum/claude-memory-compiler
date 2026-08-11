@@ -6,24 +6,13 @@ import argparse
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-import errno
 import inspect
 import os
 from pathlib import Path
 import random
-import stat
 import sys
 from typing import Awaitable, Callable
 import uuid
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows branch.
-    fcntl = None
-try:
-    import msvcrt
-except ImportError:  # pragma: no cover - POSIX branch.
-    msvcrt = None
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,20 +30,24 @@ from scripts.providers import (
     TextRequest,
 )
 from scripts.queue import Job, QueueRepository
+from scripts.staging import recover_incomplete_apply
+from scripts.utils import ExclusiveFileLock, append_daily_entry
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class DailyWriterUnavailable(RuntimeError):
-    """Raised until Task 6 provides the serialized daily writer."""
-
-
 def daily_writer_boundary(job: Job, text: str) -> None:
-    """Task 6 replaces this boundary with a writer-lock-backed implementation."""
-    raise DailyWriterUnavailable(
-        f"daily writer is not configured for capture job {job.id}"
+    """Append an extracted capture through the shared serialized writer."""
+    config = load_config(os.environ)
+    append_daily_entry(
+        config.root_dir,
+        text,
+        section="Session",
+        project_key=job.project,
+        cwd=job.cwd,
+        agent=job.source_agent,
     )
 
 
@@ -62,93 +55,11 @@ class LeaseLostError(RuntimeError):
     """Raised when the active worker can no longer prove lease ownership."""
 
 
-class SingletonDrainLock:
+class SingletonDrainLock(ExclusiveFileLock):
     """Cross-platform OS file lock; file contents are diagnostic only."""
 
     def __init__(self, path: Path | str) -> None:
-        self.path = Path(os.path.abspath(Path(path).expanduser()))
-        self._token = f"{os.getpid()}:{uuid.uuid4()}"
-        self._descriptor: int | None = None
-
-    @staticmethod
-    def _try_os_lock(descriptor: int) -> bool:
-        try:
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            elif msvcrt is not None:  # pragma: no cover - Windows branch.
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                if os.fstat(descriptor).st_size == 0:
-                    os.write(descriptor, b"\0")
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            else:  # pragma: no cover - unsupported Python platform.
-                raise RuntimeError("no supported OS file-lock implementation")
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                return False
-            raise
-        return True
-
-    @staticmethod
-    def _unlock(descriptor: int) -> None:
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        elif msvcrt is not None:  # pragma: no cover - Windows branch.
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-
-    def acquire(self) -> bool:
-        if self._descriptor is not None:
-            return True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.parent.is_symlink() or self.path.is_symlink():
-            raise ValueError("worker lock path must not be a symlink")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.path, flags, 0o600)
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            os.close(descriptor)
-            raise ValueError("worker lock path must be a regular file")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            os.close(descriptor)
-            raise ValueError("worker lock path has an unsafe owner")
-        if info.st_nlink != 1:
-            os.close(descriptor)
-            raise ValueError("worker lock path must not be hard-linked")
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        if not self._try_os_lock(descriptor):
-            os.close(descriptor)
-            return False
-        try:
-            payload = self._token.encode()
-            os.ftruncate(descriptor, 0)
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-        except BaseException:
-            self._unlock(descriptor)
-            os.close(descriptor)
-            raise
-        self._descriptor = descriptor
-        return True
-
-    def release(self) -> None:
-        if self._descriptor is None:
-            return
-        try:
-            self._unlock(self._descriptor)
-        finally:
-            os.close(self._descriptor)
-            self._descriptor = None
-
-    def __enter__(self) -> "SingletonDrainLock":
-        if not self.acquire():
-            raise RuntimeError("worker drain lock is already owned")
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.release()
+        super().__init__(path, blocking=False)
 
 
 class MemoryWorker:
@@ -357,6 +268,7 @@ class MemoryWorker:
 
 def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     config = load_config(os.environ)
+    recover_incomplete_apply(config.root_dir)
     repository = QueueRepository(config.queue_path)
     codex = CodexProvider(task_models=config.task_models)
     claude = ClaudeProvider(model=config.claude_model)

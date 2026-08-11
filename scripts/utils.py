@@ -1,11 +1,24 @@
 """Shared utilities for the personal knowledge base."""
 
 import hashlib
+import errno
 import json
 import os
 import re
+import stat
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+import uuid
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows branch.
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX branch.
+    msvcrt = None
 
 from config import (
     CONCEPTS_DIR,
@@ -17,6 +30,165 @@ from config import (
     QA_DIR,
     STATE_FILE,
 )
+
+
+class ExclusiveFileLock:
+    """Owner-only cross-platform advisory file lock.
+
+    The lock file is diagnostic; ownership comes from the operating-system
+    lock held for the descriptor's lifetime.  ``blocking=False`` is useful for
+    singleton workers, while durable writers use the blocking default.
+    """
+
+    def __init__(self, path: Path | str, *, blocking: bool = True) -> None:
+        self.path = Path(os.path.abspath(Path(path).expanduser()))
+        self.blocking = blocking
+        self._token = f"{os.getpid()}:{uuid.uuid4()}"
+        self._descriptor: int | None = None
+
+    def _try_os_lock(self, descriptor: int) -> bool:
+        try:
+            if fcntl is not None:
+                operation = fcntl.LOCK_EX
+                if not self.blocking:
+                    operation |= fcntl.LOCK_NB
+                fcntl.flock(descriptor, operation)
+            elif msvcrt is not None:  # pragma: no cover - Windows branch.
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                mode = msvcrt.LK_LOCK if self.blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(descriptor, mode, 1)
+            else:  # pragma: no cover - unsupported Python platform.
+                raise RuntimeError("no supported OS file-lock implementation")
+        except OSError as exc:
+            if not self.blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return False
+            raise
+        return True
+
+    @staticmethod
+    def _unlock(descriptor: int) -> None:
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows branch.
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+    def acquire(self) -> bool:
+        if self._descriptor is not None:
+            return True
+        parent_existed = self.path.parent.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not parent_existed:
+            self.path.parent.chmod(0o700)
+        if self.path.parent.is_symlink() or self.path.is_symlink():
+            raise ValueError("lock path must not be a symlink")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags, 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise ValueError("lock path must be a regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            os.close(descriptor)
+            raise ValueError("lock path has an unsafe owner")
+        if info.st_nlink != 1:
+            os.close(descriptor)
+            raise ValueError("lock path must not be hard-linked")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        if not self._try_os_lock(descriptor):
+            os.close(descriptor)
+            return False
+        try:
+            payload = self._token.encode()
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        except BaseException:
+            self._unlock(descriptor)
+            os.close(descriptor)
+            raise
+        self._descriptor = descriptor
+        return True
+
+    def release(self) -> None:
+        if self._descriptor is None:
+            return
+        try:
+            self._unlock(self._descriptor)
+        finally:
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def __enter__(self) -> "ExclusiveFileLock":
+        if not self.acquire():
+            raise RuntimeError("file lock is already owned")
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+
+def append_daily_entry(
+    memory_home: Path | str,
+    content: str,
+    *,
+    section: str = "Session",
+    project_key: str = "unknown",
+    cwd: str = "",
+    agent: str = "claude",
+    now: datetime | None = None,
+) -> Path:
+    """Append one provenance-tagged daily entry under the writer lock."""
+    root = Path(memory_home).expanduser().resolve()
+    timestamp = now or datetime.now(timezone.utc).astimezone()
+    daily_dir = root / "daily"
+    log_path = daily_dir / f"{timestamp.strftime('%Y-%m-%d')}.md"
+    display_agent = {"claude": "Claude Code", "codex": "Codex"}.get(agent)
+    if display_agent is None:
+        raise ValueError("agent must be 'claude' or 'codex'")
+
+    metadata_lines = [f"**Agent:** {display_agent}", f"**Project:** {project_key}"]
+    if cwd:
+        metadata_lines.append(f"**CWD:** {cwd}")
+    entry = (
+        f"### {section} [{project_key}] ({timestamp.strftime('%H:%M')})\n\n"
+        f"{'\n'.join(metadata_lines)}\n\n{content}\n\n"
+    )
+
+    with ExclusiveFileLock(root / "scripts" / "memory-writer.lock"):
+        if daily_dir.is_symlink():
+            raise ValueError("daily directory must not be a symlink")
+        created = not log_path.exists() and not log_path.is_symlink()
+        if created:
+            daily_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            info = log_path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError("daily log must not be a symlink")
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("daily log must be a regular file")
+            if info.st_nlink != 1:
+                raise ValueError("daily log must not be hard-linked")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise ValueError("daily log has an unsafe owner")
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_CREAT | os.O_EXCL if created else 0
+        descriptor = os.open(log_path, flags, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            if created:
+                handle.write(
+                    f"# Daily Log: {timestamp.strftime('%Y-%m-%d')}\n\n"
+                    "## Sessions\n\n## Memory Maintenance\n\n"
+                )
+            handle.write(entry)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return log_path
 
 
 # ── Terminal notifications ────────────────────────────────────────────

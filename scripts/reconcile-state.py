@@ -28,9 +28,10 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from compile import COMPILED_MARKER_RE, append_compiled_marker  # noqa: E402
+from compile import COMPILED_MARKER_RE, commit_compiled_bookkeeping  # noqa: E402
 from config import DAILY_DIR, KNOWLEDGE_DIR, now_iso  # noqa: E402
-from utils import file_hash, load_state, save_state  # noqa: E402
+from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply  # noqa: E402
+from utils import file_hash, load_state  # noqa: E402
 
 LOG_MD_PATH = KNOWLEDGE_DIR / "log.md"
 COMPILE_ENTRY_RE = re.compile(r"^##\s+\[[^\]]+\]\s+compile\s+\|\s+(\S+\.md)", re.MULTILINE)
@@ -86,19 +87,26 @@ def main() -> None:
         return
 
     print("\nApplying...")
+    recover_incomplete_apply(DAILY_DIR.parent)
     now = now_iso()
     for log_path in to_reconcile:
         content = log_path.read_text(encoding="utf-8")
-        if not COMPILED_MARKER_RE.search(content):
-            append_compiled_marker(log_path, now)
+        needs_marker = not COMPILED_MARKER_RE.search(content)
         prior = ingested.get(log_path.name, {})
         ingested[log_path.name] = {
-            "hash": file_hash(log_path),  # post-marker hash
+            "hash": "pending-transaction" if needs_marker else file_hash(log_path),
             "compiled_at": prior.get("compiled_at", now),
             "cost_usd": prior.get("cost_usd", 0.0),
             "reconciled_at": now,
         }
-    save_state(state)
+        if needs_marker:
+            commit_compiled_bookkeeping(log_path, state, now)
+        else:
+            apply_host_bookkeeping(
+                DAILY_DIR.parent,
+                ApplyBookkeeping(state=state),
+            )
+        ingested = state.setdefault("ingested", {})
     print(f"Done. state.json now tracks {len(ingested)} ingested file(s).")
 
 

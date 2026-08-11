@@ -30,7 +30,7 @@ STATE_FILE = SCRIPTS_DIR / "last-flush.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
-from utils import notify_terminal, _resolve_tty_path  # noqa: E402
+from utils import append_daily_entry, notify_terminal, _resolve_tty_path  # noqa: E402
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -61,28 +61,19 @@ def append_to_daily_log(
     section: str = "Session",
     project_key: str = "unknown",
     cwd: str = "",
-) -> None:
+    agent: str = "claude",
+    memory_home: Path | str | None = None,
+) -> Path:
     """Append content to today's daily log, tagged with project metadata."""
-    today = datetime.now(timezone.utc).astimezone()
-    log_path = DAILY_DIR / f"{today.strftime('%Y-%m-%d')}.md"
-
-    if not log_path.exists():
-        DAILY_DIR.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            f"# Daily Log: {today.strftime('%Y-%m-%d')}\n\n## Sessions\n\n## Memory Maintenance\n\n",
-            encoding="utf-8",
-        )
-
-    time_str = today.strftime("%H:%M")
-    header = f"### {section} [{project_key}] ({time_str})"
-    metadata_lines = [f"**Project:** {project_key}"]
-    if cwd:
-        metadata_lines.append(f"**CWD:** {cwd}")
-    metadata_block = "\n".join(metadata_lines)
-    entry = f"{header}\n\n{metadata_block}\n\n{content}\n\n"
-
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(entry)
+    root = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT
+    return append_daily_entry(
+        root,
+        content,
+        section=section,
+        project_key=project_key,
+        cwd=cwd,
+        agent=agent,
+    )
 
 
 async def run_flush(context: str, project_key: str = "unknown", cwd: str = "") -> str:

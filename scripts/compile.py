@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import hashlib
 import logging
 import re
 import sys
@@ -29,8 +31,8 @@ from utils import (
     load_state,
     notify_terminal,
     read_wiki_index,
-    save_state,
 )
+from staging import ApplyBookkeeping, apply_host_bookkeeping, recover_incomplete_apply
 
 # ── Paths for the LLM to use ──────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -58,10 +60,33 @@ def find_last_compiled_offset(content: str) -> int:
 
 
 def append_compiled_marker(log_path: Path, when: str) -> None:
-    """Append a `@compiled-through` marker line to the daily log."""
-    marker = f"\n<!-- @compiled-through:{when} -->\n"
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(marker)
+    """Append a marker through the shared writer journal."""
+    home = DAILY_DIR.parent.resolve()
+    relative = log_path.resolve().relative_to(home).as_posix()
+    apply_host_bookkeeping(
+        home,
+        ApplyBookkeeping(compiled_marker_path=relative, compiled_at=when),
+    )
+
+
+def commit_compiled_bookkeeping(log_path: Path, state: dict, when: str) -> None:
+    """Commit a compiled marker and state snapshot as one durable unit."""
+    home = DAILY_DIR.parent.resolve()
+    relative = log_path.resolve().relative_to(home).as_posix()
+    marker = f"\n<!-- @compiled-through:{when} -->\n".encode()
+    post_marker_hash = hashlib.sha256(log_path.read_bytes() + marker).hexdigest()[:16]
+    next_state = copy.deepcopy(state)
+    next_state.setdefault("ingested", {}).setdefault(log_path.name, {})["hash"] = post_marker_hash
+    apply_host_bookkeeping(
+        home,
+        ApplyBookkeeping(
+            compiled_marker_path=relative,
+            compiled_at=when,
+            state=next_state,
+        ),
+    )
+    state.clear()
+    state.update(next_state)
 
 logger = logging.getLogger("compile")
 logger.setLevel(logging.DEBUG)
@@ -100,14 +125,14 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
         if prior_hash == current_hash:
             logger.info("Backfilling marker for %s (unchanged since last compile)", log_path.name)
             notify_terminal(f"compile backfill — {log_path.name} (seeding marker, no new content)")
-            append_compiled_marker(log_path, now_iso())
+            compiled_at = now_iso()
             ingested[log_path.name] = {
-                "hash": file_hash(log_path),
-                "compiled_at": now_iso(),
+                "hash": "pending-transaction",
+                "compiled_at": compiled_at,
                 "cost_usd": ingested[log_path.name].get("cost_usd", 0.0),
             }
             state["ingested"] = ingested
-            save_state(state)
+            commit_compiled_bookkeeping(log_path, state, compiled_at)
             return 0.0
         else:
             logger.info(
@@ -119,14 +144,14 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     if not new_content:
         logger.info("No new content past marker in %s; skipping", log_path.name)
         notify_terminal(f"compile skipped — {log_path.name} (no new sessions)")
-        append_compiled_marker(log_path, now_iso())
+        compiled_at = now_iso()
         ingested[log_path.name] = {
-            "hash": file_hash(log_path),
-            "compiled_at": now_iso(),
+            "hash": "pending-transaction",
+            "compiled_at": compiled_at,
             "cost_usd": ingested.get(log_path.name, {}).get("cost_usd", 0.0),
         }
         state["ingested"] = ingested
-        save_state(state)
+        commit_compiled_bookkeeping(log_path, state, compiled_at)
         return 0.0
 
     schema = AGENTS_FILE.read_text(encoding="utf-8")
@@ -344,20 +369,19 @@ sees the file was processed. Example:
     # Drop a marker so the next compile run knows where to slice. Hash is
     # recorded AFTER the marker is appended so a no-op refresh next run
     # sees a stable hash.
-    append_compiled_marker(log_path, now_iso())
-
-    logger.info("Compile complete for %s", log_path.name)
-    notify_terminal(f"compile complete — {log_path.name} (${cost:.4f})")
-
     # Update state
     rel_path = log_path.name
+    compiled_at = now_iso()
     state.setdefault("ingested", {})[rel_path] = {
-        "hash": file_hash(log_path),
-        "compiled_at": now_iso(),
+        "hash": "pending-transaction",
+        "compiled_at": compiled_at,
         "cost_usd": cost,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + cost
-    save_state(state)
+    commit_compiled_bookkeeping(log_path, state, compiled_at)
+
+    logger.info("Compile complete for %s", log_path.name)
+    notify_terminal(f"compile complete — {log_path.name} (${cost:.4f})")
 
     return cost
 
@@ -369,6 +393,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be compiled")
     args = parser.parse_args()
 
+    if not args.dry_run:
+        recover_incomplete_apply(DAILY_DIR.parent)
     state = load_state()
 
     # Determine which files to compile
