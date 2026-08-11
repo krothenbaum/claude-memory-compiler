@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Literal, Mapping
 
 
@@ -26,6 +27,9 @@ from scripts.transcripts import parse_claude_transcript, parse_codex_transcript
 
 
 CAPTURE_DB_BUSY_TIMEOUT_MS = 250
+SNAPSHOT_LINK_RETRY_ATTEMPTS = 3
+SNAPSHOT_LINK_RETRY_SECONDS = 0.01
+_snapshot_retry_wait = time.sleep
 
 
 class UnsafeSpoolError(ValueError):
@@ -180,15 +184,22 @@ def _validate_existing_snapshot(
 ) -> None:
     if path.parent != spool_dir or path.parent.resolve() != spool_dir.resolve():
         raise UnsafeSpoolError("snapshot destination escapes the spool directory")
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise UnsafeSpoolError("snapshot destination is not a regular private file")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
-        raise UnsafeSpoolError("snapshot destination has an unsafe owner")
-    if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077:
-        raise UnsafeSpoolError("snapshot destination has unsafe identity or permissions")
-    if info.st_size != expected_size or _snapshot_digest(path) != expected_digest:
-        raise UnsafeSpoolError("snapshot destination content does not match capture")
+    for attempt in range(SNAPSHOT_LINK_RETRY_ATTEMPTS):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise UnsafeSpoolError("snapshot destination is not a regular private file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise UnsafeSpoolError("snapshot destination has an unsafe owner")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise UnsafeSpoolError("snapshot destination has unsafe permissions")
+        if info.st_size != expected_size or _snapshot_digest(path) != expected_digest:
+            raise UnsafeSpoolError("snapshot destination content does not match capture")
+        if info.st_nlink == 1:
+            return
+        if info.st_nlink == 2 and attempt + 1 < SNAPSHOT_LINK_RETRY_ATTEMPTS:
+            _snapshot_retry_wait(SNAPSHOT_LINK_RETRY_SECONDS)
+            continue
+        raise UnsafeSpoolError("snapshot destination has unsafe identity")
 
 
 def _publish_snapshot(temporary: Path, destination: Path) -> None:

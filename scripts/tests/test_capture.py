@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 try:
     import fcntl
@@ -11,6 +12,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 
 import pytest
@@ -270,6 +272,59 @@ def test_snapshot_is_fsynced_before_directory_and_database_enqueue(tmp_path, mon
     assert names.index("file") < names.index("directory") < names.index("enqueue")
 
 
+def test_equivalent_concurrent_snapshot_link_settles_without_false_rejection(
+    tmp_path, monkeypatch
+):
+    spool = tmp_path / "spool"
+    spool.mkdir(mode=0o700)
+    publisher_temporary = spool / "publisher.jsonl"
+    publisher_temporary.write_bytes(b"same capture")
+    publisher_temporary.chmod(0o600)
+    destination = spool / "claude-hash.jsonl"
+    destination.hardlink_to(publisher_temporary)
+    contender_temporary = spool / "contender.jsonl"
+    contender_temporary.write_bytes(b"same capture")
+    contender_temporary.chmod(0o600)
+    waits = []
+
+    def finish_publisher(_seconds):
+        waits.append(True)
+        publisher_temporary.unlink()
+
+    monkeypatch.setattr(capture_module, "_snapshot_retry_wait", finish_publisher)
+    capture_module._publish_snapshot(contender_temporary, destination)
+
+    assert waits == [True]
+    assert destination.read_bytes() == b"same capture"
+    assert destination.stat().st_nlink == 1
+    assert not contender_temporary.exists()
+
+
+def test_persistent_snapshot_hard_link_is_rejected_after_bounded_handshake(
+    tmp_path, monkeypatch
+):
+    spool = tmp_path / "spool"
+    spool.mkdir(mode=0o700)
+    linked = spool / "linked.jsonl"
+    linked.write_bytes(b"same capture")
+    linked.chmod(0o600)
+    destination = spool / "claude-hash.jsonl"
+    destination.hardlink_to(linked)
+    contender = spool / "contender.jsonl"
+    contender.write_bytes(b"same capture")
+    contender.chmod(0o600)
+    waits = []
+    monkeypatch.setattr(
+        capture_module, "_snapshot_retry_wait", lambda seconds: waits.append(seconds)
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        capture_module._publish_snapshot(contender, destination)
+
+    assert waits
+    assert contender.exists()
+
+
 def test_launch_worker_is_detached_with_closed_standard_streams(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -451,20 +506,80 @@ def test_worker_waits_for_future_retry_without_real_sleep(tmp_path):
         assert sleeps == [1.0] * 5
 
 
-def test_contending_worker_waits_for_lock_handoff_and_drains_enqueued_job(tmp_path):
+def test_idle_release_wins_before_enqueue_and_new_worker_can_take_lock(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
     lock_path = tmp_path / "memory-worker.lock"
-    held = SingletonDrainLock(lock_path)
-    assert held.acquire()
-    released = []
+    owner_lock = SingletonDrainLock(lock_path)
+    assert owner_lock.acquire()
+    enqueue_started = threading.Event()
+    enqueue_completed = threading.Event()
 
-    async def handoff(_seconds):
-        if not released:
-            held.release()
-            released.append(True)
-        await asyncio.sleep(0)
+    def enqueue_after_release():
+        enqueue_started.set()
+        with QueueRepository(path, clock=lambda: NOW) as contender:
+            contender.enqueue_capture(
+                capture_module.parse_claude_transcript(
+                    tmp_path / "source.jsonl", {"trigger": "session_end"}
+                )
+            )
+        enqueue_completed.set()
 
-    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
-        enqueue_capture_job(repository, tmp_path)
+    write_claude_transcript(tmp_path / "source.jsonl")
+    with QueueRepository(path, clock=lambda: NOW) as owner_queue, ThreadPoolExecutor(
+        max_workers=1
+    ) as executor:
+        future = None
+
+        def release_while_serialized():
+            nonlocal future
+            owner_lock.release()
+            future = executor.submit(enqueue_after_release)
+            assert enqueue_started.wait(timeout=1)
+            assert not enqueue_completed.is_set()
+
+        assert owner_queue.release_worker_lock_if_idle(release_while_serialized) is True
+        future.result(timeout=2)
+
+    successor = SingletonDrainLock(lock_path)
+    assert successor.acquire() is True
+    successor.release()
+
+
+def test_enqueue_commit_wins_before_idle_check_and_owner_keeps_lock(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    normalized = capture_module.parse_claude_transcript(
+        source, {"trigger": "session_end"}
+    )
+    lock_path = tmp_path / "memory-worker.lock"
+    owner_lock = SingletonDrainLock(lock_path)
+    assert owner_lock.acquire()
+
+    with QueueRepository(path, clock=lambda: NOW) as owner_queue, QueueRepository(
+        path, clock=lambda: NOW
+    ) as enqueuer:
+        enqueuer._connection.execute("BEGIN IMMEDIATE")
+        enqueuer.enqueue_capture(normalized)
+        enqueuer._connection.execute("COMMIT")
+        assert owner_queue.release_worker_lock_if_idle(owner_lock.release) is False
+
+    contender = SingletonDrainLock(lock_path)
+    assert contender.acquire() is False
+    owner_lock.release()
+
+
+def test_worker_schedules_unexpired_crashed_lease_then_recovers_it(tmp_path):
+    current = [NOW]
+    sleeps = []
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        current[0] += timedelta(seconds=seconds)
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: current[0]) as repository:
+        queued = enqueue_capture_job(repository, tmp_path)
+        repository.claim_next("crashed-worker", NOW, 5)
         success = ProviderResult(
             "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
         )
@@ -472,11 +587,14 @@ def test_contending_worker_waits_for_lock_handoff_and_drains_enqueued_job(tmp_pa
             repository,
             FakeRouter(routed(success)),
             daily_writer=lambda *_: None,
-            clock=lambda: NOW,
-            lock_path=lock_path,
-            sleeper=handoff,
+            clock=lambda: current[0],
+            owner="recovery-worker",
+            sleeper=advance,
         )
-        assert asyncio.run(worker.run_drain(wait_for_handoff=True)) == 1
+
+        assert asyncio.run(worker.drain()) == 1
+        assert sleeps == [1.0] * 5
+        assert repository.get_job(queued.job_id).status == "succeeded"
 
 
 @pytest.mark.parametrize("renewal", [False, RuntimeError("database unavailable")])

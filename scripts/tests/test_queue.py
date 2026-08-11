@@ -246,3 +246,27 @@ def test_persistence_errors_and_attempt_reasons_redact_credentials(tmp_path):
         assert "[REDACTED]" in repository.get_job(job_id).last_error
         assert secret not in repository.attempts_for(job_id)[0].reason
         assert "[REDACTED]" in repository.attempts_for(job_id)[0].reason
+
+
+def test_persistence_redacts_generic_credential_suffixes_only(tmp_path):
+    credentials = {
+        "GITHUB_TOKEN": "github-secret-value",
+        "SERVICE_API_KEY": "service-secret-value",
+        "DB_PASSWORD": "database-secret-value",
+        "OTHER_SECRET": "other-secret-value",
+        "UNRELATED_SETTING": "public-setting-value",
+    }
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3",
+        clock=lambda: NOW,
+        redaction_env=credentials,
+    ) as repository:
+        job_id = repository.enqueue_capture(session(tmp_path)).job_id
+        repository.claim_next("worker", NOW, 30)
+        reason = " | ".join(credentials.values())
+        repository.retry(job_id, "worker", reason, NOW)
+
+        persisted = repository.get_job(job_id).last_error
+        assert persisted.count("[REDACTED]") == 4
+        assert all(value not in persisted for value in list(credentials.values())[:4])
+        assert credentials["UNRELATED_SETTING"] in persisted

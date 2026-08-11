@@ -45,6 +45,7 @@ SCHEMA_VERSION = 1
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
+_SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 
 
 class LeaseOwnershipError(RuntimeError):
@@ -65,6 +66,7 @@ def normalize_persistence_reason(
             name in _SECRET_NAMES
             or name.startswith("OPENAI_")
             or name.startswith("AZURE_OPENAI_")
+            or name.endswith(_SECRET_SUFFIXES)
         )
     }
     for secret in sorted(secrets, key=len, reverse=True):
@@ -553,6 +555,43 @@ class QueueRepository:
             """
         ).fetchone()
         return _loaded_time(row[0]) if row and row[0] is not None else None
+
+    def next_wake_at(self) -> datetime | None:
+        """Return the next runnable time or active lease expiry."""
+        row = self._connection.execute(
+            """
+            SELECT MIN(wake_at) FROM (
+                SELECT available_at AS wake_at FROM jobs
+                WHERE status IN ('pending', 'failed')
+                UNION ALL
+                SELECT lease_expires_at AS wake_at FROM jobs
+                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+            )
+            """
+        ).fetchone()
+        return _loaded_time(row[0]) if row and row[0] is not None else None
+
+    def release_worker_lock_if_idle(self, release: Callable[[], None]) -> bool:
+        """Release a worker lock only while enqueues are serialized behind us."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            active = self._connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE status IN ('pending', 'failed', 'leased')
+                LIMIT 1
+                """
+            ).fetchone()
+            if active is not None:
+                self._connection.execute("COMMIT")
+                return False
+            release()
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def attempts_for(self, job_id: int) -> list[ProviderAttempt]:
         rows = self._connection.execute(

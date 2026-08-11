@@ -321,31 +321,36 @@ class MemoryWorker:
                     self._retry_at(current),
                 )
 
-    async def drain(self) -> int:
+    async def _drain(self, release_if_idle: Callable[[], None] | None) -> int:
         processed = 0
-        self.queue.recover_stale(self._now())
         while True:
+            self.queue.recover_stale(self._now())
             job = self.queue.claim_next(
                 self.owner, self._now(), self.lease_seconds
             )
             if job is None:
-                available_at = self.queue.next_available_at()
-                if available_at is None:
-                    return processed
-                delay = max(0.0, (available_at - self._now()).total_seconds())
+                wake_at = self.queue.next_wake_at()
+                if wake_at is None:
+                    if release_if_idle is None:
+                        return processed
+                    if self.queue.release_worker_lock_if_idle(release_if_idle):
+                        return processed
+                    continue
+                delay = max(0.0, (wake_at - self._now()).total_seconds())
                 await self.sleeper(min(delay, self.max_idle_sleep_seconds))
                 continue
             await self.process(job)
             processed += 1
 
-    async def run_drain(self, *, wait_for_handoff: bool = False) -> int:
+    async def drain(self) -> int:
+        return await self._drain(None)
+
+    async def run_drain(self) -> int:
         lock = SingletonDrainLock(self.lock_path)
-        while not lock.acquire():
-            if not wait_for_handoff:
-                return 0
-            await self.sleeper(0.05)
+        if not lock.acquire():
+            return 0
         try:
-            return await self.drain()
+            return await self._drain(lock.release)
         finally:
             lock.release()
 
@@ -377,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--drain is required")
     worker, repository = _default_worker()
     try:
-        asyncio.run(worker.run_drain(wait_for_handoff=True))
+        asyncio.run(worker.run_drain())
     finally:
         repository.close()
     return 0
