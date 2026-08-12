@@ -39,6 +39,7 @@ Each file follows this format:
 
 ### Session [project-key] (HH:MM) - Brief Title
 
+**Agent:** Claude Code
 **Project:** project-key
 **CWD:** /full/path/to/working/directory
 
@@ -307,7 +308,9 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 ```
 llm-personal-kb/
 |-- .claude/
-|   |-- settings.json                # Hook configuration (auto-activates in Claude Code)
+|   |-- settings.json                # Claude Code hook commands
+|-- .codex/
+|   |-- hooks.json.example           # Opt-in Codex hook commands
 |-- .gitignore                       # Excludes runtime state, temp files, caches
 |-- AGENTS.md                        # This file - schema + full technical reference
 |-- README.md                        # Concise overview + quick start
@@ -320,202 +323,192 @@ llm-personal-kb/
 |   |-- connections/                 #   Cross-cutting insights linking 2+ concepts
 |   |-- qa/                          #   Filed query answers (compounding knowledge)
 |-- scripts/                         # CLI tools
+|   |-- batch-flush.py               # Historical Claude/Codex import
+|   |-- capture.py                   # Fast snapshot and enqueue boundary
 |   |-- compile.py                   #   Compile daily logs -> knowledge articles
+|   |-- connections.py               #   Cross-graph connection discovery
+|   |-- providers.py                 # Subscription providers and fallback router
+|   |-- queue.py                     # SQLite jobs, leases, attempts, and retry
 |   |-- query.py                     #   Ask questions (index-guided, no RAG)
 |   |-- lint.py                      #   7 health checks
-|   |-- flush.py                     #   Extract memories from conversations (background)
+|   |-- flush.py                     # Extraction prompt and daily-log writer
+|   |-- staging.py                   # Staged validation and atomic apply journal
+|   |-- transcripts.py               # Claude/Codex normalizers
+|   |-- usage.py                     # Provider-neutral usage JSONL
+|   |-- worker.py                    # Detached queue drain
 |   |-- config.py                    #   Path constants
 |   |-- utils.py                     #   Shared helpers
-|-- hooks/                           # Claude Code hooks
+|-- hooks/                           # Claude Code and Codex adapters
+|   |-- codex-session-start.py       #   Injects shared local context into Codex
+|   |-- codex-session-end.py         #   Enqueues a Codex transcript slice
 |   |-- session-start.py             #   Injects knowledge into every session
-|   |-- session-end.py               #   Extracts conversation -> daily log
-|   |-- pre-compact.py               #   Safety net: captures context before compaction
+|   |-- session-end.py               #   Enqueues a Claude transcript slice
+|   |-- pre-compact.py               #   Enqueues context before compaction
 |-- reports/                         # Lint reports (gitignored)
 ```
 
 ---
 
-## Hook System (Automatic Capture)
+## Runtime Architecture
 
-Hooks are configured in `.claude/settings.json` and fire automatically when you use Claude Code in this project.
-
-### `.claude/settings.json` Format
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-start.py", "timeout": 15 }] }],
-    "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/pre-compact.py", "timeout": 10 }] }],
-    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-end.py", "timeout": 10 }] }]
-  }
-}
+```text
+Claude hook --\
+               +--> transcript normalizer --> private spool --> SQLite queue
+Codex hook ----/                                           |
+                                                            v
+                                             singleton detached worker
+                                                            |
+                      Codex (ChatGPT auth) --> Claude subscription fallback
+                                                            |
+                                      text result or disposable staged workspace
+                                                            |
+                                      validate --> writer lock --> recovery journal
+                                                            |
+                                      daily/ + knowledge/ + log + marker + state
 ```
 
-Commands use simple relative paths from the project root. Empty `matcher` catches all events.
+Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Workers may run model or read-only work concurrently, but every filesystem mutation uses the same writer lock. Models receive only the files required for the task and never write to the real knowledge root.
 
-### Hook Details
+## Configuration and Subscription Authentication
 
-**`session-start.py`** (SessionStart)
-- Pure local I/O, no API calls, runs in under 1 second
-- Reads `knowledge/index.md` and the most recent daily log
-- Outputs JSON to stdout: `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`
-- Claude sees the knowledge base index at the start of every session
-- Max context: 20,000 characters
+`AI_MEMORY_HOME` is the canonical knowledge-base root. `CLAUDE_MEMORY_HOME` remains a deprecated compatibility alias. The loader rejects empty roots and rejects different resolved values when both variables are set.
 
-**`session-end.py`** (SessionEnd)
-- Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `cwd`)
-- Copies the raw JSONL transcript to a temp file (no parsing in the hook - keeps it fast)
-- Spawns `flush.py` as a fully detached background process
-- Recursion guard: exits immediately if `CLAUDE_INVOKED_BY` env var is set
+| Variable | Default | Purpose |
+|---|---|---|
+| `AI_MEMORY_HOME` | repository root | Canonical memory root |
+| `CLAUDE_MEMORY_HOME` | unset | Compatibility alias |
+| `AI_MEMORY_PROVIDER_ORDER` | `codex,claude` | Fixed provider order |
+| `AI_MEMORY_CODEX_LUNA_MODEL` | `gpt-5.6-luna` | Extraction and semantic lint |
+| `AI_MEMORY_CODEX_TERRA_MODEL` | `gpt-5.6-terra` | Synthesis and staged edits |
+| `AI_MEMORY_CLAUDE_MODEL` | `claude-sonnet-5` | Claude subscription fallback |
+| `AI_MEMORY_JOB_TIMEOUT_SECONDS` | `900` | Provider attempt timeout |
+| `AI_MEMORY_QUEUE_PATH` | `$AI_MEMORY_HOME/scripts/jobs.sqlite3` | Absolute queue path |
+| `AI_MEMORY_WORKER_CONCURRENCY` | `2` | Model/read concurrency |
+| `AI_MEMORY_INTERNAL_JOB` | unset | Recursion guard for provider children |
+| `AI_MEMORY_USAGE_ESTIMATE_ONLY` | `0` | Advisory usage estimation mode |
 
-**`pre-compact.py`** (PreCompact)
-- Same architecture as session-end.py
-- Fires before Claude Code auto-compacts the context window
-- Guards against empty `transcript_path` (known Claude Code bug #13668)
-- Critical for long sessions: captures context before summarization discards it
+Each Codex attempt runs `codex login status`. It proceeds only when the command exits zero and stdout contains `Logged in using ChatGPT`. API-key login, unknown status, a missing CLI, timeout, or nonzero exit rejects Codex and records a fallback reason. The provider never logs in automatically.
 
-**Why both PreCompact and SessionEnd?** Long-running sessions may trigger multiple auto-compactions before you close the session. Without PreCompact, intermediate context is lost to summarization before SessionEnd ever fires.
+Both providers receive a minimal child environment with `OPENAI_*`, `AZURE_OPENAI_*`, `ANTHROPIC_API_KEY`, and `CLAUDE_API_KEY` removed. Codex text jobs run ephemeral, read-only, and noninteractive. Workspace jobs run ephemeral with write access confined to a disposable stage. The implementation never uses OpenAI Platform API billing or a sandbox-bypass flag.
 
-### Background Flush Process (`flush.py`)
+## Hooks and Shared Retrieval
 
-Spawned by both hooks as a fully detached background process:
-- **Windows:** `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` flags
-- **Mac/Linux:** `start_new_session=True`
+`.claude/settings.json` defines Claude Code `SessionStart`, `PreCompact`, and `SessionEnd`. `.codex/hooks.json.example` defines Codex `SessionStart` and `SessionEnd` for codex-cli 0.146.1 or newer. Global installation is opt-in: `bin/setup-global.sh` prints non-destructive merge instructions for `~/.claude/settings.json` and `~/.codex/hooks.json`.
 
-This ensures flush.py survives after Claude Code's hook process exits.
+Both SessionStart adapters call the same local context builder. It reads `knowledge/index.md` and recent project/global daily sections, then emits the host-specific JSON envelope. It makes no model call.
 
-**What flush.py does:**
-1. Sets `CLAUDE_INVOKED_BY=memory_flush` env var (prevents recursive hook firing)
-2. Reads the pre-extracted conversation context from the temp `.md` file
-3. Skips if context is empty or if same session was flushed within 60 seconds (deduplication)
-4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`)
-5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
-6. Appends result to `daily/YYYY-MM-DD.md`
-7. Cleans up temp context file
-8. **End-of-day auto-compilation:** If it's past 4 PM local time (`COMPILE_AFTER_HOUR = 16`), no other Claude Code instances are running (`pgrep -x claude` returns 0 — flush.py is a detached subprocess so it does not count itself), and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. The pgrep gate means PreCompact-triggered flushes (current session continues) never run compile, and SessionEnd flushes only run compile when this was the last open session — compilation never competes with an active session. If `pgrep` is unavailable (non-Unix) the gate fails closed and skips compile; users can still run `uv run python scripts/compile.py` manually.
+The end and pre-compaction adapters:
 
-### JSONL Transcript Format
+1. Stop before file or queue work when `AI_MEMORY_INTERNAL_JOB=1` or the legacy `CLAUDE_INVOKED_BY` guard exists.
+2. Validate the hook payload and transcript path.
+3. Create a bounded normalized slice and a private queue-owned spool snapshot.
+4. Insert or find the job by `(kind, source_agent, session_id, source_hash)`.
+5. Launch `scripts/worker.py --drain` as a detached process.
+6. Return without waiting for a provider.
 
-Claude Code stores conversations as `.jsonl` files. Messages are nested under a `message` key:
+Claude keeps both PreCompact and SessionEnd because compaction can discard intermediate context. Canonical normalized hashing deduplicates equivalent slices. Codex uses SessionEnd; its adapter fills missing hook metadata from `session_meta`.
 
-```python
-entry = json.loads(line)
-msg = entry.get("message", {})
-role = msg.get("role", "")     # "user" or "assistant"
-content = msg.get("content", "")  # string or list of content blocks
-```
+## Transcript Normalization and Privacy
 
-Content can be a string or a list of blocks (`{"type": "text", "text": "..."}` dicts).
+`scripts/transcripts.py` produces immutable `NormalizedSession` values containing the agent, session ID, project, CWD, timestamp, trigger, normalized turns, source path, and canonical source hash.
 
----
+Claude JSONL records store user and assistant content under `message`. The parser also recognizes `AskUserQuestion` decisions and completed `Agent` or `Task` findings. Codex JSONL records use `type == "response_item"`; user `input_text` and assistant `output_text` come from `payload.type == "message"`. The parser uses `session_meta` for identity and location when necessary.
 
-## Script Details
+Before provider execution, both parsers exclude developer instructions, hidden reasoning, duplicate `event_msg.agent_message` records, routine tool calls and output, token counts, session instructions, and asynchronous launch acknowledgements. Unknown tool records remain excluded. Selected explicit choices and completed collaboration findings use a small allowlist and bounded text.
 
-### compile.py - The Compiler
+Local transcripts, normalized prompts, stages, queue rows, usage logs, daily logs, and knowledge files remain on disk except for normalized content sent to a subscription provider. Logs retain job metadata and bounded errors, not transcript bodies or credentials. Codex cloud-only history cannot be imported unless Codex exposes a local transcript or hook event.
 
-Uses the Claude Agent SDK's async streaming `query()`:
+## Provider Layer and Model Routing
 
-```python
-async for message in query(
-    prompt=compile_prompt,
-    options=ClaudeAgentOptions(
-        cwd=str(ROOT_DIR),
-        system_prompt={"type": "preset", "preset": "claude_code"},
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-        permission_mode="acceptEdits",
-        max_turns=30,
-    ),
-):
-```
+All LLM-backed operations use `GenerationProvider` and `ProviderRouter` from `scripts/providers.py`:
 
-- Builds a prompt with: AGENTS.md schema, current index, all existing articles, and the daily log
-- Claude reads the daily log, decides what concepts to extract, and writes files directly
-- `permission_mode="acceptEdits"` auto-approves all file operations
-- Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
-- Cost: ~$0.45-0.65 per daily log (increases as KB grows)
+| Operation | Task kind | Codex model | Request type |
+|---|---|---|---|
+| Live or historical extraction | `EXTRACT` | `gpt-5.6-luna` | text |
+| Contradiction lint | `SEMANTIC_LINT` | `gpt-5.6-luna` | text |
+| Compile | `COMPILE` | `gpt-5.6-terra` | staged workspace |
+| Query | `QUERY` | `gpt-5.6-terra` | text |
+| Filed answer | `FILE_ANSWER` | `gpt-5.6-terra` | staged workspace |
+| Connection confirmation | `CONNECTIONS` | `gpt-5.6-terra` | staged workspace |
 
-**CLI:**
+The router tries Codex once. Authentication, capacity, timeout, command, invalid-output, and staged-validation failures cause a fresh Claude attempt. A successful Codex result never calls Claude. If both fail, the logical job remains retryable. Structural lint is entirely local.
+
+Capacity and usage limits are subscription constraints, not dollar balances. The queue and `scripts/logs/usage.jsonl` record provider, model, task, outcome, fallback reason, tokens when available, elapsed time, and timestamp. Codex usage never receives a fabricated dollar cost.
+
+## Queue, Leases, and Worker
+
+`scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs` plus `provider_attempts`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
+
+Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one own the queue drain. A later worker exits successfully when another healthy worker owns it.
+
+Queue inspection is read-only:
+
 ```bash
-uv run python scripts/compile.py              # compile new/changed only
-uv run python scripts/compile.py --all        # force recompile everything
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status;'
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT id,kind,source_agent,attempt_count,status,last_error FROM jobs WHERE status IN ("failed","dead");'
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT job_id,provider,model,outcome,reason FROM provider_attempts ORDER BY id DESC LIMIT 20;'
+```
+
+After correcting authentication, capacity, or filesystem failures, run `uv run python scripts/worker.py --drain`. This recovers expired leases and drains ready retry jobs. A dead job requires an explicit, targeted requeue after inspecting its `last_error`, attempts, and retained spool input. Never delete or rewrite active queue payloads.
+
+## Staging and Single-Writer Transactions
+
+Compile, connection, and filed-answer providers edit a fresh owner-only stage containing the schema, selected daily input, index, build log, relevant articles, and compatible state snapshot. Validation rejects unexpected paths, escaping links, special files, structural deletion, malformed UTF-8 or frontmatter, source-daily edits, and incomplete article/index/log change sets. A rejected Codex stage is discarded before Claude receives a fresh stage.
+
+Approved changes pass through `scripts/memory-writer.lock`. The host rechecks real-file baselines, writes an fsynced journal of original and replacement bytes, applies same-directory atomic replacements, and commits markers, state, and usage bookkeeping. Any failure restores original bytes and leaves the job retryable. Daily-log appends use the same lock.
+
+An interrupted apply leaves `scripts/memory-apply-journal/`. Before other maintenance, run:
+
+```bash
+uv run python scripts/reconcile-state.py
+```
+
+The command acquires the writer lock, restores an incomplete transaction, and reconciles legacy compile markers and state. Do not delete a persistent journal manually; investigate invalid journal identity or content before retrying.
+
+Queue-owned inputs remain under owner-only `scripts/spool/` so failed jobs can retry. Preserve the spool for pending, failed, leased, or dead jobs. Remove a snapshot only after its job succeeds and no queue row references its path.
+
+## Commands
+
+```bash
+uv run python scripts/compile.py
+uv run python scripts/compile.py --all
 uv run python scripts/compile.py --file daily/2026-04-01.md
 uv run python scripts/compile.py --dry-run
-```
-
-### query.py - Index-Guided Retrieval
-
-Loads the entire knowledge base into context (index + all articles). No RAG.
-
-At personal KB scale (50-500 articles), the LLM reading a structured index outperforms vector similarity. The LLM understands what you're really asking; cosine similarity just finds similar words.
-
-**CLI:**
-```bash
+uv run python scripts/connections.py --dry-run
+uv run python scripts/connections.py --top 40
 uv run python scripts/query.py "What auth patterns do I use?"
 uv run python scripts/query.py "What's my error handling strategy?" --file-back
+uv run python scripts/lint.py
+uv run python scripts/lint.py --structural-only
+uv run python scripts/worker.py --drain
 ```
 
-With `--file-back`, creates a Q&A article in `knowledge/qa/` and updates the index and log. This is the compounding loop - every question makes the KB smarter.
+Historical discovery reads Claude sessions from `~/.claude/projects/` and Codex sessions from `~/.codex/sessions/**/*.jsonl`:
 
-### lint.py - Health Checks
-
-Seven checks:
-
-| Check | Type | Catches |
-|-------|------|---------|
-| Broken links | Structural | `[[wikilinks]]` to non-existent articles |
-| Orphan pages | Structural | Articles with zero inbound links |
-| Orphan sources | Structural | Daily logs not yet compiled |
-| Stale articles | Structural | Source logs changed since compilation |
-| Missing backlinks | Structural | A links to B but B doesn't link back |
-| Sparse articles | Structural | Under 200 words |
-| Contradictions | LLM | Conflicting claims across articles |
-
-**CLI:**
 ```bash
-uv run python scripts/lint.py                    # all checks
-uv run python scripts/lint.py --structural-only  # skip LLM check (free)
+uv run python scripts/batch-flush.py --source codex --dry-run
+uv run python scripts/batch-flush.py --source codex --dates 2026-04-11 --dry-run
+uv run python scripts/batch-flush.py --source codex --from-date 2026-04-01 --to-date 2026-04-30 --dry-run
+uv run python scripts/batch-flush.py --source codex --resume --concurrency 2
+uv run python scripts/batch-flush.py --source all --resume --concurrency 2
 ```
 
-Reports saved to `reports/lint-YYYY-MM-DD.md`.
+Dry run parses, filters, chunks, checks deduplication, and estimates tokens/tasks without a model call or any queue, state, daily-log, or knowledge write. `--resume` shares the live job identity and skips completed sessions regardless of which provider succeeded. `--max-cost` is legacy Claude-only accounting and is rejected when `--source` includes Codex.
 
----
+## State and Usage Compatibility
 
-## State Tracking
+`scripts/state.json` still stores `ingested`, `query_count`, `last_lint`, and legacy `total_cost`. Existing per-entry `cost_usd` values and top-level `total_cost` round-trip unchanged. These fields record historical Claude-reported costs only; they do not represent total subscription usage.
 
-`scripts/state.json` tracks:
-- `ingested` - map of daily log filenames to SHA-256 hashes, compilation timestamps, and costs
-- `query_count` - total queries run
-- `last_lint` - timestamp of most recent lint
-- `total_cost` - cumulative API cost
+New queued operations use SQLite `provider_attempts` as their source of truth. `scripts/logs/usage.jsonl` is a recoverable, bounded projection for operations outside or inside the queue. It records Codex tokens when the CLI provides them and uses an unavailable value otherwise. It never invents `cost_usd` for Codex. Historical previews report advisory token and task estimates because ChatGPT plan limits vary.
 
-`scripts/last-flush.json` tracks flush deduplication (session_id + timestamp).
-
-Both are gitignored and regenerated automatically.
-
----
+Runtime queue, lock, journal, spool, stage, log, state, daily, knowledge, and report files created during tests or operations must never enter implementation commits.
 
 ## Dependencies
 
-`pyproject.toml` (at project root):
-- `claude-agent-sdk>=0.1.29` - Claude Agent SDK for LLM calls with tool use
-- `python-dotenv>=1.0.0` - Environment variable management
-- `tzdata>=2024.1` - Timezone data
-- Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
-
-No API key needed - uses Claude Code's built-in credentials at `~/.claude/.credentials.json`.
-
----
-
-## Costs
-
-| Operation | Cost |
-|-----------|------|
-| Compile one daily log | $0.45-0.65 |
-| Query (no file-back) | ~$0.15-0.25 |
-| Query (with file-back) | ~$0.25-0.40 |
-| Full lint (with contradictions) | ~$0.15-0.25 |
-| Structural lint only | $0.00 |
-| Memory flush (per session) | ~$0.02-0.05 |
+Python 3.12+ is managed with `uv`. `claude-agent-sdk` supplies the subscription-backed fallback, `python-dotenv` handles environment files, and `tzdata` supplies cross-platform timezone data. Codex is an external CLI and must be version 0.146.1 or newer. Neither provider requires an API key in this design.
 
 ---
 

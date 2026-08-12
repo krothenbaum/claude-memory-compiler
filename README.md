@@ -1,103 +1,149 @@
 # LLM Personal Knowledge Base
 
-**Your AI conversations compile themselves into a searchable knowledge base.**
+Claude Code and Codex conversations compile into one searchable, local knowledge base.
 
-Adapted from [Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) architecture, but instead of clipping web articles, the raw data is your own conversations with Claude Code. When a session ends (or auto-compacts mid-session), Claude Code hooks capture the conversation transcript and spawn a background process that uses the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) to extract the important stuff - decisions, lessons learned, patterns, gotchas - and appends it to a daily log. You then compile those daily logs into structured, cross-referenced knowledge articles organized by concept. Retrieval uses a simple index file instead of RAG - no vector database, no embeddings, just markdown.
+The project adapts [Karpathy's LLM Knowledge Base](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) architecture to personal AI sessions. Claude Code and Codex hooks capture durable conversation content, a background queue extracts useful decisions and lessons, and later compilation turns append-only daily logs into cross-referenced Markdown articles. Retrieval reads a structured index instead of using a vector database.
 
-Anthropic has clarified that personal use of the Claude Agent SDK is covered under your existing Claude subscription (Max, Team, or Enterprise) - no separate API credits needed. Unlike OpenClaw, which requires API billing for its memory flush, this runs on your subscription.
+## Data Flow
+
+```text
+Claude Code SessionEnd / PreCompact --\
+                                      +--> local parser --> SQLite queue --> worker
+Codex SessionEnd --------------------/                           |
+                                                                 v
+                                           Codex (ChatGPT login) --> Claude fallback
+                                                                 |
+                                                                 v
+                                        daily/ --> staged compile --> knowledge/
+
+Claude Code / Codex SessionStart --> local index and recent-log context
+```
+
+Hooks perform local parsing and enqueue work; they never call a model. The worker prefers Codex, uses `gpt-5.6-luna` for extraction and semantic lint, and uses `gpt-5.6-terra` for synthesis and staged edits. If Codex authentication, capacity, timeout, command execution, output validation, or staged validation fails, the same job falls back to the subscription-backed Claude Agent SDK. Provider attempts and fallback reasons remain available in the queue and usage log.
+
+All model-driven edits happen in disposable staging directories. Host Python validates each stage and applies approved files under one writer lock with a recovery journal. Models never write directly to the real knowledge base.
+
+## Requirements and Authentication
+
+- Python 3.12+ and [`uv`](https://docs.astral.sh/uv/)
+- Claude Code with subscription credentials for fallback
+- Codex CLI 0.146.1 or newer, logged in through ChatGPT
+
+Verify Codex before enabling it:
+
+```bash
+codex --version
+codex login status
+```
+
+The second command must exit successfully and print `Logged in using ChatGPT`. The memory provider rejects API-key login, unknown login states, missing credentials, and nonzero status results. It never logs in automatically. It removes `OPENAI_*`, `AZURE_OPENAI_*`, `ANTHROPIC_API_KEY`, and `CLAUDE_API_KEY` variables from provider children, so neither Codex nor the Claude fallback can silently switch to API-key or OpenAI Platform API billing.
+
+Codex usage limits can vary by ChatGPT plan and time window. On a capacity or usage-limit response, the job records the reason and tries Claude. If both subscription providers fail, the queue retries with backoff and eventually moves the job to the dead-letter state; the source snapshot remains local for recovery.
 
 ## Quick Start
 
-Tell your AI coding agent:
-
-> "Clone https://github.com/coleam00/claude-memory-compiler into this project. Set up the Claude Code hooks so my conversations automatically get captured into daily logs, compiled into a knowledge base, and injected back into future sessions. Read the AGENTS.md for the full technical reference on how everything works."
-
-The agent will:
-1. Clone the repo and run `uv sync` to install dependencies
-2. Copy `.claude/settings.json` into your project (or merge the hooks into your existing settings)
-3. The hooks activate automatically next time you open Claude Code
-
-From there, your conversations start accumulating. After 4 PM local time, the next session flush automatically triggers compilation of that day's logs into knowledge articles — but only when no other Claude Code instances are still open, so it never competes with an active session. You can also run `uv run python scripts/compile.py` manually at any time.
-
-## Global Setup (Capture Every Session, Anywhere)
-
-The default Quick Start only captures sessions started inside this repo. To capture every Claude Code session no matter the working directory:
-
-1. **Clone anywhere you like.** No fixed path required — the hooks resolve via the `CLAUDE_MEMORY_HOME` environment variable.
-2. **Install dependencies:** `cd <your-clone-path> && uv sync`.
-3. **Run the setup helper for personalized instructions:**
-   ```bash
-   bin/setup-global.sh
-   ```
-   It auto-detects your clone path and prints the exact two manual steps:
-   - Add `export CLAUDE_MEMORY_HOME="<your-clone-path>"` to your shell's startup file (e.g. `~/.zshrc`).
-   - Merge the `hooks` object from this repo's `.claude/settings.json` into your `~/.claude/settings.json` (create it if missing).
-4. **Done.** Every Claude Code session, in any directory, fires the hooks. All output lands in `$CLAUDE_MEMORY_HOME/daily/` and `$CLAUDE_MEMORY_HOME/knowledge/` — one central knowledge base, not one per project.
-
-Each session is automatically tagged with the project key (basename of the session's working directory) so retrieval can be scoped per-project later.
-
-**Why an env var?** Team members clone to different locations. With `$CLAUDE_MEMORY_HOME`, the same `settings.json` works on everyone's machine — they just set the env var once for their clone.
-
-**Caveat:** Claude Code hook commands inherit env vars from the shell that launched `claude`. If you run Claude Code from a fresh terminal where `CLAUDE_MEMORY_HOME` is exported, the hooks will see it. If you launch Claude Code from a macOS GUI launcher that doesn't read your shell profile, set the var via `launchctl setenv CLAUDE_MEMORY_HOME <path>` or in `~/.zshenv` instead of `~/.zshrc`.
-
-**Double-fire prevention:** When hooks live in both project-local (`.claude/settings.json`) and user-global (`~/.claude/settings.json`) scopes, Claude Code fires both. The hooks include a 10-second per-session dedup guard (`scripts/last-hook-fire.json`) so only the first invocation does work. You don't need to choose between project-local and global — both can coexist.
-
-## How It Works
-
-```
-Conversation -> SessionEnd/PreCompact hooks -> flush.py extracts knowledge
-    -> daily/YYYY-MM-DD.md -> compile.py -> knowledge/concepts/, connections/, qa/
-        -> SessionStart hook injects index into next session -> cycle repeats
-
-Periodically, over the whole graph:
-    connections.py -> Swanson 2-hop candidates -> conservative LLM gate
-        -> knowledge/connections/ (latent cross-topic links compile cannot see)
+```bash
+git clone https://github.com/coleam00/claude-memory-compiler
+cd claude-memory-compiler
+uv sync
+export AI_MEMORY_HOME="$PWD"
+bin/setup-global.sh
 ```
 
-- **Hooks** capture conversations automatically (session end + pre-compaction safety net)
-- **flush.py** calls the Claude Agent SDK to decide what's worth saving, and after 4 PM triggers end-of-day compilation automatically — gated on no other Claude Code instances being open
-- **compile.py** turns daily logs into organized concept articles (plus the connection articles a single day's own sessions reveal), with cross-references (triggered automatically or run manually)
-- **connections.py** runs a periodic Swanson 2-hop pass over the whole concept graph to surface non-obvious, cross-topic links the per-day compile cannot see (old-to-old, cross-project). It generates candidate pairs from shared "bridge" concepts, drops hub-driven noise, scores by bridge rarity, and a conservative LLM gate writes only genuine connections (deduping against existing ones). Use `--dry-run` to preview candidates at no cost.
-- **query.py** answers questions using index-guided retrieval (no RAG needed at personal scale)
-- **lint.py** runs 7 health checks (broken links, orphans, contradictions, staleness)
+`AI_MEMORY_HOME` is the canonical absolute path to the central knowledge base. `CLAUDE_MEMORY_HOME` remains a deprecated compatibility alias. If both variables are set, they must resolve to the same path. Provider children receive `AI_MEMORY_INTERNAL_JOB=1`; hooks check that guard before touching the queue or spool, which prevents recursive capture.
 
-## Key Commands
+The setup helper only prints instructions. Follow them to merge the project hooks into both user configurations:
+
+- Claude Code: `~/.claude/settings.json`
+- Codex: `~/.codex/hooks.json`, using `.codex/hooks.json.example`
+
+Preserve existing settings and hooks; do not replace either file. Start each agent from a new terminal that exports `AI_MEMORY_HOME`. To capture only sessions started inside this repository, keep the project-local `.claude/settings.json` and skip the global merge.
+
+## What Gets Captured
+
+The local normalizers retain ordinary user and assistant messages, explicit user decisions, and selected completed subagent findings. They exclude developer instructions, hidden reasoning, token accounting, routine tool calls and output, and asynchronous launch acknowledgements before content reaches an extraction provider.
+
+The resulting source entry keeps the existing daily-log schema and adds provenance:
+
+```markdown
+### Session [project-key] (14:20) - Brief title
+
+**Agent:** Codex
+**Project:** project-key
+**CWD:** /full/path/to/project
+```
+
+Transcripts, prompts, queue rows, stages, spools, daily logs, and knowledge files stay local except for the minimum normalized content sent to the selected subscription-backed model. Structured logs omit transcript bodies and credentials. Codex conversations that exist only in cloud history remain unavailable: live capture and historical import require a local transcript or hook event.
+
+## Commands
 
 ```bash
-uv run python scripts/compile.py                    # compile new daily logs
-uv run python scripts/connections.py --dry-run       # preview latent connection candidates (no cost)
-uv run python scripts/connections.py --top 40        # run the Swanson pass: write genuine connections
-uv run python scripts/query.py "question"            # ask the knowledge base
-uv run python scripts/query.py "question" --file-back # ask + save answer back
-uv run python scripts/lint.py                        # run health checks
-uv run python scripts/lint.py --structural-only      # free structural checks only
-uv run python scripts/batch-flush.py --dry-run       # seed KB from past transcripts
+uv run python scripts/compile.py                       # compile new or changed daily logs
+uv run python scripts/connections.py --dry-run        # preview connection candidates locally
+uv run python scripts/connections.py --top 40         # confirm and write connections
+uv run python scripts/query.py "question"             # query without writing
+uv run python scripts/query.py "question" --file-back # query and stage a filed answer
+uv run python scripts/lint.py                         # structural and semantic checks
+uv run python scripts/lint.py --structural-only       # local checks; no provider call
+uv run python scripts/worker.py --drain               # recover leases and drain ready jobs
 ```
 
-## Seeding the Knowledge Base from Past Conversations
+At personal scale, the model can select relevant articles from `knowledge/index.md` more accurately than cosine similarity. Consider hybrid retrieval only when the index grows beyond the available context window.
 
-If you've already been using Claude Code on a project for a while, `batch-flush.py` extracts knowledge from your existing JSONL transcripts (under `~/.claude/projects/<project>/`) so the KB starts with real context instead of empty. It parses every transcript, chunks large sessions at user-message boundaries (not just the last 30 turns like the live hook), runs LLM extraction on each chunk, and writes everything into dated daily logs ready for `compile.py`.
+## Historical Import
+
+Claude history is discovered under `~/.claude/projects/`; Codex history is discovered recursively under `~/.codex/sessions/`. Preview first:
 
 ```bash
-uv run python scripts/batch-flush.py --dry-run            # preview — shows sessions, chunks, est. cost
-uv run python scripts/batch-flush.py                       # run full extraction
-uv run python scripts/batch-flush.py --max-cost 5.00       # stop after $5 spent
-uv run python scripts/batch-flush.py --dates 2026-04-11    # only specific dates
-uv run python scripts/batch-flush.py --resume              # skip sessions already processed
-uv run python scripts/batch-flush.py --compile             # extract + trigger compile
-uv run python scripts/batch-flush.py --all-projects --dry-run  # preview every project on this machine
+uv run python scripts/batch-flush.py --source codex --dry-run
+uv run python scripts/batch-flush.py --source codex --dates 2026-04-11 --dry-run
+uv run python scripts/batch-flush.py --source codex --from-date 2026-04-01 --to-date 2026-04-30 --dry-run
 ```
 
-**Single project (default):** auto-discovers the transcripts directory from `cwd`; override with `--transcripts-dir`. Daily-log entries are tagged with the project key (defaults to `Path.cwd().name`, matching the live hook); override with `--project-key` and `--project-cwd` when seeding from a directory other than the project itself.
+A dry run parses, filters, chunks, checks deduplication, and estimates tokens and model tasks. It makes no model calls and writes no queue, state, daily-log, or knowledge-base data. Estimates describe possible ChatGPT subscription usage, not dollar charges.
 
-**All projects (`--all-projects`):** walks `~/.claude/projects/*` and seeds every project in one pass. Each project's daily-log entries are tagged with that project's basename (decoded from Claude Code's `/`→`-` path encoding via filesystem-existence checks, so dashed names like `claude-memory-compiler` round-trip correctly). Honors `--max-cost` as a global budget across all projects and stops cleanly when the cap is hit.
+After reviewing the preview, import with bounded concurrency and resumability:
 
-State (`state.json`) is shared across modes — `--resume` skips sessions already processed by any prior invocation, so single-project runs and `--all-projects` runs are interchangeable.
+```bash
+uv run python scripts/batch-flush.py --source codex --resume --concurrency 2
+uv run python scripts/batch-flush.py --source all --resume --concurrency 2
+```
 
-## Why No RAG?
+`--resume` uses the same agent/session/normalized-hash identity as live capture. Repeating an import does not duplicate a completed entry, even when the first attempt used Claude fallback. `--max-cost` remains a legacy Claude-only option and is rejected when `--source` includes Codex.
 
-Karpathy's insight: at personal scale (50-500 articles), the LLM reading a structured `index.md` outperforms vector similarity. The LLM understands what you're really asking; cosine similarity just finds similar words. RAG becomes necessary at ~2,000+ articles when the index exceeds the context window.
+## Operations and Recovery
+
+Runtime data lives below `scripts/` and is gitignored. Inspect the queue without changing it:
+
+```bash
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status;'
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT id,kind,source_agent,attempt_count,status,last_error FROM jobs WHERE status IN ("failed","dead");'
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'SELECT job_id,provider,model,outcome,reason FROM provider_attempts ORDER BY id DESC LIMIT 20;'
+```
+
+For pending, failed, or expired leased jobs, fix the underlying authentication, capacity, path, or filesystem problem and run `uv run python scripts/worker.py --drain`. The worker recovers expired leases and applies bounded retry backoff. A dead job has exhausted its attempts. Preserve `scripts/jobs.sqlite3*` and the matching private file in `scripts/spool/`, inspect `last_error` and provider attempts, then requeue only after correcting the cause:
+
+```bash
+sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
+  'BEGIN IMMEDIATE; UPDATE jobs SET status="failed",attempt_count=0,available_at=strftime("%Y-%m-%dT%H:%M:%f+00:00","now"),lease_owner=NULL,lease_expires_at=NULL,completed_at=NULL WHERE id=JOB_ID AND status="dead"; COMMIT;'
+uv run python scripts/worker.py --drain
+```
+
+Replace `JOB_ID` with one inspected numeric ID. Never delete an active spool snapshot or edit queue payloads by hand. A spool file is recovery input; remove it only after its job succeeds and no queue row references it.
+
+An interrupted staged apply leaves `scripts/memory-apply-journal/` in place. Stop new writes and recover it before other maintenance:
+
+```bash
+uv run python scripts/reconcile-state.py
+```
+
+The command acquires the writer lock, restores an incomplete transaction, and reconciles legacy marker/state drift. Do not delete a persistent journal manually. Investigate malformed or unexpected journals before retrying. Provider outcome records appear in `scripts/logs/usage.jsonl`; Codex records contain tokens when available but never fabricate `cost_usd`.
+
+Legacy `state.json` fields, including per-entry `cost_usd` and top-level `total_cost`, remain readable and survive round trips. They represent historical Claude-reported costs only. New subscription activity uses provider, model, outcome, fallback reason, token, and elapsed-time records instead of invented dollar totals.
 
 ## Technical Reference
 
-See **[AGENTS.md](AGENTS.md)** for the complete technical reference: article formats, hook architecture, script internals, cross-platform details, costs, and customization options. AGENTS.md is designed to give an AI agent everything it needs to understand, modify, or rebuild the system.
+See [AGENTS.md](AGENTS.md) for the article schema, parser contracts, provider boundaries, queue and staging architecture, and detailed recovery behavior.

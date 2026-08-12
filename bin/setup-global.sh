@@ -32,10 +32,19 @@ This setup is opt-in and does not edit either agent's configuration.
    Preserve every unrelated setting and hook already present; do not replace
    the destination file.
 
-3) Codex hooks require codex-cli 0.146.1 or newer. Validate the installed CLI:
+3) Codex hooks require codex-cli 0.146.1 or newer. Validate the installed CLI
+   and its subscription authentication:
 
      codex --version
      codex features list | grep '^hooks'
+     codex login status
+
+   The last command must report exactly this supported login type:
+
+     Logged in using ChatGPT
+
+   Stop if it reports API-key authentication, another login type, or an error.
+   This project never logs in automatically and never uses API billing.
 
    Then merge .codex/hooks.json.example into:
 
