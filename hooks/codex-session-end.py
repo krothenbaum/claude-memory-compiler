@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 import sys
+import time
+from typing import Callable
 
 
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
@@ -23,6 +25,7 @@ from scripts.transcripts import parse_codex_transcript
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
+HOOK_WORK_BUDGET_SECONDS = 2.25
 
 
 def _live_capture_helpers():
@@ -63,7 +66,8 @@ def _logger() -> logging.Logger:
     return logger
 
 
-def main() -> None:
+def main(clock: Callable[[], float] = time.monotonic) -> None:
+    deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
     try:
         value = json.loads(sys.stdin.read())
@@ -99,11 +103,19 @@ def main() -> None:
                 limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
             )
 
-        with helpers.bounded_transcript_slice(transcript_path, previewer) as selected:
+        with helpers.bounded_transcript_slice(
+            transcript_path,
+            previewer,
+            deadline=deadline,
+            clock=clock,
+        ) as selected:
             live_slice, preview = selected
             if not preview.turns:
                 logger.info("skip: empty normalized transcript")
                 return
+            helpers.require_time_remaining(
+                deadline, clock, helpers.MIN_CAPTURE_REMAINING_SECONDS
+            )
             capture_input = dict(value)
             capture_input["transcript_path"] = str(live_slice)
             outcome = enqueue_hook_input(

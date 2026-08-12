@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Iterator
 
 
@@ -30,13 +31,27 @@ from scripts.transcripts import parse_claude_transcript, render_turns
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
-LIVE_TRANSCRIPT_TAIL_BYTES = 1_000_000
 MAX_LIVE_TRANSCRIPT_SCAN_BYTES = 16_000_000
 MAX_LIVE_JSONL_RECORD_BYTES = 500_000
+HOOK_WORK_BUDGET_SECONDS = 2.25
+MIN_CAPTURE_REMAINING_SECONDS = 0.75
 
 
 class LiveTranscriptRejected(ValueError):
     """A live transcript cannot be sliced without risking partial capture."""
+
+
+class HookDeadlineExceeded(TimeoutError):
+    """The internal hook budget expired before durable enqueue began."""
+
+
+def require_time_remaining(
+    deadline: float,
+    clock: Callable[[], float],
+    minimum_seconds: float = 0.0,
+) -> None:
+    if clock() + minimum_seconds >= deadline:
+        raise HookDeadlineExceeded("live hook work budget exhausted")
 
 
 def _runtime_root() -> Path:
@@ -171,14 +186,18 @@ def _write_private_slice(path: Path, payload: bytes, *, durable: bool) -> None:
 def bounded_transcript_slice(
     source: Path,
     previewer: Callable[[Path], object],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
 ) -> Iterator[tuple[Path, object]]:
     """Select a semantic tail under a hard 16 MB fail-closed scan budget.
 
-    Windows expand geometrically until the shared normalizer retains 30 turns,
-    the file start is reached, or the hard cap is reached. At the cap, the
-    largest signal-bearing preview wins. A larger file with no signal in the
-    final 16 MB is pathological live input and is rejected for later recovery.
+    One maximum bounded window avoids repeated copying/parsing near the host's
+    three-second kill timeout. The shared parser retains its final 30 turns. A
+    larger file with no signal in the final 16 MB is pathological live input
+    and is rejected for later recovery.
     """
+    require_time_remaining(deadline, clock)
     size = source.stat().st_size
     with source.open("rb") as stream:
         first_record = stream.readline(MAX_LIVE_JSONL_RECORD_BYTES + 1).rstrip(
@@ -192,32 +211,24 @@ def bounded_transcript_slice(
     try:
         os.fchmod(descriptor, 0o600)
         os.close(descriptor)
-        window = min(LIVE_TRANSCRIPT_TAIL_BYTES, MAX_LIVE_TRANSCRIPT_SCAN_BYTES)
-        while True:
-            payload, reached_start = _bounded_tail(
-                source,
-                size=size,
-                window_bytes=window,
-                metadata_prefix=metadata_prefix,
+        payload, reached_start = _bounded_tail(
+            source,
+            size=size,
+            window_bytes=MAX_LIVE_TRANSCRIPT_SCAN_BYTES,
+            metadata_prefix=metadata_prefix,
+        )
+        require_time_remaining(deadline, clock)
+        _write_private_slice(temporary, payload, durable=False)
+        require_time_remaining(deadline, clock)
+        preview = previewer(temporary)
+        require_time_remaining(deadline, clock)
+        if not getattr(preview, "turns", ()) and not reached_start:
+            raise LiveTranscriptRejected(
+                "no durable signal found within the 16 MB live scan budget"
             )
-            _write_private_slice(temporary, payload, durable=False)
-            preview = previewer(temporary)
-            turns = getattr(preview, "turns", ())
-            if len(turns) >= MAX_TURNS or reached_start:
-                _write_private_slice(temporary, payload, durable=True)
-                yield temporary, preview
-                return
-            if window >= MAX_LIVE_TRANSCRIPT_SCAN_BYTES:
-                if not turns:
-                    raise LiveTranscriptRejected(
-                        "no durable signal found within the 16 MB live scan budget"
-                    )
-                # The hard cap wins over the 30-turn target. The geometrically
-                # largest valid preview is the best bounded recovery slice.
-                _write_private_slice(temporary, payload, durable=True)
-                yield temporary, preview
-                return
-            window = min(window * 2, MAX_LIVE_TRANSCRIPT_SCAN_BYTES)
+        _write_private_slice(temporary, payload, durable=True)
+        require_time_remaining(deadline, clock)
+        yield temporary, preview
     except BaseException:
         try:
             os.close(descriptor)
@@ -246,16 +257,31 @@ def extract_conversation_context(
     return context, len(session.turns)
 
 
-def _resolve_user_tty() -> str | None:
+def _resolve_user_tty(
+    *,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> str | None:
     """Find the terminal while the parent Claude process is still alive."""
+    tty_deadline = (
+        min(deadline - MIN_CAPTURE_REMAINING_SECONDS, clock() + 0.15)
+        if deadline is not None
+        else None
+    )
     pid = os.getpid()
     for _ in range(10):
+        timeout = 2.0
+        if tty_deadline is not None:
+            remaining = tty_deadline - clock()
+            if remaining <= 0:
+                return None
+            timeout = min(timeout, remaining)
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "ppid=,tty="],
                 capture_output=True,
                 text=True,
-                timeout=2,
+                timeout=timeout,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return None
@@ -279,7 +305,8 @@ def _resolve_user_tty() -> str | None:
     return None
 
 
-def main() -> None:
+def main(clock: Callable[[], float] = time.monotonic) -> None:
+    deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
     try:
         hook_input = _read_hook_input()
@@ -316,7 +343,12 @@ def main() -> None:
                 path, metadata, limits={"max_turns": MAX_TURNS}
             )
 
-        with bounded_transcript_slice(transcript_path, previewer) as selected:
+        with bounded_transcript_slice(
+            transcript_path,
+            previewer,
+            deadline=deadline,
+            clock=clock,
+        ) as selected:
             live_slice, preview = selected
             context = render_turns(preview)
             if len(context) > MAX_CONTEXT_CHARS:
@@ -329,9 +361,12 @@ def main() -> None:
                 logger.info("skip: empty or too-short transcript")
                 return
 
-            tty_path = _resolve_user_tty()
+            tty_path = _resolve_user_tty(deadline=deadline, clock=clock)
             if tty_path:
                 os.environ["CLAUDE_MEMORY_TTY"] = tty_path
+            require_time_remaining(
+                deadline, clock, MIN_CAPTURE_REMAINING_SECONDS
+            )
             capture_input = dict(hook_input)
             capture_input["transcript_path"] = str(live_slice)
             outcome = enqueue_hook_input(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -563,6 +564,108 @@ def test_semantic_expansion_preserves_four_older_turns_before_routine_tail(
     for index in range(4):
         assert f"OLDER_DURABLE_TURN_{index}" in rendered
     assert "FINAL_DURABLE_TURN" in rendered
+    assert list(hook_tmp.iterdir()) == []
+
+
+def test_very_large_semantic_tail_completes_with_host_timeout_margin(tmp_path):
+    source = tmp_path / "claude-19mb.jsonl"
+    padding = "v" * 60_000
+    routine = json.dumps({"type": "progress", "data": padding}) + "\n"
+    with source.open("w", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "sessionId": "nineteen-mb-session",
+                    "cwd": "/projects/nineteen-mb",
+                }
+            )
+            + "\n"
+        )
+        for _ in range(130):
+            stream.write(routine)
+        stream.write(
+            json.dumps(
+                {
+                    "message": {
+                        "role": "user",
+                        "content": "TWELVE_MB_BURIED_SIGNAL",
+                    }
+                }
+            )
+            + "\n"
+        )
+        for _ in range(200):
+            stream.write(routine)
+    assert source.stat().st_size > 19_000_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "nineteen-mb-session",
+            "transcript_path": str(source),
+            "cwd": "/projects/nineteen-mb",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    assert "TWELVE_MB_BURIED_SIGNAL" in _only_job_payload(memory_home)[
+        "rendered_context"
+    ]
+    assert _only_job_source_path(memory_home).stat().st_size <= 16_100_000
+    assert list(hook_tmp.iterdir()) == []
+
+
+def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "deadline.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "TIMEOUT_SIGNAL"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    hook = _load_hook("session-end.py")
+    ticks = iter([0.0, 0.1, 0.2, 2.5])
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    monkeypatch.setattr(hook.tempfile, "tempdir", str(hook_tmp))
+    monkeypatch.setattr(
+        hook.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "session_id": "deadline-session",
+                    "transcript_path": str(source),
+                    "cwd": "/projects/deadline",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        hook,
+        "enqueue_hook_input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deadline must prevent enqueue")
+        ),
+    )
+
+    hook.main(clock=lambda: next(ticks))
+
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "spool").exists()
     assert list(hook_tmp.iterdir()) == []
 
 

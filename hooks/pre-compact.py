@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
+from typing import Callable
 
 
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
@@ -25,6 +27,7 @@ from scripts.transcripts import parse_claude_transcript, render_turns
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 5
+HOOK_WORK_BUDGET_SECONDS = 2.25
 
 
 def _live_capture_helpers():
@@ -94,7 +97,8 @@ def extract_conversation_context(
     return context, len(session.turns)
 
 
-def main() -> None:
+def main(clock: Callable[[], float] = time.monotonic) -> None:
+    deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
     try:
         hook_input = _read_hook_input()
@@ -132,7 +136,12 @@ def main() -> None:
                 path, metadata, limits={"max_turns": MAX_TURNS}
             )
 
-        with helpers.bounded_transcript_slice(transcript_path, previewer) as selected:
+        with helpers.bounded_transcript_slice(
+            transcript_path,
+            previewer,
+            deadline=deadline,
+            clock=clock,
+        ) as selected:
             live_slice, preview = selected
             context = render_turns(preview)
             if len(context) > MAX_CONTEXT_CHARS:
@@ -144,6 +153,9 @@ def main() -> None:
             if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
                 logger.info("skip: empty or too-short transcript")
                 return
+            helpers.require_time_remaining(
+                deadline, clock, helpers.MIN_CAPTURE_REMAINING_SECONDS
+            )
             capture_input = dict(hook_input)
             capture_input["transcript_path"] = str(live_slice)
             outcome = enqueue_hook_input(
