@@ -52,6 +52,14 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
+def _default_workspace_router(config, fallback_workspace_factory):
+    return ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+        fallback_workspace_factory=fallback_workspace_factory,
+    )
+
+
 def find_last_compiled_offset(content: str) -> int:
     last_end = 0
     for match in COMPILED_MARKER_RE.finditer(content):
@@ -163,6 +171,7 @@ async def compile_daily_log(
     state_baseline: FileBaseline,
     *,
     router: object | None = None,
+    router_factory: object | None = None,
     memory_home: Path | str | None = None,
 ) -> float:
     """Compile one daily log and atomically apply the first valid provider stage."""
@@ -245,11 +254,14 @@ async def compile_daily_log(
             allowed_paths=request.allowed_paths,
         )
 
-    provider_router = router or ProviderRouter(
-        CodexProvider(task_models=config.task_models),
-        ClaudeProvider(model=config.claude_model),
-        fallback_workspace_factory=fallback_factory,
-    )
+    if router is not None and router_factory is not None:
+        raise ValueError("provide router or router_factory, not both")
+    if router_factory is not None:
+        provider_router = router_factory(fallback_factory)
+    elif router is not None:
+        provider_router = router
+    else:
+        provider_router = _default_workspace_router(config, fallback_factory)
     request = WorkspaceRequest(
         TaskKind.COMPILE,
         prompt,
@@ -267,7 +279,7 @@ async def compile_daily_log(
         try:
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
         except StageValidationError as validation_error:
-            if result.provider != "codex" or router is not None:
+            if result.provider != "codex" or (router is not None and router_factory is None):
                 discard_stage(selected)
                 return 0.0
             failed = ProviderResult(

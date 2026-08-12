@@ -34,6 +34,13 @@ from utils import (
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
+def _default_router(config):
+    return ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+    )
+
+
 def check_broken_links() -> list[dict]:
     """Check for [[wikilinks]] that point to non-existent articles."""
     issues = []
@@ -194,10 +201,7 @@ async def check_contradictions(
     environment["AI_MEMORY_HOME"] = str(home)
     environment.pop("CLAUDE_MEMORY_HOME", None)
     config = load_config(environment)
-    provider_router = router or ProviderRouter(
-        CodexProvider(task_models=config.task_models),
-        ClaudeProvider(model=config.claude_model),
-    )
+    provider_router = router or _default_router(config)
     request = TextRequest(
         task=TaskKind.SEMANTIC_LINT,
         prompt=build_contradiction_prompt(wiki_content),

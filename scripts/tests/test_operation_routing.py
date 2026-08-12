@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -176,6 +177,88 @@ def test_read_only_query_uses_query_text_request(memory_home: Path):
     assert type(request) is TextRequest
     assert request.task is TaskKind.QUERY
     assert str(memory_home) not in request.prompt
+
+
+@pytest.mark.parametrize("file_back", [False, True])
+def test_query_cli_preserves_legacy_output_envelope(
+    monkeypatch, capsys, tmp_path: Path, file_back: bool
+):
+    monkeypatch.setattr(query, "QA_DIR", tmp_path / "knowledge/qa")
+    if file_back:
+        _write(query.QA_DIR / "answer.md", "answer")
+
+    async def fake_run(question, *, file_back=False):
+        assert question == "What changed?"
+        return "Provider answer"
+
+    monkeypatch.setattr(query, "run_query", fake_run)
+    argv = ["What changed?"] + (["--file-back"] if file_back else [])
+
+    assert query.main(argv) == 0
+    output = capsys.readouterr().out
+    assert output.startswith(
+        f"Question: What changed?\nFile back: {'yes' if file_back else 'no'}\n"
+        + "-" * 60
+        + "\nProvider answer\n"
+    )
+    if file_back:
+        assert output.endswith(
+            "\n" + "-" * 60 + "\nAnswer filed to knowledge/qa/ (1 Q&A articles total)\n"
+        )
+
+
+def test_default_router_wiring_uses_configured_luna_and_terra(
+    memory_home: Path, batch_flush_module, monkeypatch
+):
+    expected_luna = "configured-luna"
+    expected_terra = "configured-terra"
+    environment = {
+        "AI_MEMORY_HOME": str(memory_home),
+        "AI_MEMORY_CODEX_LUNA_MODEL": expected_luna,
+        "AI_MEMORY_CODEX_TERRA_MODEL": expected_terra,
+    }
+    config = flush.load_config(environment)
+    assert config.task_models == {
+        TaskKind.EXTRACT: expected_luna,
+        TaskKind.SEMANTIC_LINT: expected_luna,
+        TaskKind.COMPILE: expected_terra,
+        TaskKind.QUERY: expected_terra,
+        TaskKind.CONNECTIONS: expected_terra,
+        TaskKind.FILE_ANSWER: expected_terra,
+    }
+
+    captured = []
+
+    class CapturingCodex:
+        def __init__(self, *, task_models):
+            captured.append(dict(task_models))
+
+    class Claude:
+        def __init__(self, **_kwargs):
+            pass
+
+    class Router:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setenv("AI_MEMORY_CODEX_LUNA_MODEL", expected_luna)
+    monkeypatch.setenv("AI_MEMORY_CODEX_TERRA_MODEL", expected_terra)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    for module, factory in (
+        (flush, lambda: flush._default_router(memory_home)),
+        (batch_flush_module, lambda: batch_flush_module._default_router(config)),
+        (query, lambda: query._text_router(config)),
+        (query, lambda: query._workspace_router(config, Mock())),
+        (compile_module, lambda: compile_module._default_workspace_router(config, Mock())),
+        (connections, lambda: connections._default_workspace_router(config, Mock())),
+        (lint, lambda: lint._default_router(config)),
+    ):
+        monkeypatch.setattr(module, "CodexProvider", CapturingCodex)
+        monkeypatch.setattr(module, "ClaudeProvider", Claude)
+        monkeypatch.setattr(module, "ProviderRouter", Router)
+        factory()
+    assert captured == [dict(config.task_models)] * 7
 
 
 def test_semantic_lint_uses_luna_text_request_and_parses_lines(memory_home: Path):
@@ -357,6 +440,54 @@ def test_invalid_codex_compile_uses_fresh_clean_claude_stage(
     assert "compile | 2026-08-11.md" in (memory_home / "knowledge/log.md").read_text()
 
 
+def test_injected_compile_router_factory_handles_invalid_stage_fallback(memory_home: Path):
+    calls: list[tuple[str, Path]] = []
+    attempts: list[ProviderResult] = []
+
+    class Codex:
+        async def edit_workspace(self, request):
+            calls.append(("codex", request.cwd))
+            _write(request.cwd / "unexpected.txt", "bad")
+            return ProviderResult("codex", "gpt-5.6-terra", request.task, "success")
+
+    class Claude:
+        async def edit_workspace(self, request):
+            calls.append(("claude", request.cwd))
+            assert not (request.cwd / "unexpected.txt").exists()
+            with (request.cwd / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n## [2026-08-11T12:00:00+00:00] compile | 2026-08-11.md\n"
+                    "- Articles created: (none)\n"
+                )
+            return ProviderResult("claude", "claude-sonnet-5", request.task, "success")
+
+    def router_factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(
+            Codex(), Claude(), attempt_callback=attempts.append,
+            fallback_workspace_factory=fallback_workspace_factory,
+        )
+
+    log_path = memory_home / "daily/2026-08-11.md"
+    asyncio.run(
+        compile_module.compile_daily_log(
+            log_path,
+            {"ingested": {}, "query_count": 0, "total_cost": 0.0},
+            capture_file_baseline(memory_home / "scripts/state.json"),
+            router_factory=router_factory,
+            memory_home=memory_home,
+        )
+    )
+    assert [name for name, _path in calls] == ["codex", "claude"]
+    assert calls[0][1] != calls[1][1]
+    assert [attempt.outcome for attempt in attempts] == [
+        "success",
+        "invalid_output",
+        "success",
+    ]
+
+
 def test_connections_uses_terra_staged_workspace(memory_home: Path, monkeypatch):
     router = EditingRouter()
     _write(memory_home / "knowledge/concepts/a.md", "---\ntitle: A\nproject: memory\nsources:\n  - daily/2026-08-11.md\ncreated: 2026-08-11\nupdated: 2026-08-11\n---\n# A\n")
@@ -407,9 +538,10 @@ def test_file_back_query_uses_terra_staged_workspace(memory_home: Path):
 
 @pytest.mark.parametrize("operation", ["connections", "file_answer"])
 def test_invalid_codex_specialized_write_uses_fresh_claude_stage(
-    memory_home: Path, monkeypatch, operation: str
+    memory_home: Path, operation: str
 ):
     calls: list[tuple[str, Path, str]] = []
+    attempts: list[ProviderResult] = []
 
     class InvalidCodex:
         def __init__(self, **_kwargs):
@@ -433,8 +565,15 @@ def test_invalid_codex_specialized_write_uses_fresh_claude_stage(
                 EditingRouter._write_file_answer(request.cwd)
             return ProviderResult("claude", "claude-sonnet-5", request.task, "success", text="claude")
 
-    monkeypatch.setattr(connections if operation == "connections" else query, "CodexProvider", InvalidCodex)
-    monkeypatch.setattr(connections if operation == "connections" else query, "ClaudeProvider", ValidClaude)
+    def router_factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(
+            InvalidCodex(),
+            ValidClaude(),
+            attempt_callback=attempts.append,
+            fallback_workspace_factory=fallback_workspace_factory,
+        )
     before = {
         path.relative_to(memory_home): path.read_bytes()
         for path in memory_home.rglob("*")
@@ -445,15 +584,29 @@ def test_invalid_codex_specialized_write_uses_fresh_claude_stage(
         _write(memory_home / "knowledge/concepts/b.md", "---\ntitle: B\nproject: memory\nsources:\n  - daily/2026-08-11.md\ncreated: 2026-08-11\nupdated: 2026-08-11\n---\n# B\n")
         asyncio.run(
             connections.synthesize_connections(
-                [connections.Candidate("a", "b", [], 1.0)], memory_home=memory_home
+                [connections.Candidate("a", "b", [], 1.0)],
+                router_factory=router_factory,
+                memory_home=memory_home,
             )
         )
     else:
-        asyncio.run(query.run_query("What changed?", file_back=True, memory_home=memory_home))
+        asyncio.run(
+            query.run_query(
+                "What changed?",
+                file_back=True,
+                router_factory=router_factory,
+                memory_home=memory_home,
+            )
+        )
 
     assert [item[0] for item in calls] == ["codex", "claude"]
     assert calls[0][1] != calls[1][1]
     assert calls[0][2] == calls[1][2] == "# Build Log\n"
+    assert [attempt.outcome for attempt in attempts] == [
+        "success",
+        "invalid_output",
+        "success",
+    ]
     assert list((memory_home / "scripts/staging").iterdir()) == []
     assert not (memory_home / "unexpected.txt").exists()
     for relative, contents in before.items():

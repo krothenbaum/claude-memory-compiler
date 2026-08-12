@@ -7,7 +7,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from config import load_config, now_iso
+from config import QA_DIR, load_config, now_iso
 from providers import (
     ClaudeProvider,
     CodexProvider,
@@ -92,6 +92,14 @@ def _text_router(config):
     )
 
 
+def _workspace_router(config, fallback_workspace_factory):
+    return ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+        fallback_workspace_factory=fallback_workspace_factory,
+    )
+
+
 def _article_paths(home: Path) -> tuple[str, ...]:
     paths: list[str] = []
     for directory in ("concepts", "connections", "qa"):
@@ -108,6 +116,7 @@ async def _file_answer(
     home: Path,
     config,
     router: object | None,
+    router_factory: object | None,
 ) -> str:
     state_path = home / "scripts/state.json"
     state = _load_state(home)
@@ -138,11 +147,14 @@ async def _file_answer(
             allowed_paths=request.allowed_paths,
         )
 
-    provider_router = router or ProviderRouter(
-        CodexProvider(task_models=config.task_models),
-        ClaudeProvider(model=config.claude_model),
-        fallback_workspace_factory=fallback_factory,
-    )
+    if router is not None and router_factory is not None:
+        raise ValueError("provide router or router_factory, not both")
+    if router_factory is not None:
+        provider_router = router_factory(fallback_factory)
+    elif router is not None:
+        provider_router = router
+    else:
+        provider_router = _workspace_router(config, fallback_factory)
     request = WorkspaceRequest(
         task=TaskKind.FILE_ANSWER,
         prompt=prompt,
@@ -169,7 +181,9 @@ async def _file_answer(
     except StageValidationError as exc:
         # A successful Codex command with an invalid manifest is a failed Codex
         # attempt; ask the router to perform its Claude fallback in a fresh stage.
-        if getattr(result, "provider", None) != "codex" or router is not None:
+        if getattr(result, "provider", None) != "codex" or (
+            router is not None and router_factory is None
+        ):
             if stage.root.exists():
                 discard_stage(stage)
             return f"Error querying knowledge base: {exc}"
@@ -207,6 +221,7 @@ async def run_query(
     file_back: bool = False,
     *,
     router: object | None = None,
+    router_factory: object | None = None,
     memory_home: Path | str | None = None,
 ) -> str:
     """Query the knowledge base, optionally applying a validated staged answer."""
@@ -214,7 +229,9 @@ async def run_query(
     config = _config(home)
     prompt = build_query_prompt(question, _wiki_content(home), file_back=file_back)
     if file_back:
-        answer = await _file_answer(question, prompt, home, config, router)
+        answer = await _file_answer(
+            question, prompt, home, config, router, router_factory
+        )
     else:
         request = TextRequest(
             task=TaskKind.QUERY,
@@ -260,7 +277,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("question")
     parser.add_argument("--file-back", action="store_true")
     args = parser.parse_args(argv)
+    print(f"Question: {args.question}")
+    print(f"File back: {'yes' if args.file_back else 'no'}")
+    print("-" * 60)
     print(asyncio.run(run_query(args.question, file_back=args.file_back)))
+    if args.file_back:
+        print("\n" + "-" * 60)
+        qa_count = len(list(QA_DIR.glob("*.md"))) if QA_DIR.exists() else 0
+        print(f"Answer filed to knowledge/qa/ ({qa_count} Q&A articles total)")
     return 0
 
 
