@@ -337,6 +337,11 @@ def _start_independent_callable_wake(
     launcher: Callable[[Path], None], root: Path
 ) -> bool:
     """Start an injected wake outside this process when POSIX fork is available."""
+    if (
+        threading.current_thread() is not threading.main_thread()
+        or threading.active_count() != 1
+    ):
+        return False
     fork = getattr(os, "fork", None)
     if fork is None:
         return False
@@ -391,8 +396,7 @@ def _wake_after_commit(
             pass
         return
 
-    remaining = deadline - monotonic()
-    if remaining <= 0 and _start_independent_callable_wake(launcher, root):
+    if _start_independent_callable_wake(launcher, root):
         return
 
     def wake() -> None:
@@ -403,9 +407,7 @@ def _wake_after_commit(
 
     thread = threading.Thread(target=wake, daemon=True)
     thread.start()
-    thread.join(timeout=max(0.0, remaining))
-    if thread.is_alive():
-        _start_independent_callable_wake(launcher, root)
+    thread.join(timeout=max(0.0, deadline - monotonic()))
 
 
 def capture_transcript(

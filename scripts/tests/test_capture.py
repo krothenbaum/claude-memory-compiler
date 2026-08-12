@@ -33,6 +33,20 @@ from worker import MemoryWorker, SingletonDrainLock
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
+def _wait_for_text(path: Path, expected: str, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    actual = None
+    while time.monotonic() < deadline:
+        try:
+            actual = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            actual = None
+        if actual == expected:
+            return
+        time.sleep(0.01)
+    assert actual == expected
+
+
 def write_claude_transcript(path: Path) -> None:
     path.write_text(
         json.dumps({"sessionId": "session-1", "cwd": "/tmp/project", "message": {
@@ -232,10 +246,7 @@ def test_deadline_after_committed_enqueue_retains_job_and_attempts_wake(tmp_path
 
     assert result.created is True
     assert Path(result.job.source_path).exists()
-    deadline = time.monotonic() + 1
-    while not wake_marker.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert wake_marker.read_text(encoding="utf-8") == "woke"
+    _wait_for_text(wake_marker, "woke")
 
 
 def test_launcher_failure_after_commit_preserves_referenced_snapshot_and_dedup(
@@ -320,10 +331,7 @@ def test_postcommit_deadline_attempts_wake_without_blocking_or_losing_job(tmp_pa
     assert result.created is True
     assert elapsed < 0.2
     assert Path(result.job.source_path).exists()
-    deadline = time.monotonic() + 1
-    while not wake_marker.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert wake_marker.read_text(encoding="utf-8") == "woke"
+    _wait_for_text(wake_marker, "woke")
 
 
 def test_expired_deadline_wake_outlives_capture_process(tmp_path):
@@ -335,7 +343,11 @@ def test_expired_deadline_wake_outlives_capture_process(tmp_path):
         "marker = pathlib.Path(sys.argv[1])\n"
         "def delayed(_root):\n"
         "    time.sleep(0.25)\n"
-        "    marker.write_text('woke', encoding='utf-8')\n"
+        "    with marker.open('w', encoding='utf-8') as stream:\n"
+        "        stream.write('wo')\n"
+        "        stream.flush()\n"
+        "        time.sleep(0.1)\n"
+        "        stream.write('ke')\n"
         "_wake_after_commit(delayed, marker, deadline=0.0, monotonic=lambda: 1.0)\n"
     )
     started = time.monotonic()
@@ -348,13 +360,29 @@ def test_expired_deadline_wake_outlives_capture_process(tmp_path):
         check=False,
     )
     process_elapsed = time.monotonic() - started
-    _wait_deadline = time.monotonic() + 1
-    while not marker.exists() and time.monotonic() < _wait_deadline:
-        time.sleep(0.01)
-
     assert result.returncode == 0, result.stderr
     assert process_elapsed < 0.2
-    assert marker.read_text(encoding="utf-8") == "woke"
+    _wait_for_text(marker, "woke")
+
+
+def test_slow_deadline_wake_invokes_launcher_once(tmp_path):
+    marker = tmp_path / "wake-count"
+
+    def slow_wake(_root):
+        time.sleep(0.1)
+        with marker.open("a", encoding="utf-8") as stream:
+            stream.write("wake\n")
+
+    capture_module._wake_after_commit(
+        slow_wake,
+        tmp_path,
+        deadline=time.monotonic() + 0.02,
+        monotonic=time.monotonic,
+    )
+
+    _wait_for_text(marker, "wake\n")
+    time.sleep(0.2)
+    assert marker.read_text(encoding="utf-8") == "wake\n"
 
 
 def test_default_wake_starts_cross_platform_detached_helper(tmp_path, monkeypatch):
@@ -404,13 +432,33 @@ def test_expired_wake_fork_failure_does_not_escape_commit(monkeypatch, tmp_path)
     assert launched == [tmp_path]
 
 
+def test_deadline_wake_from_worker_thread_does_not_fork(monkeypatch, tmp_path):
+    launched = []
+    monkeypatch.setattr(
+        capture_module.os,
+        "fork",
+        lambda: (_ for _ in ()).throw(AssertionError("must not fork from a thread")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(
+            capture_module._wake_after_commit,
+            lambda root: launched.append(root),
+            tmp_path,
+            deadline=time.monotonic() + 1,
+            monotonic=time.monotonic,
+        ).result()
+
+    assert launched == [tmp_path]
+
+
 def test_queue_close_failure_after_commit_keeps_snapshot_and_attempts_wake(
     tmp_path, monkeypatch
 ):
     source = tmp_path / "source.jsonl"
     write_claude_transcript(source)
     home = tmp_path / "memory"
-    launched = []
+    wake_marker = tmp_path / "close-failure-wake"
 
     class CloseFailureQueue:
         def __init__(self, *_args, **_kwargs):
@@ -434,7 +482,7 @@ def test_queue_close_failure_after_commit_keeps_snapshot_and_attempts_wake(
         source_agent="claude",
         metadata={"trigger": "session_end"},
         memory_home=home,
-        launcher=lambda root: launched.append(root),
+        launcher=lambda root: wake_marker.write_text(str(root), encoding="utf-8"),
         env={},
         deadline=time.monotonic() + 5,
         monotonic=time.monotonic,
@@ -443,7 +491,7 @@ def test_queue_close_failure_after_commit_keeps_snapshot_and_attempts_wake(
 
     assert result.created is True
     assert Path(result.job.source_path).exists()
-    assert launched == [home]
+    _wait_for_text(wake_marker, str(home))
 
 
 def test_deadline_capture_tokens_isolate_concurrent_equivalent_snapshots(tmp_path):
