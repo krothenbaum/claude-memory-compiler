@@ -27,6 +27,7 @@ import json
 import logging
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -42,20 +43,23 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from transcripts import (
+    MAX_TRANSCRIPT_BYTES,
+    MAX_TRANSCRIPT_RECORD_BYTES,
+    MAX_TRANSCRIPT_RECORDS,
     NormalizedSession,
     Turn as NormalizedTurn,
     chunk_session,
-    codex_transcript_is_well_formed,
+    consistent_codex_session_meta,
     parse_claude_transcript,
     parse_codex_transcript,
-    read_codex_session_meta,
+    read_transcript_snapshot,
     render_turns,
 )
 
 from config import load_config
 from providers import ClaudeProvider, CodexProvider, ProviderRouter, TaskKind
 from scripts.queue import QueueRepository
-from utils import append_daily_entry
+from utils import ExclusiveFileLock, append_daily_entry
 from worker import MemoryWorker
 
 DAILY_DIR = ROOT / "daily"
@@ -207,6 +211,9 @@ class ImportReport:
     dates: tuple[str, ...]
     estimated_tokens: int
     enqueued: int = 0
+    preexisting: int = 0
+    newly_enqueued: int = 0
+    processed: int = 0
     succeeded: int = 0
     skipped: int = 0
     failed: int = 0
@@ -241,9 +248,14 @@ def _directory_date(root: Path, path: Path) -> str | None:
 
 def _parse_codex_candidate(root: Path, path: Path) -> HistoricalSession | None:
     try:
-        if not codex_transcript_is_well_formed(path):
-            return None
-        meta = read_codex_session_meta(path)
+        snapshot = read_transcript_snapshot(
+            path,
+            root=root,
+            max_bytes=MAX_TRANSCRIPT_BYTES,
+            max_record_bytes=MAX_TRANSCRIPT_RECORD_BYTES,
+            max_records=MAX_TRANSCRIPT_RECORDS,
+        )
+        meta = consistent_codex_session_meta(snapshot.records)
         if meta is None or any(
             not isinstance(meta.get(field), str) or not str(meta[field]).strip()
             for field in ("id", "cwd", "timestamp")
@@ -252,7 +264,11 @@ def _parse_codex_candidate(root: Path, path: Path) -> HistoricalSession | None:
         timestamp = _parse_timestamp(str(meta["timestamp"]))
         if timestamp is None:
             return None
-        normalized = parse_codex_transcript(path, {"trigger": "historical"})
+        normalized = parse_codex_transcript(
+            path,
+            {"trigger": "historical"},
+            records=snapshot.records,
+        )
     except (OSError, UnicodeError, ValueError):
         return None
     if not normalized.turns:
@@ -388,7 +404,7 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
         # Skip if inside a subagents directory
         if "subagents" in str(f):
             continue
-        stat = f.stat()
+        stat = f.lstat()
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).astimezone()
         session_id = f.stem  # UUID
         results.append(TranscriptInfo(
@@ -406,24 +422,36 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
 def _parse_claude_candidate(
     target: Target, info: TranscriptInfo
 ) -> HistoricalSession | None:
-    if info.size < MIN_FILE_SIZE:
-        return None
     try:
+        snapshot = read_transcript_snapshot(
+            info.path,
+            root=target.transcripts_dir,
+            max_bytes=MAX_TRANSCRIPT_BYTES,
+            max_record_bytes=MAX_TRANSCRIPT_RECORD_BYTES,
+            max_records=MAX_TRANSCRIPT_RECORDS,
+        )
+        if snapshot.size < MIN_FILE_SIZE:
+            return None
+        mtime = datetime.fromtimestamp(
+            snapshot.mtime_ns / 1_000_000_000, tz=timezone.utc
+        ).astimezone()
         session = parse_claude_transcript(
             info.path,
             {
                 "session_id": info.session_id,
                 "cwd": target.project_cwd,
                 "project": target.project_key,
-                "timestamp": info.mtime.isoformat(),
+                "timestamp": mtime.isoformat(),
                 "trigger": "historical",
             },
+            records=snapshot.records,
         )
     except (OSError, UnicodeError, ValueError):
         return None
     if not session.turns:
         return None
-    return HistoricalSession(session, info.path, info.date, info.date)
+    stable_date = mtime.strftime("%Y-%m-%d")
+    return HistoricalSession(session, info.path, stable_date, stable_date)
 
 
 def discover_claude_sessions(
@@ -512,13 +540,27 @@ def _historical_writer(memory_home: Path):
 
 
 class _BoundedRouter:
-    def __init__(self, router: object, semaphore: asyncio.Semaphore) -> None:
+    def __init__(
+        self,
+        router: object,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
         self._router = router
         self._semaphore = semaphore
 
     async def generate_text(self, request):
         async with self._semaphore:
-            return await self._router.generate_text(request)
+            with tempfile.TemporaryDirectory(
+                prefix="memory-historical-workspace-"
+            ) as directory:
+                workspace = Path(directory).resolve()
+                workspace.chmod(0o700)
+                safe_request = replace(
+                    request,
+                    prompt=f"Historical source CWD: {request.cwd}\n\n{request.prompt}",
+                    cwd=workspace,
+                )
+                return await self._router.generate_text(safe_request)
 
 
 def _default_router(config=None) -> ProviderRouter:
@@ -533,7 +575,6 @@ def _config_for_home(memory_home: Path):
     environment = dict(os.environ)
     environment["AI_MEMORY_HOME"] = str(memory_home)
     environment.pop("CLAUDE_MEMORY_HOME", None)
-    environment.pop("AI_MEMORY_QUEUE_PATH", None)
     return load_config(environment)
 
 
@@ -605,25 +646,31 @@ def _read_queue_identities(queue_path: Path) -> dict[tuple[str, str, str, str], 
 
 
 def _read_legacy_processed_sessions(state_path: Path) -> set[str]:
-    if not state_path.is_file():
-        return set()
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        data = _read_state_bytes(state_path)
+        if data is None:
+            return set()
+        state = json.loads(data.decode("utf-8"))
         processed = state.get("batch_flush", {}).get("processed_sessions", {})
-    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        AttributeError,
+        ValueError,
+    ):
         return set()
     return set(processed) if isinstance(processed, dict) else set()
 
 
 def _read_legacy_total_cost(state_path: Path) -> Decimal:
-    if not state_path.is_file():
-        return Decimal(0)
     try:
-        state = json.loads(
-            state_path.read_text(encoding="utf-8"), parse_float=Decimal
-        )
+        data = _read_state_bytes(state_path)
+        if data is None:
+            return Decimal(0)
+        state = json.loads(data.decode("utf-8"), parse_float=Decimal)
         value = state.get("batch_flush", {}).get("total_cost", 0)
-        total = Decimal(str(value))
+        total = _legacy_cost_value(value)
     except (
         OSError,
         UnicodeError,
@@ -637,20 +684,146 @@ def _read_legacy_total_cost(state_path: Path) -> Decimal:
     return total
 
 
-def _dedup_plan(
-    planned: Sequence[NormalizedSession], memory_home: Path, *, resume: bool
-) -> tuple[list[NormalizedSession], int, int]:
-    queue_identities = _read_queue_identities(
-        memory_home / "scripts" / "jobs.sqlite3"
+def _legacy_cost_value(value: object) -> Decimal:
+    try:
+        total = Decimal(str(value))
+    except InvalidOperation:
+        return Decimal(0)
+    if not total.is_finite() or total < 0:
+        return Decimal(0)
+    return total
+
+
+def _legacy_accounting_identity(session: NormalizedSession) -> str:
+    return hashlib.sha256("\0".join(_identity(session)).encode()).hexdigest()
+
+
+def _read_state_bytes(state_path: Path) -> bytes | None:
+    if not state_path.exists() and not state_path.is_symlink():
+        return None
+    if state_path.is_symlink():
+        raise ValueError("legacy state path must not be a symlink")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(state_path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("legacy state path must be a regular file")
+        if info.st_nlink != 1:
+            raise ValueError("legacy state path must not be hard-linked")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError("legacy state path has an unsafe owner")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024:
+            raise ValueError("legacy state exceeds byte limit")
+    finally:
+        os.close(descriptor)
+    return data
+
+
+def _atomic_write_state(state_path: Path, state: dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if state_path.parent.is_symlink():
+        raise ValueError("legacy state directory must not be a symlink")
+    serialized = json.dumps(state, indent=2, default=str).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{state_path.name}.", suffix=".tmp", dir=state_path.parent
     )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, state_path)
+        directory = os.open(
+            state_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reconcile_legacy_claude_cost(
+    repository: QueueRepository,
+    sessions: Sequence[NormalizedSession],
+    memory_home: Path,
+) -> None:
+    succeeded: dict[str, NormalizedSession] = {}
+    for session in sessions:
+        if session.agent != "claude":
+            continue
+        status = repository._connection.execute(
+            """
+            SELECT status FROM jobs
+            WHERE kind = 'capture' AND source_agent = ?
+              AND session_id = ? AND source_hash = ?
+            """,
+            (session.agent, session.session_id, session.source_hash),
+        ).fetchone()
+        if status is not None and status[0] == "succeeded":
+            succeeded[_legacy_accounting_identity(session)] = session
+    if not succeeded:
+        return
+
+    state_path = memory_home / "scripts" / "state.json"
+    with ExclusiveFileLock(memory_home / "scripts" / "memory-writer.lock"):
+        state_data = _read_state_bytes(state_path)
+        if state_data is None:
+            state = {}
+            current = Decimal(0)
+        else:
+            try:
+                state = json.loads(state_data.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError):
+                state = {}
+            try:
+                exact_state = json.loads(
+                    state_data.decode("utf-8"), parse_float=Decimal
+                )
+                current = _legacy_cost_value(
+                    exact_state.get("batch_flush", {}).get("total_cost", 0)
+                )
+            except (UnicodeError, json.JSONDecodeError, AttributeError):
+                current = Decimal(0)
+        batch_state = state.get("batch_flush")
+        if not isinstance(batch_state, dict):
+            batch_state = {}
+        accounted = batch_state.get("accounted_historical_jobs")
+        if not isinstance(accounted, dict):
+            accounted = {}
+        new_identities = sorted(set(succeeded) - set(accounted))
+        if not new_identities:
+            return
+        estimate = Decimal(str(FLUSH_COST_ESTIMATE))
+        for identity in new_identities:
+            accounted[identity] = str(estimate)
+        batch_state["accounted_historical_jobs"] = accounted
+        batch_state["total_cost"] = str(current + estimate * len(new_identities))
+        state["batch_flush"] = batch_state
+        _atomic_write_state(state_path, state)
+
+
+def _dedup_plan(
+    planned: Sequence[NormalizedSession], queue_path: Path, state_path: Path, *, resume: bool
+) -> tuple[list[NormalizedSession], int, int, int]:
+    queue_identities = _read_queue_identities(queue_path)
     legacy = (
-        _read_legacy_processed_sessions(memory_home / "scripts" / "state.json")
+        _read_legacy_processed_sessions(state_path)
         if resume
         else set()
     )
     retained: list[NormalizedSession] = []
     skipped = 0
     would_create = 0
+    preexisting = 0
     seen: set[tuple[str, str, str, str]] = set()
     for session in planned:
         identity = _identity(session)
@@ -663,13 +836,13 @@ def _dedup_plan(
             resume and session.agent == "claude" and session.session_id in legacy
         )
         if status is not None or legacy_match:
-            skipped += 1
+            preexisting += 1
             if resume and (status == "succeeded" or legacy_match):
                 continue
         else:
             would_create += 1
         retained.append(session)
-    return retained, skipped, would_create
+    return retained, skipped, would_create, preexisting
 
 
 def _print_import_report(report: ImportReport, config) -> None:
@@ -682,6 +855,9 @@ def _print_import_report(report: ImportReport, config) -> None:
         f"(Claude fallback: {config.claude_model})"
     )
     print(f"estimated tokens: {report.estimated_tokens}")
+    print(f"preexisting: {report.preexisting}")
+    print(f"newly enqueued: {report.newly_enqueued}")
+    print(f"processed: {report.processed}")
     print(f"enqueued: {report.enqueued}")
     print(f"succeeded: {report.succeeded}")
     print(f"skipped: {report.skipped}")
@@ -699,13 +875,16 @@ async def execute_historical_import(
     """Plan, enqueue, and drain historical captures through the live queue contract."""
     home = Path(memory_home).expanduser().resolve()
     config = _config_for_home(home)
+    queue_path = config.queue_path
+    state_path = home / "scripts" / "state.json"
     selected = filter_historical_sessions(sessions, args)
+    candidate_chunks = _plan_chunks(selected, None)
     accumulated = Decimal(0)
     if args.max_cost is not None:
-        accumulated = _read_legacy_total_cost(home / "scripts" / "state.json")
+        accumulated = _read_legacy_total_cost(state_path)
     all_planned = _plan_chunks(selected, args.max_cost, accumulated)
-    planned, deduplicated, would_create = _dedup_plan(
-        all_planned, home, resume=args.resume
+    planned, deduplicated, would_create, preexisting = _dedup_plan(
+        all_planned, queue_path, state_path, resume=args.resume
     )
     report = ImportReport(
         sessions=len(selected),
@@ -716,21 +895,40 @@ async def execute_historical_import(
             max(1, (len(render_turns(chunk)) + 3) // 4) for chunk in planned
         ),
         enqueued=would_create if args.dry_run else 0,
+        preexisting=preexisting,
+        newly_enqueued=would_create if args.dry_run else 0,
         skipped=deduplicated,
     )
     if args.dry_run:
         _print_import_report(report, config)
         return report
 
-    queue_path = home / "scripts" / "jobs.sqlite3"
     repository = QueueRepository(queue_path)
     try:
+        _reconcile_legacy_claude_cost(repository, candidate_chunks, home)
+        if args.max_cost is not None:
+            accumulated = _read_legacy_total_cost(state_path)
+            all_planned = _plan_chunks(selected, args.max_cost, accumulated)
+            planned, deduplicated, would_create, preexisting = _dedup_plan(
+                all_planned, queue_path, state_path, resume=args.resume
+            )
+            report = replace(
+                report,
+                chunks=len(planned),
+                estimated_tokens=sum(
+                    max(1, (len(render_turns(chunk)) + 3) // 4)
+                    for chunk in planned
+                ),
+                preexisting=max(report.preexisting, preexisting),
+                skipped=deduplicated,
+            )
         enqueued = [repository.enqueue_capture(chunk) for chunk in planned]
         created = sum(result.created for result in enqueued)
-        skipped = max(deduplicated, len(enqueued) - created)
+        skipped = deduplicated
         if planned:
             bounded_router = _BoundedRouter(
-                router or _default_router(config), asyncio.Semaphore(args.concurrency)
+                router or _default_router(config),
+                asyncio.Semaphore(args.concurrency),
             )
             workers = [
                 MemoryWorker(
@@ -744,14 +942,21 @@ async def execute_historical_import(
             ]
             await asyncio.gather(*(worker.drain() for worker in workers))
         statuses = [repository.get_job(result.job_id).status for result in enqueued]
+        unique_count = len(all_planned) - deduplicated
+        omitted_preexisting = unique_count - len(planned)
+        actual_preexisting = omitted_preexisting + len(enqueued) - created
         report = replace(
             report,
             enqueued=created,
+            preexisting=max(report.preexisting, actual_preexisting),
+            newly_enqueued=created,
+            processed=len(statuses),
             succeeded=statuses.count("succeeded"),
             skipped=skipped,
             failed=statuses.count("failed"),
             dead=statuses.count("dead"),
         )
+        _reconcile_legacy_claude_cost(repository, all_planned, home)
     finally:
         repository.close()
     _print_import_report(report, config)

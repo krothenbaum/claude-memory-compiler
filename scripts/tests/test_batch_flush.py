@@ -6,8 +6,10 @@ from decimal import Decimal
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -59,6 +61,25 @@ def write_codex(path: Path, *, session_id: str, cwd: str, timestamp: str) -> Non
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "Choice recorded"}],
             },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+
+
+def write_claude(path: Path, *, session_id: str, cwd: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "timestamp": "2026-08-10T10:00:00Z",
+            "message": {"role": "user", "content": "x" * 6_000},
+        },
+        {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "timestamp": "2026-08-10T10:00:01Z",
+            "message": {"role": "assistant", "content": "done"},
         },
     ]
     path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
@@ -134,6 +155,193 @@ def test_codex_discovery_skips_malformed_and_deduplicates_equivalent_rollouts(
     assert len(result.sessions) == 1
     assert result.duplicates == (duplicate,)
     assert result.malformed == (malformed,)
+
+
+def test_codex_discovery_rejects_external_symlink_without_reading_target(
+    batch, tmp_path
+):
+    root = tmp_path / "sessions"
+    root.mkdir()
+    external = tmp_path / "external.jsonl"
+    write_codex(
+        external,
+        session_id="outside",
+        cwd="/outside/project",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    sentinel = external.read_bytes()
+    linked = root / "linked.jsonl"
+    linked.symlink_to(external)
+
+    result = batch.discover_codex_sessions(root)
+
+    assert result.sessions == ()
+    assert result.malformed == (linked,)
+    assert external.read_bytes() == sentinel
+
+
+def test_codex_discovery_fallback_rejects_symlinked_root(
+    batch, tmp_path, monkeypatch
+):
+    real_root = tmp_path / "real-sessions"
+    transcript = real_root / "rollout.jsonl"
+    write_codex(
+        transcript,
+        session_id="outside",
+        cwd="/outside/project",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    linked_root = tmp_path / "linked-sessions"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    transcript_module = sys.modules[batch.read_transcript_snapshot.__module__]
+    monkeypatch.setattr(transcript_module, "_USE_DIR_FD", False)
+
+    result = batch.discover_codex_sessions(linked_root)
+
+    assert result.sessions == ()
+    assert result.malformed == (linked_root / "rollout.jsonl",)
+
+
+def test_claude_discovery_rejects_external_symlink(batch, tmp_path):
+    root = tmp_path / "claude"
+    root.mkdir()
+    external = tmp_path / "external-claude.jsonl"
+    write_claude(external, session_id="outside", cwd="/outside/project")
+    linked = root / "linked.jsonl"
+    linked.symlink_to(external)
+    target = batch.Target("project", "/trusted/project", root)
+
+    assert batch.discover_claude_sessions([target]) == []
+
+
+def test_codex_discovery_rejects_hardlinked_source_when_supported(batch, tmp_path):
+    root = tmp_path / "sessions"
+    root.mkdir()
+    external = tmp_path / "external.jsonl"
+    write_codex(
+        external,
+        session_id="hardlinked",
+        cwd="/outside/project",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    linked = root / "linked.jsonl"
+    try:
+        os.link(external, linked)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {exc}")
+
+    result = batch.discover_codex_sessions(root)
+
+    assert result.sessions == ()
+    assert result.malformed == (linked,)
+
+
+def test_codex_discovery_accepts_repeated_identical_session_meta(batch, tmp_path):
+    root = tmp_path / "sessions"
+    transcript = root / "rollout.jsonl"
+    write_codex(
+        transcript,
+        session_id="same-meta",
+        cwd="/repo/project",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    records.insert(1, records[0])
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    result = batch.discover_codex_sessions(root)
+
+    assert len(result.sessions) == 1
+    assert result.malformed == ()
+
+
+def test_codex_discovery_rejects_conflicting_session_meta(batch, tmp_path):
+    root = tmp_path / "sessions"
+    transcript = root / "rollout.jsonl"
+    write_codex(
+        transcript,
+        session_id="first",
+        cwd="/repo/first",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    conflicting = json.loads(json.dumps(records[0]))
+    conflicting["payload"]["id"] = "second"
+    conflicting["payload"]["cwd"] = "/repo/second"
+    records.insert(1, conflicting)
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    result = batch.discover_codex_sessions(root)
+
+    assert result.sessions == ()
+    assert result.malformed == (transcript,)
+
+
+@pytest.mark.parametrize("limit_name", ["MAX_TRANSCRIPT_BYTES", "MAX_TRANSCRIPT_RECORDS"])
+def test_codex_discovery_rejects_bounded_source_limits(
+    batch, tmp_path, monkeypatch, limit_name
+):
+    root = tmp_path / "sessions"
+    transcript = root / "rollout.jsonl"
+    write_codex(
+        transcript,
+        session_id="bounded",
+        cwd="/repo/bounded",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    monkeypatch.setattr(batch, limit_name, 1, raising=False)
+
+    result = batch.discover_codex_sessions(root)
+
+    assert result.sessions == ()
+    assert result.malformed == (transcript,)
+
+
+@pytest.mark.parametrize("change", ["grow", "replace"])
+def test_codex_discovery_rejects_source_changed_during_single_snapshot(
+    batch, tmp_path, monkeypatch, change
+):
+    root = tmp_path / "sessions"
+    transcript = root / "rollout.jsonl"
+    write_codex(
+        transcript,
+        session_id="stable",
+        cwd="/repo/stable",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    original_read = os.read
+    changed = False
+
+    def changing_read(descriptor, count):
+        nonlocal changed
+        data = original_read(descriptor, count)
+        if data and not changed:
+            changed = True
+            if change == "grow":
+                with transcript.open("ab") as stream:
+                    stream.write(b"\n{}")
+            else:
+                replacement = transcript.with_suffix(".replacement")
+                write_codex(
+                    replacement,
+                    session_id="replacement",
+                    cwd="/repo/replacement",
+                    timestamp="2026-08-11T10:00:00Z",
+                )
+                os.replace(replacement, transcript)
+        return data
+
+    monkeypatch.setattr(os, "read", changing_read)
+
+    result = batch.discover_codex_sessions(root)
+
+    assert changed
+    assert result.sessions == ()
+    assert result.malformed == (transcript,)
 
 
 def test_historical_single_chunk_keeps_live_capture_resume_key(batch, tmp_path):
@@ -494,7 +702,10 @@ def test_resume_dry_run_skips_completed_queue_identity_without_mutation(batch, t
 
     assert report.chunks == 0
     assert report.enqueued == 0
-    assert report.skipped == 1
+    assert report.preexisting == 1
+    assert report.skipped == 0
+    assert report.newly_enqueued == 0
+    assert report.processed == 0
     assert manifest(memory_home) == before
 
 
@@ -576,7 +787,8 @@ def test_resume_dry_run_honors_legacy_processed_session_state(batch, tmp_path):
     )
 
     assert report.chunks == 0
-    assert report.skipped == 1
+    assert report.preexisting == 1
+    assert report.skipped == 0
     assert manifest(memory_home) == before
 
 
@@ -597,8 +809,49 @@ def test_dry_run_reports_existing_pending_queue_identity_as_deduplicated(batch, 
 
     assert report.chunks == 1
     assert report.enqueued == 0
-    assert report.skipped == 1
+    assert report.preexisting == 1
+    assert report.skipped == 0
+    assert report.newly_enqueued == 0
+    assert report.processed == 0
     assert manifest(memory_home) == before
+
+
+def test_custom_queue_path_is_shared_by_live_and_historical_import(
+    batch, tmp_path, monkeypatch
+):
+    memory_home = tmp_path / "memory"
+    custom_queue = tmp_path / "private-queue" / "custom.sqlite3"
+    sessions = make_discovered(batch, tmp_path, 1)
+    with QueueRepository(custom_queue) as repository:
+        repository.enqueue_capture(sessions[0].session)
+    monkeypatch.setenv("AI_MEMORY_QUEUE_PATH", str(custom_queue))
+    dry_args = batch.parse_cli_args(["--source", "codex", "--dry-run"])
+
+    dry_report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, dry_args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert dry_report.preexisting == 1
+    assert dry_report.newly_enqueued == 0
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+
+    router = TrackingRouter()
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions,
+            batch.parse_cli_args(["--source", "codex"]),
+            memory_home=memory_home,
+            router=router,
+        )
+    )
+
+    assert report.preexisting == 1
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert router.calls == 1
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
 
 
 @pytest.mark.parametrize(
@@ -662,6 +915,29 @@ class TrackingRouter:
         return RoutedResult.from_result(attempt, [attempt], None)
 
 
+class WorkspaceCheckingRouter(TrackingRouter):
+    def __init__(self, expected_source_cwd: str, forbidden_roots: tuple[Path, ...]):
+        super().__init__()
+        self.expected_source_cwd = expected_source_cwd
+        self.forbidden_roots = forbidden_roots
+        self.workspaces: list[Path] = []
+
+    async def generate_text(self, request):
+        workspace = request.cwd
+        assert workspace.is_absolute()
+        assert workspace.exists() and workspace.is_dir()
+        assert not workspace.is_symlink()
+        assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+        assert list(workspace.iterdir()) == []
+        assert all(
+            workspace != root and root not in workspace.parents
+            for root in self.forbidden_roots
+        )
+        assert f"Historical source CWD: {self.expected_source_cwd}" in request.prompt
+        self.workspaces.append(workspace)
+        return await super().generate_text(request)
+
+
 class SentinelRouter:
     def __init__(self, text: str):
         self.text = text
@@ -723,6 +999,49 @@ def test_import_bounds_provider_concurrency_and_serializes_daily_writes(batch, t
     assert router.peak == 2
     daily = (memory_home / "daily" / "2026-08-10.md").read_text(encoding="utf-8")
     assert daily.count("**Agent:** Codex") == 5
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "unrelated", "symlink"])
+def test_historical_provider_uses_ephemeral_empty_workspace_not_source_cwd(
+    batch, tmp_path, source_kind
+):
+    memory_home = tmp_path / "memory"
+    source = tmp_path / "source-project"
+    if source_kind == "unrelated":
+        source.mkdir()
+        (source / "secret.txt").write_text("do not expose", encoding="utf-8")
+        source_cwd = str(source)
+    elif source_kind == "symlink":
+        target = tmp_path / "sensitive"
+        target.mkdir()
+        source.symlink_to(target, target_is_directory=True)
+        source_cwd = str(source)
+    else:
+        source_cwd = str(source)
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    historical = replace(
+        discovered,
+        session=replace(discovered.session, cwd=source_cwd),
+    )
+    router = WorkspaceCheckingRouter(
+        source_cwd,
+        (memory_home.resolve(), source.resolve()),
+    )
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            batch.parse_cli_args(["--source", "codex"]),
+            memory_home=memory_home,
+            router=router,
+        )
+    )
+
+    assert report.succeeded == 1
+    assert len(router.workspaces) == 1
+    assert not router.workspaces[0].exists()
+    daily = (memory_home / "daily" / "2026-08-10.md").read_text(encoding="utf-8")
+    assert f"**CWD:** {source_cwd}" in daily
 
 
 def test_import_collapses_repeated_identical_chunks_before_estimate_and_enqueue(
@@ -910,6 +1229,183 @@ def test_claude_max_cost_tolerates_missing_or_corrupt_legacy_state(
     assert report.enqueued == 1
 
 
+@pytest.mark.parametrize("response", ["**Context:** captured", "FLUSH_OK"])
+def test_successful_claude_jobs_advance_legacy_cost_once(batch, tmp_path, response):
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    historical = replace(
+        discovered,
+        session=replace(discovered.session, agent="claude"),
+    )
+    args = batch.parse_cli_args(["--source", "claude", "--resume"])
+
+    first = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            args,
+            memory_home=memory_home,
+            router=SentinelRouter(response),
+        )
+    )
+    second = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            args,
+            memory_home=memory_home,
+            router=SentinelRouter(response),
+        )
+    )
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8"),
+        parse_float=Decimal,
+    )["batch_flush"]
+
+    assert first.succeeded == 1
+    assert second.preexisting == 1
+    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert len(state["accounted_historical_jobs"]) == 1
+
+
+def test_failed_claude_job_does_not_advance_legacy_cost(batch, tmp_path, monkeypatch):
+    original_repository = batch.QueueRepository
+    monkeypatch.setattr(
+        batch,
+        "QueueRepository",
+        lambda path: original_repository(path, max_attempts=1),
+    )
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    historical = replace(
+        discovered,
+        session=replace(discovered.session, agent="claude"),
+    )
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            batch.parse_cli_args(["--source", "claude"]),
+            memory_home=memory_home,
+            router=FailedRouter(),
+        )
+    )
+
+    assert report.dead == 1
+    assert not (memory_home / "scripts" / "state.json").exists()
+
+
+def test_resume_repairs_cost_after_queue_success_before_state_commit(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    session = replace(discovered.session, agent="claude")
+    historical = replace(discovered, session=session)
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        queued = repository.enqueue_capture(session)
+        claimed = repository.claim_next("prior-worker", batch.datetime.now(batch.timezone.utc), 30)
+        assert claimed is not None
+        repository.complete(queued.job_id, "prior-worker")
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            batch.parse_cli_args(["--source", "claude", "--resume"]),
+            memory_home=memory_home,
+            router=TrackingRouter(),
+        )
+    )
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+
+    assert report.preexisting == 1
+    assert report.processed == 0
+    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+
+
+def test_resume_repairs_cost_before_enforcing_remaining_ceiling(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 2)
+    ]
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        queued = repository.enqueue_capture(sessions[0].session)
+        claimed = repository.claim_next("prior-worker", batch.datetime.now(batch.timezone.utc), 30)
+        assert claimed is not None
+        repository.complete(queued.job_id, "prior-worker")
+    router = TrackingRouter()
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions,
+            batch.parse_cli_args(
+                ["--source", "claude", "--resume", "--max-cost", "0.04"]
+            ),
+            memory_home=memory_home,
+            router=router,
+        )
+    )
+
+    assert report.chunks == 0
+    assert report.preexisting == 1
+    assert report.newly_enqueued == 0
+    assert router.calls == 0
+
+
+def test_concurrent_claude_imports_do_not_lose_legacy_cost_updates(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 2)
+    ]
+    args = batch.parse_cli_args(["--source", "claude", "--resume"])
+
+    async def run_concurrently():
+        return await asyncio.gather(
+            batch.execute_historical_import(
+                [sessions[0]], args, memory_home=memory_home, router=TrackingRouter()
+            ),
+            batch.execute_historical_import(
+                [sessions[1]], args, memory_home=memory_home, router=TrackingRouter()
+            ),
+        )
+
+    reports = asyncio.run(run_concurrently())
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+
+    assert sum(report.succeeded for report in reports) == 2
+    assert Decimal(str(state["total_cost"])) == Decimal("0.08")
+    assert len(state["accounted_historical_jobs"]) == 2
+
+
+def test_legacy_cost_atomic_replace_failure_preserves_prior_state(
+    batch, tmp_path, monkeypatch
+):
+    state_path = tmp_path / "memory" / "scripts" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    original = b'{"batch_flush":{"total_cost":"1.00"}}'
+    state_path.write_bytes(original)
+    real_replace = os.replace
+
+    def fail_target_replace(source, destination):
+        if Path(destination) == state_path:
+            raise OSError("synthetic replace failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_target_replace)
+
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        batch._atomic_write_state(
+            state_path, {"batch_flush": {"total_cost": "1.04"}}
+        )
+
+    assert state_path.read_bytes() == original
+    assert list(state_path.parent.glob(".state.json.*.tmp")) == []
+
+
 @pytest.mark.parametrize("agent", ["claude", "codex"])
 def test_flush_ok_completes_dedup_without_daily_write(batch, tmp_path, agent):
     memory_home = tmp_path / "memory"
@@ -931,7 +1427,8 @@ def test_flush_ok_completes_dedup_without_daily_write(batch, tmp_path, agent):
     )
 
     assert first.succeeded == 1
-    assert second.skipped == 1
+    assert second.preexisting == 1
+    assert second.skipped == 0
     assert router.calls == 1
     assert not (memory_home / "daily").exists()
 
@@ -1052,5 +1549,6 @@ def test_resume_skips_completed_jobs_and_provider_fallback_does_not_change_key(
     assert second.succeeded == 0
     assert second_router.calls == 0
     assert daily_path.read_bytes() == daily_before
-    assert dry_report.skipped == 1
+    assert dry_report.preexisting == 1
+    assert dry_report.skipped == 0
     assert manifest(memory_home) == before_dry_run

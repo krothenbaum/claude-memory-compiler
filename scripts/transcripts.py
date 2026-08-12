@@ -6,7 +6,9 @@ from collections import deque
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Iterable, Iterator, Literal, Mapping, Sequence
 
 
@@ -17,6 +19,9 @@ TurnKind = Literal["message", "decision", "subagent_finding"]
 
 DEFAULT_TIMESTAMP = "1970-01-01T00:00:00Z"
 MAX_FINDING_CHARS = 2_000
+MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+MAX_TRANSCRIPT_RECORD_BYTES = 2 * 1024 * 1024
+MAX_TRANSCRIPT_RECORDS = 200_000
 
 CLAUDE_SUBAGENT_TOOLS = {"Agent", "Task"}
 CODEX_DECISION_TOOLS = {"ask_user_question", "askuserquestion", "request_user_input"}
@@ -49,6 +54,176 @@ class NormalizedSession:
     source_hash: str
 
 
+class UnsafeTranscriptSource(ValueError):
+    """A historical transcript could not be read as one confined snapshot."""
+
+
+@dataclass(frozen=True)
+class TranscriptSnapshot:
+    path: Path
+    records: tuple[dict, ...]
+    size: int
+    mtime_ns: int
+
+
+def _safe_owner(info: os.stat_result) -> bool:
+    return not hasattr(os, "getuid") or info.st_uid == os.getuid()
+
+
+def _stable_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+_USE_DIR_FD = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and bool(getattr(os, "O_NOFOLLOW", 0))
+)
+
+
+def _link_or_reparse(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse and attributes & reparse)
+
+
+def _validate_directory(info: os.stat_result, label: str) -> None:
+    if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode) or not _safe_owner(info):
+        raise UnsafeTranscriptSource(f"unsafe transcript {label}")
+
+
+def _validate_file(info: os.stat_result, max_bytes: int) -> None:
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeTranscriptSource("transcript must be a regular file")
+    if not _safe_owner(info):
+        raise UnsafeTranscriptSource("transcript has an unsafe owner")
+    if info.st_nlink != 1:
+        raise UnsafeTranscriptSource("transcript must not be hard-linked")
+    if info.st_size > max_bytes:
+        raise UnsafeTranscriptSource("transcript exceeds byte limit")
+
+
+def read_transcript_snapshot(
+    path: Path | str,
+    *,
+    root: Path | str,
+    max_bytes: int = MAX_TRANSCRIPT_BYTES,
+    max_record_bytes: int = MAX_TRANSCRIPT_RECORD_BYTES,
+    max_records: int = MAX_TRANSCRIPT_RECORDS,
+) -> TranscriptSnapshot:
+    """Read one owner-controlled regular JSONL file exactly once under ``root``."""
+    if max_bytes <= 0 or max_record_bytes <= 0 or max_records <= 0:
+        raise ValueError("transcript limits must be positive")
+    root_path = Path(root).expanduser().absolute()
+    transcript_path = Path(path).expanduser().absolute()
+    try:
+        relative = transcript_path.relative_to(root_path)
+    except ValueError as exc:
+        raise UnsafeTranscriptSource("transcript is outside its discovery root") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise UnsafeTranscriptSource("invalid transcript path")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    fallback_paths: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+    try:
+        if _USE_DIR_FD:
+            directory = os.open(root_path, directory_flags)
+            descriptors.append(directory)
+            _validate_directory(os.fstat(directory), "root")
+            for component in relative.parts[:-1]:
+                directory = os.open(component, directory_flags, dir_fd=directory)
+                descriptors.append(directory)
+                _validate_directory(os.fstat(directory), "directory")
+            descriptor = os.open(relative.parts[-1], file_flags, dir_fd=directory)
+        else:
+            current_path = root_path
+            info = os.lstat(current_path)
+            _validate_directory(info, "root")
+            fallback_paths.append((current_path, _stable_identity(info)))
+            for component in relative.parts[:-1]:
+                current_path = current_path / component
+                info = os.lstat(current_path)
+                _validate_directory(info, "directory")
+                fallback_paths.append((current_path, _stable_identity(info)))
+            candidate_info = os.lstat(transcript_path)
+            _validate_file(candidate_info, max_bytes)
+            descriptor = os.open(transcript_path, file_flags)
+        descriptors.append(descriptor)
+        before = os.fstat(descriptor)
+        _validate_file(before, max_bytes)
+        if not _USE_DIR_FD and (
+            before.st_dev != candidate_info.st_dev or before.st_ino != candidate_info.st_ino
+        ):
+            raise UnsafeTranscriptSource("transcript changed before it was opened")
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise UnsafeTranscriptSource("transcript exceeds byte limit")
+
+        after = os.fstat(descriptor)
+        current = (
+            os.stat(relative.parts[-1], dir_fd=directory, follow_symlinks=False)
+            if _USE_DIR_FD
+            else os.lstat(transcript_path)
+        )
+        if (
+            _stable_identity(before) != _stable_identity(after)
+            or before.st_dev != current.st_dev
+            or before.st_ino != current.st_ino
+        ):
+            raise UnsafeTranscriptSource("transcript changed while being read")
+        for ancestor, identity in fallback_paths:
+            if _stable_identity(os.lstat(ancestor)) != identity:
+                raise UnsafeTranscriptSource("transcript directory changed while being read")
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        if isinstance(exc, UnsafeTranscriptSource):
+            raise
+        raise UnsafeTranscriptSource("transcript could not be opened safely") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+    records: list[dict] = []
+    try:
+        for raw_line in b"".join(chunks).splitlines():
+            if not raw_line.strip():
+                continue
+            if len(raw_line) > max_record_bytes:
+                raise UnsafeTranscriptSource("transcript record exceeds byte limit")
+            if len(records) >= max_records:
+                raise UnsafeTranscriptSource("transcript exceeds record limit")
+            record = json.loads(raw_line.decode("utf-8"))
+            if not isinstance(record, dict):
+                raise UnsafeTranscriptSource("transcript record must be an object")
+            records.append(record)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UnsafeTranscriptSource("transcript is not valid JSONL") from exc
+    return TranscriptSnapshot(
+        transcript_path,
+        tuple(records),
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
 def _read_jsonl(path: Path) -> Iterator[dict]:
     with path.open(encoding="utf-8") as stream:
         for line in stream:
@@ -63,17 +238,32 @@ def _read_jsonl(path: Path) -> Iterator[dict]:
                 yield record
 
 
+def consistent_codex_session_meta(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    metas: list[dict[str, object]] = []
+    for record in records:
+        payload = record.get("payload")
+        if record.get("type") == "session_meta" and isinstance(payload, dict):
+            metas.append(dict(payload))
+    if not metas:
+        return None
+    identity = tuple(metas[0].get(field) for field in ("id", "cwd", "timestamp"))
+    if any(
+        tuple(meta.get(field) for field in ("id", "cwd", "timestamp")) != identity
+        for meta in metas[1:]
+    ):
+        return None
+    return metas[0]
+
+
 def read_codex_session_meta(path: Path | str) -> dict[str, object] | None:
     """Return the first well-formed Codex ``session_meta`` payload.
 
     Historical discovery uses this small, side-effect-free probe to distinguish
     rollouts from malformed or unrelated JSONL files before doing full parsing.
     """
-    for record in _read_jsonl(Path(path)):
-        payload = record.get("payload")
-        if record.get("type") == "session_meta" and isinstance(payload, dict):
-            return dict(payload)
-    return None
+    return consistent_codex_session_meta(tuple(_read_jsonl(Path(path))))
 
 
 def codex_transcript_is_well_formed(path: Path | str) -> bool:
@@ -257,8 +447,8 @@ def _duplicate_call_ids(call_ids: Iterable[str]) -> set[str]:
     return duplicates
 
 
-def _claude_call_ids(path: Path) -> Iterator[str]:
-    for record in _read_jsonl(path):
+def _claude_call_ids(records: Iterable[Mapping[str, object]]) -> Iterator[str]:
+    for record in records:
         message = record.get("message", {})
         if isinstance(message, dict):
             role = message.get("role", "")
@@ -324,19 +514,22 @@ def parse_claude_transcript(
     path: Path | str,
     metadata: Mapping[str, object],
     limits: object = None,
+    *,
+    records: Sequence[Mapping[str, object]] | None = None,
 ) -> NormalizedSession:
     """Normalize Claude JSONL while retaining only durable conversation signal."""
     transcript_path = Path(path)
+    source_records = tuple(_read_jsonl(transcript_path)) if records is None else tuple(records)
     turns = _turn_accumulator(limits)
     tool_names: dict[str, str | None] = {
         call_id: None
-        for call_id in _duplicate_call_ids(_claude_call_ids(transcript_path))
+        for call_id in _duplicate_call_ids(_claude_call_ids(source_records))
     }
     fallback_session_id = ""
     fallback_cwd = ""
     fallback_timestamp = ""
 
-    for record in _read_jsonl(transcript_path):
+    for record in source_records:
         if not fallback_session_id:
             fallback_session_id = (
                 _nonempty_string(record.get("sessionId"))
@@ -555,8 +748,8 @@ def _codex_subagent_turn(value: object, timestamp: str | None) -> Turn | None:
     )
 
 
-def _codex_call_ids(path: Path) -> Iterator[str]:
-    for record in _read_jsonl(path):
+def _codex_call_ids(records: Iterable[Mapping[str, object]]) -> Iterator[str]:
+    for record in records:
         payload = record.get("payload", {})
         if record.get("type") != "response_item" or not isinstance(payload, dict):
             continue
@@ -574,18 +767,21 @@ def parse_codex_transcript(
     path: Path | str,
     metadata: Mapping[str, object],
     limits: object = None,
+    *,
+    records: Sequence[Mapping[str, object]] | None = None,
 ) -> NormalizedSession:
     """Normalize Codex JSONL without retaining hidden or routine tool traffic."""
     transcript_path = Path(path)
+    source_records = tuple(_read_jsonl(transcript_path)) if records is None else tuple(records)
     session_meta: dict = {}
     session_meta_timestamp = ""
     calls: dict[str, str | None] = {
         call_id: None
-        for call_id in _duplicate_call_ids(_codex_call_ids(transcript_path))
+        for call_id in _duplicate_call_ids(_codex_call_ids(source_records))
     }
     turns = _turn_accumulator(limits)
 
-    for record in _read_jsonl(transcript_path):
+    for record in source_records:
         record_type = record.get("type")
         payload = record.get("payload", {})
         if record_type == "session_meta" and isinstance(payload, dict) and not session_meta:
