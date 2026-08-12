@@ -94,6 +94,7 @@ class MemoryWorker:
         jitter: Callable[[], float] = random.random,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         heartbeat_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        concurrency: int = 1,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -101,6 +102,8 @@ class MemoryWorker:
             raise ValueError("provider_timeout_seconds must be positive")
         if max_idle_sleep_seconds <= 0:
             raise ValueError("max_idle_sleep_seconds must be positive")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be positive")
         if (router is None) == (router_factory is None):
             raise ValueError("provide exactly one of router or router_factory")
         self.queue = queue
@@ -120,6 +123,8 @@ class MemoryWorker:
         self.jitter = jitter
         self.sleeper = sleeper
         self.heartbeat_sleeper = heartbeat_sleeper
+        self.concurrency = concurrency
+        self._writer_lock = asyncio.Lock()
 
     def _now(self) -> datetime:
         value = self.clock()
@@ -200,6 +205,56 @@ class MemoryWorker:
         if inspect.isawaitable(outcome):
             await outcome
 
+    async def _record_attempt(self, job_id: int, attempt: ProviderResult) -> None:
+        async with self._writer_lock:
+            self.queue.record_attempt(job_id, attempt)
+
+    async def _run_serialized_with_lease(
+        self,
+        job_id: int,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object:
+        async def serialized() -> object:
+            async with self._writer_lock:
+                return await operation()
+
+        return await self._run_with_lease(job_id, serialized())
+
+    async def _complete_success(
+        self,
+        job: Job,
+        text: str,
+        attempts: tuple[ProviderResult, ...],
+    ) -> None:
+        async def write_and_complete() -> None:
+            self._require_lease(job.id)
+            for attempt in attempts:
+                self.queue.record_attempt(job.id, attempt)
+            await self._write(job, text)
+            self._require_lease(job.id)
+            self.queue.complete(job.id, self.owner)
+
+        await self._run_serialized_with_lease(job.id, write_and_complete)
+
+    async def _retry_failure(
+        self,
+        job: Job,
+        reason: str,
+        attempts: tuple[ProviderResult, ...] = (),
+    ) -> None:
+        async def retry() -> None:
+            self._require_lease(job.id)
+            for attempt in attempts:
+                self.queue.record_attempt(job.id, attempt)
+            self.queue.retry(
+                job.id,
+                self.owner,
+                reason,
+                self._retry_at(job),
+            )
+
+        await self._run_serialized_with_lease(job.id, retry)
+
     async def process(self, job: Job) -> None:
         try:
             request = TextRequest(
@@ -213,27 +268,18 @@ class MemoryWorker:
             eagerly_persisted = self.router_factory is not None
             if self.router_factory is not None:
                 router = self.router_factory(
-                    lambda attempt: self.queue.record_attempt(job.id, attempt)
+                    lambda attempt: self._record_attempt(job.id, attempt)
                 )
             else:
                 router = self.router
             result = await self._run_with_lease(job.id, router.generate_text(request))
-            if not eagerly_persisted:
-                for attempt in result.attempts:
-                    self.queue.record_attempt(job.id, attempt)
+            attempts = () if eagerly_persisted else result.attempts
             if result.outcome != "success":
-                self._require_lease(job.id)
-                self.queue.retry(
-                    job.id,
-                    self.owner,
-                    self._failure_reason(result),
-                    self._retry_at(job),
+                await self._retry_failure(
+                    job, self._failure_reason(result), attempts
                 )
                 return
-            self._require_lease(job.id)
-            await self._run_with_lease(job.id, self._write(job, result.text))
-            self._require_lease(job.id)
-            self.queue.complete(job.id, self.owner)
+            await self._complete_success(job, result.text, attempts)
         except LeaseLostError:
             return
         except asyncio.CancelledError:
@@ -241,21 +287,35 @@ class MemoryWorker:
         except Exception as exc:
             current = self.queue.get_job(job.id)
             if current.status == "leased" and current.lease_owner == self.owner:
-                self.queue.retry(
-                    job.id,
-                    self.owner,
-                    str(exc) or type(exc).__name__,
-                    self._retry_at(current),
-                )
+                try:
+                    await self._retry_failure(
+                        current, str(exc) or type(exc).__name__
+                    )
+                except LeaseLostError:
+                    return
 
     async def _drain(self, release_if_idle: Callable[[], None] | None) -> int:
         processed = 0
-        while True:
-            self.queue.recover_stale(self._now())
-            job = self.queue.claim_next(
-                self.owner, self._now(), self.lease_seconds
-            )
-            if job is None:
+        active: set[asyncio.Task[None]] = set()
+        try:
+            while True:
+                self.queue.recover_stale(self._now())
+                while len(active) < self.concurrency:
+                    job = self.queue.claim_next(
+                        self.owner, self._now(), self.lease_seconds
+                    )
+                    if job is None:
+                        break
+                    active.add(asyncio.create_task(self.process(job)))
+                if active:
+                    done, active = await asyncio.wait(
+                        active, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        await task
+                        processed += 1
+                    continue
+
                 wake_at = self.queue.next_wake_at()
                 if wake_at is None:
                     if release_if_idle is None:
@@ -265,9 +325,12 @@ class MemoryWorker:
                     continue
                 delay = max(0.0, (wake_at - self._now()).total_seconds())
                 await self.sleeper(min(delay, self.max_idle_sleep_seconds))
-                continue
-            await self.process(job)
-            processed += 1
+        finally:
+            for task in active:
+                task.cancel()
+            for task in active:
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
 
     async def drain(self) -> int:
         return await self._drain(None)
@@ -296,6 +359,7 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
         lock_path=config.root_dir / "scripts" / "memory-worker.lock",
         lease_seconds=config.job_timeout_seconds + 120,
         provider_timeout_seconds=config.job_timeout_seconds,
+        concurrency=config.worker_concurrency,
     )
     return worker, repository
 

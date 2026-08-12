@@ -367,7 +367,7 @@ Codex hook ----/                                           |
                                       daily/ + knowledge/ + log + marker + state
 ```
 
-Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Live capture uses one singleton worker with a serialized queue drain. Only historical import's explicit `--concurrency N` option bounds parallel transcript parsing and provider work. All durable knowledge-base mutations—daily appends, validated staged applies, markers, state, and usage bookkeeping—remain serialized by the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes use their own safety boundaries. Models never write directly to the real knowledge root.
+Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Live capture uses one singleton worker process with bounded concurrent provider work; provider-attempt persistence, job completion/retry transitions, and daily writes serialize within that process. Historical import's explicit `--concurrency N` option separately bounds parallel transcript parsing and provider work. All durable knowledge-base mutations—daily appends, validated staged applies, markers, state, and usage bookkeeping—remain serialized by the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes use their own safety boundaries. Models never write directly to the real knowledge root.
 
 ## Configuration and Subscription Authentication
 
@@ -383,11 +383,11 @@ Capture, model execution, and durable writes are separate boundaries. Hooks perf
 | `AI_MEMORY_CLAUDE_MODEL` | `claude-sonnet-5` | Claude subscription fallback |
 | `AI_MEMORY_JOB_TIMEOUT_SECONDS` | `900` | Provider attempt timeout |
 | `AI_MEMORY_QUEUE_PATH` | `$AI_MEMORY_HOME/scripts/jobs.sqlite3` | Absolute queue path |
-| `AI_MEMORY_WORKER_CONCURRENCY` | `2` | Reserved; parsed but not consumed by the live worker |
+| `AI_MEMORY_WORKER_CONCURRENCY` | `2` | Concurrent live-worker provider jobs; durable writes serialize |
 | `AI_MEMORY_INTERNAL_JOB` | unset | Recursion guard for provider children |
 | `AI_MEMORY_USAGE_ESTIMATE_ONLY` | `0` | Advisory usage estimation mode |
 
-Each Codex attempt runs `codex login status`. It proceeds only when the command exits zero and stdout contains `Logged in using ChatGPT`. API-key login, unknown status, a missing CLI, timeout, or nonzero exit rejects Codex and records a fallback reason. The provider never logs in automatically.
+Each Codex attempt first runs the bounded `codex --version` preflight and requires version 0.146.1 or newer, then runs `codex login status`. It proceeds only when the commands exit zero and the login output contains the exact `Logged in using ChatGPT` status without a competing login mode. An old or malformed version, API-key login, unknown status, missing CLI, timeout, truncated output, or nonzero exit rejects Codex and records a fallback reason. The provider never logs in automatically.
 
 Both providers receive a minimal child environment with `OPENAI_*`, `AZURE_OPENAI_*`, `ANTHROPIC_API_KEY`, and `CLAUDE_API_KEY` removed. Codex text jobs run ephemeral, read-only, and noninteractive. Workspace jobs run ephemeral with write access confined to a disposable stage. The implementation never uses OpenAI Platform API billing or a sandbox-bypass flag.
 
@@ -443,7 +443,7 @@ Capacity and usage limits are subscription constraints, not dollar balances. The
 
 `scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs` plus `provider_attempts`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
 
-Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one serialized live worker own the queue drain. A later worker exits successfully when another healthy worker owns it. `AI_MEMORY_WORKER_CONCURRENCY` is reserved configuration: the loader validates it, but the live worker does not consume it. Historical import uses `--concurrency N` to bound parallel parsing and provider work; its durable knowledge-base mutations still serialize through the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes retain their separate transaction, permission, atomic-file, and lock boundaries.
+Claims use short immediate transactions. A worker renews each lease while its provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one live worker process own the queue drain; a later worker exits successfully when another healthy worker owns it. Within the owner process, `AI_MEMORY_WORKER_CONCURRENCY` bounds concurrent provider jobs (default `2`), while attempt persistence, terminal queue transitions, and daily writes serialize. Historical import uses its separate `--concurrency N` bound for parallel parsing and provider work. Durable knowledge-base mutations still serialize through the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes retain their separate transaction, permission, atomic-file, and lock boundaries.
 
 Queue inspection is read-only:
 

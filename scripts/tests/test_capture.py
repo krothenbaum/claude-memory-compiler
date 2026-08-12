@@ -884,9 +884,19 @@ def routed(*attempts):
     )
 
 
-def enqueue_capture_job(repository, tmp_path):
-    source = tmp_path / "source.jsonl"
-    write_claude_transcript(source)
+def enqueue_capture_job(repository, tmp_path, *, session_id="session-1"):
+    source = tmp_path / f"source-{session_id}.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "cwd": "/tmp/project",
+                "message": {"role": "user", "content": "Remember the queue"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return capture_transcript(
         source,
         source_agent="claude",
@@ -896,6 +906,206 @@ def enqueue_capture_job(repository, tmp_path):
         launcher=lambda _: None,
         clock=lambda: NOW,
     )
+
+
+def test_worker_bounds_parallel_model_jobs_and_serializes_durable_writes(tmp_path):
+    async def exercise(repository):
+        for index in range(3):
+            enqueue_capture_job(repository, tmp_path, session_id=f"session-{index}")
+
+        provider_active = 0
+        provider_max = 0
+        provider_started = asyncio.Event()
+        release_provider = asyncio.Event()
+        writer_active = 0
+        writer_max = 0
+
+        class BlockingRouter:
+            async def generate_text(self, _request):
+                nonlocal provider_active, provider_max
+                provider_active += 1
+                provider_max = max(provider_max, provider_active)
+                if provider_active == 2:
+                    provider_started.set()
+                await release_provider.wait()
+                provider_active -= 1
+                result = ProviderResult(
+                    "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+                )
+                return routed(result)
+
+        async def observed_writer(_job, _text):
+            nonlocal writer_active, writer_max
+            writer_active += 1
+            writer_max = max(writer_max, writer_active)
+            await asyncio.sleep(0.01)
+            writer_active -= 1
+
+        worker = MemoryWorker(
+            repository,
+            BlockingRouter(),
+            concurrency=2,
+            daily_writer=observed_writer,
+            clock=lambda: NOW,
+            owner="worker",
+            heartbeat_sleeper=lambda _delay: asyncio.sleep(3600),
+        )
+        draining = asyncio.create_task(worker.drain())
+        await asyncio.wait_for(provider_started.wait(), timeout=0.5)
+        await asyncio.sleep(0)
+        assert provider_active == 2
+        assert provider_max == 2
+        release_provider.set()
+
+        assert await asyncio.wait_for(draining, timeout=1) == 3
+        assert provider_max == 2
+        assert writer_max == 1
+        assert all(
+            repository.get_job(job_id).status == "succeeded"
+            for job_id in range(1, 4)
+        )
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        asyncio.run(exercise(repository))
+
+
+def test_worker_rejects_nonpositive_concurrency(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        with pytest.raises(ValueError, match="concurrency must be positive"):
+            MemoryWorker(repository, FakeRouter(None), concurrency=0)
+
+
+def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypatch):
+    import worker as worker_module
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(
+        root_dir=tmp_path,
+        queue_path=tmp_path / "jobs.sqlite3",
+        task_models={},
+        claude_model="claude-test",
+        job_timeout_seconds=30,
+        worker_concurrency=3,
+    )
+    repository = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(worker_module, "load_config", lambda _env: config)
+    monkeypatch.setattr(worker_module, "recover_incomplete_apply", lambda _root: None)
+    monkeypatch.setattr(worker_module, "QueueRepository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(worker_module, "CodexProvider", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(worker_module, "ClaudeProvider", lambda **_kwargs: SimpleNamespace())
+
+    configured, returned_repository = worker_module._default_worker()
+
+    assert configured.concurrency == 3
+    assert returned_repository is repository
+
+
+def test_cancelling_concurrent_drain_cancels_every_inflight_provider(tmp_path):
+    async def exercise(repository):
+        for index in range(2):
+            enqueue_capture_job(repository, tmp_path, session_id=f"cancel-{index}")
+        started = asyncio.Event()
+        active = 0
+        cancelled = []
+
+        class HangingRouter:
+            async def generate_text(self, _request):
+                nonlocal active
+                active += 1
+                if active == 2:
+                    started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.append(True)
+                    raise
+
+        worker = MemoryWorker(
+            repository,
+            HangingRouter(),
+            concurrency=2,
+            daily_writer=lambda *_args: None,
+            clock=lambda: NOW,
+            owner="worker",
+            heartbeat_sleeper=lambda _delay: asyncio.sleep(3600),
+        )
+        draining = asyncio.create_task(worker.drain())
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        draining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+
+        assert cancelled == [True, True]
+        assert [repository.get_job(job_id).status for job_id in (1, 2)] == [
+            "leased",
+            "leased",
+        ]
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        asyncio.run(exercise(repository))
+
+
+def test_worker_renews_lease_while_waiting_for_serialized_writer(tmp_path):
+    async def exercise(repository):
+        for index in range(2):
+            enqueue_capture_job(repository, tmp_path, session_id=f"lease-wait-{index}")
+        first_writer_started = asyncio.Event()
+        release_first_writer = asyncio.Event()
+        second_lost_lease = asyncio.Event()
+        writes = []
+        renewal_counts = {1: 0, 2: 0}
+        original_renew = repository.renew
+
+        def renew(job_id, owner, expires_at):
+            renewal_counts[job_id] += 1
+            if job_id == 2 and renewal_counts[job_id] >= 2:
+                second_lost_lease.set()
+                return False
+            return original_renew(job_id, owner, expires_at)
+
+        repository.renew = renew
+
+        class SuccessfulRouter:
+            async def generate_text(self, _request):
+                result = ProviderResult(
+                    "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+                )
+                return routed(result)
+
+        async def blocking_writer(job, _text):
+            writes.append(job.id)
+            if job.id == 1:
+                first_writer_started.set()
+                await release_first_writer.wait()
+
+        async def short_heartbeat(_delay):
+            await asyncio.sleep(0.01)
+
+        worker = MemoryWorker(
+            repository,
+            SuccessfulRouter(),
+            concurrency=2,
+            daily_writer=blocking_writer,
+            clock=lambda: NOW,
+            owner="worker",
+            heartbeat_sleeper=short_heartbeat,
+        )
+        draining = asyncio.create_task(worker.drain())
+        await asyncio.wait_for(first_writer_started.wait(), timeout=0.5)
+        await asyncio.wait_for(second_lost_lease.wait(), timeout=0.5)
+        release_first_writer.set()
+        while repository.get_job(1).status != "succeeded":
+            await asyncio.sleep(0)
+        draining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+
+        assert writes == [1]
+        assert repository.get_job(1).status == "succeeded"
+        assert repository.get_job(2).status == "leased"
+
+    with QueueRepository(tmp_path / "jobs.sqlite3", clock=lambda: NOW) as repository:
+        asyncio.run(exercise(repository))
 
 
 def test_worker_dispatches_success_and_records_every_attempt(tmp_path):
