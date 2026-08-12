@@ -367,7 +367,7 @@ Codex hook ----/                                           |
                                       daily/ + knowledge/ + log + marker + state
 ```
 
-Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Live capture uses one singleton worker with a serialized queue drain. Only historical import's explicit `--concurrency N` option bounds parallel transcript parsing and provider work; all historical and live filesystem writes remain serialized by the writer lock. Models never write directly to the real knowledge root.
+Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Live capture uses one singleton worker with a serialized queue drain. Only historical import's explicit `--concurrency N` option bounds parallel transcript parsing and provider work. All durable knowledge-base mutations—daily appends, validated staged applies, markers, state, and usage bookkeeping—remain serialized by the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes use their own safety boundaries. Models never write directly to the real knowledge root.
 
 ## Configuration and Subscription Authentication
 
@@ -439,7 +439,7 @@ Capacity and usage limits are subscription constraints, not dollar balances. The
 
 `scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs` plus `provider_attempts`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
 
-Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one serialized live worker own the queue drain. A later worker exits successfully when another healthy worker owns it. `AI_MEMORY_WORKER_CONCURRENCY` is reserved configuration: the loader validates it, but the live worker does not consume it. Historical import uses `--concurrency N` to bound parallel parsing and provider work; its filesystem writes still serialize through the writer lock.
+Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one serialized live worker own the queue drain. A later worker exits successfully when another healthy worker owns it. `AI_MEMORY_WORKER_CONCURRENCY` is reserved configuration: the loader validates it, but the live worker does not consume it. Historical import uses `--concurrency N` to bound parallel parsing and provider work; its durable knowledge-base mutations still serialize through the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes retain their separate transaction, permission, atomic-file, and lock boundaries.
 
 Queue inspection is read-only:
 
