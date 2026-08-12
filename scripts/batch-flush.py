@@ -66,7 +66,7 @@ from providers import (
     TextRequest,
 )
 from scripts.queue import QueueRepository
-from utils import ExclusiveFileLock, append_daily_entry
+from utils import ExclusiveFileLock, append_daily_entry, open_secure_log_stream
 from worker import MemoryWorker
 
 DAILY_DIR = ROOT / "daily"
@@ -76,6 +76,8 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 WINDOWS = os.name == "nt"
+LOGGER = logging.getLogger("ai-memory-batch")
+LOGGER.propagate = False
 
 
 def default_transcripts_dir(cwd: Path | None = None) -> Path:
@@ -144,39 +146,6 @@ class _SecureLogHandler(logging.StreamHandler):
             super().close()
 
 
-def _secure_log_handler(path: Path) -> logging.Handler:
-    path = Path(os.path.abspath(path))
-    for directory in (path.parent.parent, path.parent):
-        info = directory.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"log directory must not be a symlink: {directory}")
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError(f"log directory must be a directory: {directory}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise ValueError(f"log directory has an unsafe owner: {directory}")
-    if path.is_symlink():
-        raise ValueError(f"log path must not be a symlink: {path}")
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"log path must be a regular file: {path}")
-        if info.st_nlink != 1:
-            raise ValueError(f"log path must not be hard-linked: {path}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise ValueError(f"log path has an unsafe owner: {path}")
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        elif stat.S_IMODE(info.st_mode) & ~0o600:
-            raise ValueError(f"log path has unsafe permissions: {path}")
-        stream = os.fdopen(descriptor, "a", encoding="utf-8")
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return _SecureLogHandler(stream)
-
-
 def _remove_handlers(logger: logging.Logger, attribute: str) -> None:
     for handler in list(logger.handlers):
         if getattr(handler, attribute, False):
@@ -186,30 +155,30 @@ def _remove_handlers(logger: logging.Logger, attribute: str) -> None:
 
 def configure_logging(*, dry_run: bool) -> None:
     """Configure interactive logging without creating files during imports/dry runs."""
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
     if not any(
         getattr(handler, "_memory_batch_console", False)
-        for handler in root_logger.handlers
+        for handler in LOGGER.handlers
     ):
         console = logging.StreamHandler(sys.stderr)
         console.setLevel(logging.INFO)
         console.setFormatter(logging.Formatter("%(message)s"))
         console._memory_batch_console = True  # type: ignore[attr-defined]
-        root_logger.addHandler(console)
+        LOGGER.addHandler(console)
     tagged = [
         handler
-        for handler in root_logger.handlers
+        for handler in LOGGER.handlers
         if getattr(handler, "_memory_batch_file", False)
     ]
     target = Path(os.path.abspath(LOG_FILE))
     if dry_run:
-        _remove_handlers(root_logger, "_memory_batch_file")
+        _remove_handlers(LOGGER, "_memory_batch_file")
         return
     if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
         return
-    _remove_handlers(root_logger, "_memory_batch_file")
-    file_handler = _secure_log_handler(target)
+    _remove_handlers(LOGGER, "_memory_batch_file")
+    file_handler = _SecureLogHandler(open_secure_log_stream(target))
     file_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s [batch] %(message)s",
@@ -218,7 +187,7 @@ def configure_logging(*, dry_run: bool) -> None:
     )
     file_handler._memory_batch_file = True  # type: ignore[attr-defined]
     file_handler._memory_log_path = str(target)  # type: ignore[attr-defined]
-    root_logger.addHandler(file_handler)
+    LOGGER.addHandler(file_handler)
 
 
 # ── Data classes ─────────────────────────────────────────────────────────
@@ -471,7 +440,7 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
     """Scan all top-level JSONL transcript files (skip subagent files)."""
     results = []
     if not transcripts_dir.exists():
-        logging.error("Transcripts directory not found: %s", transcripts_dir)
+        LOGGER.error("Transcripts directory not found: %s", transcripts_dir)
         return results
 
     for f in transcripts_dir.glob("*.jsonl"):
@@ -1467,14 +1436,14 @@ async def flush_chunk(
     try:
         result = await provider_router.generate_text(request)
     except Exception as exc:
-        logging.exception("Provider router error")
+        LOGGER.exception("Provider router error")
         return f"FLUSH_ERROR: {type(exc).__name__}: {exc}"
     try:
         from usage import record_routed_usage
 
         record_routed_usage(home, result, source_agent=source_agent)
     except (OSError, ValueError):
-        logging.warning("Could not append provider usage record")
+        LOGGER.warning("Could not append provider usage record")
     if result.outcome != "success":
         return f"FLUSH_ERROR: {result.reason or result.outcome}"
     return result.text
@@ -1587,7 +1556,7 @@ async def process_one_project(
 
     transcripts = scan_transcripts(transcripts_dir)
     if not transcripts:
-        logging.info("%sNo transcripts found in %s — skipping", label_prefix, transcripts_dir)
+        LOGGER.info("%sNo transcripts found in %s — skipping", label_prefix, transcripts_dir)
         return starting_cost, False
 
     if args.dates:
@@ -1602,33 +1571,33 @@ async def process_one_project(
     if args.resume:
         before = len(transcripts)
         transcripts = [t for t in transcripts if t.session_id not in processed]
-        logging.info(
+        LOGGER.info(
             "%sResume: skipping %d already-processed sessions",
             label_prefix, before - len(transcripts),
         )
 
     if not transcripts:
-        logging.info("%sNothing to process for [%s]", label_prefix, project_key)
+        LOGGER.info("%sNothing to process for [%s]", label_prefix, project_key)
         return starting_cost, False
 
     dates = sorted(set(t.date for t in transcripts))
 
-    logging.info("")
-    logging.info("%s=== Batch Flush Summary ===", label_prefix)
-    logging.info("%sProject key: %s", label_prefix, project_key)
+    LOGGER.info("")
+    LOGGER.info("%s=== Batch Flush Summary ===", label_prefix)
+    LOGGER.info("%sProject key: %s", label_prefix, project_key)
     if project_cwd:
-        logging.info("%sProject cwd: %s", label_prefix, project_cwd)
-    logging.info("%sTranscripts dir: %s", label_prefix, transcripts_dir)
-    logging.info("%sTotal sessions found: %d", label_prefix, len(transcripts) + len(skipped_tiny))
-    logging.info("%sSkipping %d tiny sessions (<5KB)", label_prefix, len(skipped_tiny))
-    logging.info("%sProcessing: %d sessions across %d dates", label_prefix, len(transcripts), len(dates))
-    logging.info(
+        LOGGER.info("%sProject cwd: %s", label_prefix, project_cwd)
+    LOGGER.info("%sTranscripts dir: %s", label_prefix, transcripts_dir)
+    LOGGER.info("%sTotal sessions found: %d", label_prefix, len(transcripts) + len(skipped_tiny))
+    LOGGER.info("%sSkipping %d tiny sessions (<5KB)", label_prefix, len(skipped_tiny))
+    LOGGER.info("%sProcessing: %d sessions across %d dates", label_prefix, len(transcripts), len(dates))
+    LOGGER.info(
         "%sDate range: %s to %s",
         label_prefix,
         dates[0] if dates else "n/a",
         dates[-1] if dates else "n/a",
     )
-    logging.info("")
+    LOGGER.info("")
 
     total_chunks = 0
     session_plans: list[tuple[TranscriptInfo, int]] = []
@@ -1640,18 +1609,18 @@ async def process_one_project(
         total_chunks += est_chunks
 
         if args.dry_run:
-            logging.info(
+            LOGGER.info(
                 "%s  %s | %s | %6.1fKB | %4d turns | %6dK chars | ~%d chunks",
                 label_prefix, t.date, t.session_id[:8], t.size / 1024, len(turns),
                 total_text // 1000, est_chunks,
             )
 
     est_cost = total_chunks * FLUSH_COST_ESTIMATE
-    logging.info("")
-    logging.info("%sEstimated: %d chunks, ~$%.2f flush cost", label_prefix, total_chunks, est_cost)
+    LOGGER.info("")
+    LOGGER.info("%sEstimated: %d chunks, ~$%.2f flush cost", label_prefix, total_chunks, est_cost)
 
     if args.dry_run:
-        logging.info("%s(dry run — no LLM calls made)", label_prefix)
+        LOGGER.info("%s(dry run — no LLM calls made)", label_prefix)
         return starting_cost, False
 
     # Process sessions
@@ -1662,26 +1631,26 @@ async def process_one_project(
 
     for t, _est_chunks in session_plans:
         if args.max_cost and cumulative_cost >= args.max_cost:
-            logging.info(
+            LOGGER.info(
                 "%sCost limit reached ($%.2f >= $%.2f), stopping",
                 label_prefix, cumulative_cost, args.max_cost,
             )
             halted = True
             break
 
-        logging.info("")
-        logging.info("%sProcessing session %s (%s, %.1fKB)...",
+        LOGGER.info("")
+        LOGGER.info("%sProcessing session %s (%s, %.1fKB)...",
                      label_prefix, t.session_id[:8], t.date, t.size / 1024)
 
         turns = extract_full_conversation(t.path)
         if not turns:
-            logging.info("%s  No text turns found, skipping", label_prefix)
+            LOGGER.info("%s  No text turns found, skipping", label_prefix)
             continue
 
         tool_summary = extract_tool_summary(t.path, project_cwd)
         chunks = chunk_conversation(turns)
 
-        logging.info("%s  %d turns, %d chunks", label_prefix, len(turns), len(chunks))
+        LOGGER.info("%s  %d turns, %d chunks", label_prefix, len(turns), len(chunks))
 
         for i, chunk in enumerate(chunks):
             chunk_num += 1
@@ -1697,7 +1666,7 @@ async def process_one_project(
                 meta_parts.append(f"Tool activity: {tool_summary}")
             session_meta = "\n".join(meta_parts)
 
-            logging.info(
+            LOGGER.info(
                 "%s  [%d/%d] Flushing chunk %d/%d (%s, %dK chars) — $%.2f spent",
                 label_prefix, chunk_num, total_chunks, i + 1, len(chunks),
                 chunk.position, chunk.char_count // 1000, cumulative_cost,
@@ -1736,17 +1705,17 @@ async def process_one_project(
         e for e in all_extractions
         if "FLUSH_OK" not in e.content and "FLUSH_ERROR" not in e.content
     ]
-    logging.info("")
-    logging.info("%s=== Writing Daily Logs ===", label_prefix)
-    logging.info(
+    LOGGER.info("")
+    LOGGER.info("%s=== Writing Daily Logs ===", label_prefix)
+    LOGGER.info(
         "%sTotal extractions: %d (%d meaningful)",
         label_prefix, len(all_extractions), len(meaningful),
     )
 
     written = write_daily_logs(all_extractions, project_key, project_cwd)
-    logging.info("%sWrote %d daily log files", label_prefix, len(written))
+    LOGGER.info("%sWrote %d daily log files", label_prefix, len(written))
     for p in written:
-        logging.info("%s  %s", label_prefix, p.name)
+        LOGGER.info("%s  %s", label_prefix, p.name)
 
     return cumulative_cost, halted
 
@@ -1759,7 +1728,7 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
     if args.source in {"claude", "all"}:
         if args.all_projects:
             if args.transcripts_dir or args.project_cwd or args.project_key:
-                logging.warning(
+                LOGGER.warning(
                     "--all-projects ignores --transcripts-dir/--project-cwd/--project-key"
                 )
             targets = discover_all_projects()
@@ -1776,11 +1745,11 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
         discovery = discover_codex_sessions(codex_root, concurrency=args.concurrency)
         sessions.extend(discovery.sessions)
         for path in discovery.malformed:
-            logging.warning("Skipping malformed Codex transcript: %s", path)
+            LOGGER.warning("Skipping malformed Codex transcript: %s", path)
         for path in discovery.duplicates:
-            logging.info("Skipping duplicate Codex transcript: %s", path)
+            LOGGER.info("Skipping duplicate Codex transcript: %s", path)
         for path in discovery.date_disagreements:
-            logging.warning("Codex transcript timestamp disagrees with directory date: %s", path)
+            LOGGER.warning("Codex transcript timestamp disagrees with directory date: %s", path)
 
     config = load_config(os.environ)
     report = await execute_historical_import(
@@ -1790,11 +1759,11 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
     )
 
     if args.compile and not args.dry_run and not report.failed and not report.dead:
-        logging.info("")
-        logging.info("=== Triggering Compilation ===")
+        LOGGER.info("")
+        LOGGER.info("=== Triggering Compilation ===")
         import subprocess
         cmd = ["uv", "run", "--directory", str(ROOT), "python", str(SCRIPTS_DIR / "compile.py"), "--all"]
-        logging.info("Running: %s", " ".join(cmd))
+        LOGGER.info("Running: %s", " ".join(cmd))
         subprocess.run(cmd, cwd=str(ROOT))
     return report
 

@@ -23,6 +23,7 @@ import pytest
 
 from providers import ProviderResult, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
+from scripts import utils as memory_utils
 
 
 def load_batch_flush():
@@ -158,11 +159,11 @@ def subprocess_environment(memory_home: Path, environment_root: Path) -> dict[st
 
 
 def close_tagged_handlers(attribute: str) -> None:
-    root_logger = logging.getLogger()
-    for handler in list(root_logger.handlers):
-        if getattr(handler, attribute, False):
-            root_logger.removeHandler(handler)
-            handler.close()
+    for logger in (logging.getLogger(), logging.getLogger("ai-memory-batch")):
+        for handler in list(logger.handlers):
+            if getattr(handler, attribute, False):
+                logger.removeHandler(handler)
+                handler.close()
 
 
 def test_subprocess_environment_is_minimal_and_scrubs_provider_credentials(
@@ -841,27 +842,27 @@ def test_batch_logging_switches_normal_dry_normal_without_duplicate_file_handler
     try:
         batch.configure_logging(dry_run=False)
         batch.configure_logging(dry_run=False)
-        logging.getLogger().info("normal-before-dry")
+        batch.LOGGER.info("normal-before-dry")
         assert sum(
             bool(getattr(handler, "_memory_batch_file", False))
-            for handler in logging.getLogger().handlers
+            for handler in batch.LOGGER.handlers
         ) == 1
         before_dry = log_path.read_bytes()
 
         batch.configure_logging(dry_run=True)
-        logging.getLogger().info("must-stay-console-only")
+        batch.LOGGER.info("must-stay-console-only")
         assert log_path.read_bytes() == before_dry
         assert not any(
             getattr(handler, "_memory_batch_file", False)
-            for handler in logging.getLogger().handlers
+            for handler in batch.LOGGER.handlers
         )
 
         batch.configure_logging(dry_run=False)
         batch.configure_logging(dry_run=False)
-        logging.getLogger().info("normal-after-dry")
+        batch.LOGGER.info("normal-after-dry")
         assert sum(
             bool(getattr(handler, "_memory_batch_file", False))
-            for handler in logging.getLogger().handlers
+            for handler in batch.LOGGER.handlers
         ) == 1
         contents = log_path.read_text(encoding="utf-8")
         assert contents.count("normal-before-dry") == 1
@@ -869,6 +870,41 @@ def test_batch_logging_switches_normal_dry_normal_without_duplicate_file_handler
         assert "must-stay-console-only" not in contents
     finally:
         close_tagged_handlers("_memory_batch_file")
+
+
+def test_batch_dry_logging_does_not_reach_flush_or_host_file_handlers(
+    batch, tmp_path, monkeypatch
+):
+    import scripts.flush as flush_module
+
+    flush_log = tmp_path / "flush" / "scripts" / "flush.log"
+    batch_log = tmp_path / "batch" / "scripts" / "batch.log"
+    host_log = tmp_path / "host.log"
+    flush_log.parent.mkdir(parents=True)
+    batch_log.parent.mkdir(parents=True)
+    monkeypatch.setattr(flush_module, "LOG_FILE", flush_log)
+    monkeypatch.setattr(batch, "LOG_FILE", batch_log)
+    host_handler = logging.FileHandler(host_log, encoding="utf-8")
+    logging.getLogger().addHandler(host_handler)
+    close_tagged_handlers("_memory_flush_file")
+    try:
+        flush_module.configure_logging()
+        logging.getLogger().warning("host-before-batch")
+        host_before = host_log.read_bytes()
+        flush_before = flush_log.read_bytes()
+
+        batch.configure_logging(dry_run=True)
+        batch.LOGGER.info("batch-dry-only")
+
+        assert host_log.read_bytes() == host_before
+        assert flush_log.read_bytes() == flush_before
+        assert not batch_log.exists()
+        assert batch.LOGGER.propagate is False
+    finally:
+        close_tagged_handlers("_memory_flush_file")
+        close_tagged_handlers("_memory_batch_file")
+        logging.getLogger().removeHandler(host_handler)
+        host_handler.close()
 
 
 def test_flush_logging_is_explicit_idempotent_and_replaces_stale_path(
@@ -1059,6 +1095,49 @@ def test_loggers_reject_symlinked_scripts_directory_without_external_mutation(
         assert metadata_manifest(external_root) == before
     finally:
         close_tagged_handlers(attribute)
+
+
+def test_secure_log_open_pins_scripts_directory_before_final_open(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    outside_before = metadata_manifest(outside)
+    real_open = memory_utils.os.open
+    swapped = False
+
+    def swap_before_final_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "scripts" and dir_fd is not None and not swapped:
+            scripts.rename(root / "scripts-pinned")
+            scripts.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(memory_utils.os, "open", swap_before_final_open)
+    monkeypatch.setattr(
+        memory_utils.os,
+        "supports_dir_fd",
+        {*memory_utils.os.supports_dir_fd, swap_before_final_open},
+    )
+
+    stream = memory_utils.open_secure_log_stream(root / "scripts" / "flush.log")
+    try:
+        stream.write("safe\n")
+        stream.flush()
+    finally:
+        stream.close()
+
+    assert swapped
+    assert metadata_manifest(outside) == outside_before
+    assert not (outside / "flush.log").exists()
+    assert (root / "scripts-pinned" / "flush.log").read_text() == "safe\n"
 
 
 @pytest.mark.parametrize("artifact", ["missing", "corrupt-db", "corrupt-state"])

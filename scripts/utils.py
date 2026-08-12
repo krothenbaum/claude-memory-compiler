@@ -111,6 +111,115 @@ def _fsync_directory(path: Path | str) -> None:
         os.close(descriptor)
 
 
+def _validate_log_directory(info: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"log directory must be a non-symlink directory: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"log directory has an unsafe owner: {path}")
+
+
+def _validate_log_file(info: os.stat_result, path: Path) -> None:
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"log path must be a regular non-symlink file: {path}")
+    if info.st_nlink != 1:
+        raise ValueError(f"log path must not be hard-linked: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"log path has an unsafe owner: {path}")
+
+
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _open_secure_log_fallback(path: Path):
+    """Open an existing log when directory-relative no-follow opens are unavailable."""
+    root = path.parent.parent
+    scripts = path.parent
+    root_before = root.lstat()
+    scripts_before = scripts.lstat()
+    _validate_log_directory(root_before, root)
+    _validate_log_directory(scripts_before, scripts)
+    if not path.exists() or path.is_symlink():
+        raise ValueError("secure log creation requires directory-relative no-follow opens")
+    file_before = path.lstat()
+    _validate_log_file(file_before, path)
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        opened = os.fstat(descriptor)
+        _validate_log_file(opened, path)
+        if not _same_file_identity(file_before, opened):
+            raise ValueError(f"log path identity changed while opening: {path}")
+        root_after = root.lstat()
+        scripts_after = scripts.lstat()
+        _validate_log_directory(root_after, root)
+        _validate_log_directory(scripts_after, scripts)
+        if not _same_file_identity(root_before, root_after) or not _same_file_identity(
+            scripts_before, scripts_after
+        ):
+            raise ValueError(f"log directory identity changed while opening: {scripts}")
+        if stat.S_IMODE(opened.st_mode) & ~0o600:
+            raise ValueError(f"log path has unsafe permissions: {path}")
+        stream = os.fdopen(descriptor, "a", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return stream
+
+
+def open_secure_log_stream(path: Path | str):
+    """Open an owner-controlled append log without path-following races."""
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    supports_dir_fd = os.open in getattr(os, "supports_dir_fd", set())
+    if not (nofollow and directory and supports_dir_fd):
+        return _open_secure_log_fallback(target)
+
+    root = target.parent.parent
+    root_descriptor = os.open(root, os.O_RDONLY | directory | nofollow)
+    scripts_descriptor: int | None = None
+    log_descriptor: int | None = None
+    try:
+        _validate_log_directory(os.fstat(root_descriptor), root)
+        try:
+            scripts_descriptor = os.open(
+                target.parent.name,
+                os.O_RDONLY | directory | nofollow,
+                dir_fd=root_descriptor,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"log directory must be a non-symlink directory: {target.parent}"
+            ) from exc
+        _validate_log_directory(os.fstat(scripts_descriptor), target.parent)
+        try:
+            log_descriptor = os.open(
+                target.name,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | nofollow,
+                0o600,
+                dir_fd=scripts_descriptor,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"log path must be a regular non-symlink file: {target}"
+            ) from exc
+        info = os.fstat(log_descriptor)
+        _validate_log_file(info, target)
+        if hasattr(os, "fchmod"):
+            os.fchmod(log_descriptor, 0o600)
+        elif stat.S_IMODE(info.st_mode) & ~0o600:
+            raise ValueError(f"log path has unsafe permissions: {target}")
+        stream = os.fdopen(log_descriptor, "a", encoding="utf-8")
+        log_descriptor = None
+        return stream
+    finally:
+        if log_descriptor is not None:
+            os.close(log_descriptor)
+        if scripts_descriptor is not None:
+            os.close(scripts_descriptor)
+        os.close(root_descriptor)
+
+
 class ExclusiveFileLock:
     """Owner-only cross-platform advisory file lock.
 

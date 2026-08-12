@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import sys
-import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +28,12 @@ STATE_FILE = SCRIPTS_DIR / "last-flush.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
-from utils import append_daily_entry, notify_terminal, _resolve_tty_path  # noqa: E402
+from utils import (  # noqa: E402
+    _resolve_tty_path,
+    append_daily_entry,
+    notify_terminal,
+    open_secure_log_stream,
+)
 from config import load_config  # noqa: E402
 from providers import (  # noqa: E402
     ClaudeProvider,
@@ -53,39 +57,6 @@ class _SecureLogHandler(logging.StreamHandler):
             if self.stream is not None and not self.stream.closed:
                 self.stream.close()
             super().close()
-
-
-def _secure_log_handler(path: Path) -> logging.Handler:
-    path = Path(os.path.abspath(path))
-    for directory in (path.parent.parent, path.parent):
-        info = directory.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"log directory must not be a symlink: {directory}")
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError(f"log directory must be a directory: {directory}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise ValueError(f"log directory has an unsafe owner: {directory}")
-    if path.is_symlink():
-        raise ValueError(f"log path must not be a symlink: {path}")
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"log path must be a regular file: {path}")
-        if info.st_nlink != 1:
-            raise ValueError(f"log path must not be hard-linked: {path}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise ValueError(f"log path has an unsafe owner: {path}")
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        elif stat.S_IMODE(info.st_mode) & ~0o600:
-            raise ValueError(f"log path has unsafe permissions: {path}")
-        stream = os.fdopen(descriptor, "a", encoding="utf-8")
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return _SecureLogHandler(stream)
 
 
 def _remove_tagged_handlers(logger: logging.Logger, attribute: str) -> None:
@@ -117,7 +88,7 @@ def configure_logging() -> None:
     if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
         return
     _remove_tagged_handlers(root_logger, "_memory_flush_file")
-    file_handler = _secure_log_handler(target)
+    file_handler = _SecureLogHandler(open_secure_log_stream(target))
     file_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s %(message)s",
