@@ -121,8 +121,6 @@ def main() -> None:
             "compiled_at": prior.get("compiled_at", now),
             "reconciled_at": now,
         }
-        if "cost_usd" not in ingested[log_path.name]:
-            ingested[log_path.name]["cost_usd"] = 0.0
         if needs_marker:
             commit_compiled_bookkeeping(
                 log_path, state, now, state_baseline, log_baseline

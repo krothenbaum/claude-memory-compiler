@@ -12,7 +12,9 @@ from config import QA_DIR, load_config, now_iso
 from providers import (
     ClaudeProvider,
     CodexProvider,
+    ProviderResult,
     ProviderRouter,
+    RoutedResult,
     TaskKind,
     TextRequest,
     WorkspaceRequest,
@@ -197,8 +199,10 @@ async def _file_answer(
         allowed_paths=allowed,
     )
     result = None
+    authoritative_result = None
     try:
         result = await provider_router.edit_workspace(request)
+        authoritative_result = result
         if result.outcome != "success":
             for candidate in [*fallback_holder, stage]:
                 if candidate.root.exists():
@@ -217,8 +221,6 @@ async def _file_answer(
             if stage.root.exists():
                 discard_stage(stage)
             return f"Error querying knowledge base: {exc}"
-        from providers import ProviderResult
-
         failed = ProviderResult(
             provider="codex",
             model=result.model,
@@ -227,6 +229,7 @@ async def _file_answer(
             reason=str(exc),
         )
         retry = await provider_router.edit_workspace(request, codex_attempt=failed)
+        authoritative_result = retry
         if retry.outcome != "success" or not fallback_holder:
             if stage.root.exists():
                 discard_stage(stage)
@@ -236,9 +239,27 @@ async def _file_answer(
             validated = validate_stage(
                 fallback, allowed_paths=allowed, task=TaskKind.FILE_ANSWER
             )
+        except StageValidationError as fallback_error:
+            failed_claude = ProviderResult(
+                provider="claude",
+                model=retry.model,
+                task=TaskKind.FILE_ANSWER,
+                outcome="invalid_output",
+                input_tokens=retry.input_tokens,
+                output_tokens=retry.output_tokens,
+                elapsed_ms=retry.elapsed_ms,
+                reason=str(fallback_error),
+            )
+            authoritative_result = RoutedResult.from_result(
+                failed_claude,
+                (*retry.attempts[:-1], failed_claude),
+                retry.fallback_reason,
+            )
+            return f"Error querying knowledge base: {fallback_error}"
+        try:
             _apply_file_answer_with_state(validated, home)
             return retry.text
-        except (StageValidationError, RetryableApplyError) as fallback_error:
+        except RetryableApplyError as fallback_error:
             return f"Error querying knowledge base: {fallback_error}"
     except Exception as exc:
         for candidate in [*fallback_holder, stage]:
@@ -246,9 +267,9 @@ async def _file_answer(
                 discard_stage(candidate)
         return f"Error querying knowledge base: {exc}"
     finally:
-        if result is not None:
+        if authoritative_result is not None:
             try:
-                record_routed_usage(home, result, source_agent="system")
+                record_routed_usage(home, authoritative_result, source_agent="system")
             except (OSError, ValueError):
                 pass
         for candidate in [*fallback_holder, stage]:

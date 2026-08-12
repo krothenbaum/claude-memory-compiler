@@ -206,8 +206,6 @@ async def compile_daily_log(
             "hash": "pending-transaction",
             "compiled_at": compiled_at,
         }
-        if "cost_usd" not in ingested[log_path.name]:
-            ingested[log_path.name]["cost_usd"] = 0.0
         commit_compiled_bookkeeping(
             log_path, state, compiled_at, state_baseline, log_baseline
         )
@@ -332,8 +330,6 @@ async def compile_daily_log(
         "hash": "pending-transaction",
         "compiled_at": timestamp,
     }
-    if "cost_usd" not in state["ingested"][log_path.name]:
-        state["ingested"][log_path.name]["cost_usd"] = 0.0
     bookkeeping = ApplyBookkeeping(
         compiled_marker_path=log_path.resolve().relative_to(home).as_posix(),
         compiled_marker_baseline=log_baseline,

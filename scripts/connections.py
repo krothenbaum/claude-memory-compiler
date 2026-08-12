@@ -36,6 +36,7 @@ from staging import (
     validate_stage,
 )
 from utils import notify_terminal, read_wiki_index
+from usage import record_routed_usage
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
 CONNECTS_RE = re.compile(r'''["']concepts/([a-z0-9-]+)["']''')
@@ -279,9 +280,23 @@ async def synthesize_connections(
     )
     notify_terminal(f"connections pass started ({len(cands)} candidates)")
     logger.info("Begin connections pass (%d candidates)", len(cands))
+    result = None
+    usage_recorded = False
+
+    def record_usage() -> None:
+        nonlocal usage_recorded
+        if usage_recorded or result is None:
+            return
+        try:
+            record_routed_usage(home, result, source_agent="system")
+        except (OSError, ValueError) as exc:
+            logger.warning("could not append connections usage: %s", exc)
+        usage_recorded = True
+
     try:
         result = await provider_router.edit_workspace(request)
         if result.outcome != "success":
+            record_usage()
             discard_stage(fallback_holder[-1] if fallback_holder else stage)
             return 0.0
         selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
@@ -294,6 +309,7 @@ async def synthesize_connections(
             )
         except StageValidationError as validation_error:
             if result.provider != "codex" or (router is not None and router_factory is None):
+                record_usage()
                 discard_stage(selected)
                 return 0.0
             failed = ProviderResult(
@@ -302,6 +318,7 @@ async def synthesize_connections(
             )
             result = await provider_router.edit_workspace(request, codex_attempt=failed)
             if result.outcome != "success" or not fallback_holder:
+                record_usage()
                 if stage.root.exists():
                     discard_stage(stage)
                 return 0.0
@@ -312,8 +329,10 @@ async def synthesize_connections(
                 task=TaskKind.CONNECTIONS,
                 expected_candidate_count=len(cands),
             )
+        record_usage()
         apply_validated_stage(validated, validated.before, ApplyBookkeeping())
     except Exception as exc:
+        record_usage()
         logger.exception("connections provider failed")
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():

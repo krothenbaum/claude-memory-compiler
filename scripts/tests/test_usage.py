@@ -17,6 +17,7 @@ from transcripts import NormalizedSession, Turn
 import usage
 import utils
 import compile as compile_module
+import connections
 import lint
 import query
 
@@ -62,7 +63,11 @@ def _memory_home(tmp_path: Path) -> Path:
     for relative, content in {
         "AGENTS.md": "# Schema\n",
         "daily/2026-08-11.md": "# Daily\n\nA durable decision.\n",
-        "knowledge/index.md": "# Knowledge Base Index\n",
+        "knowledge/index.md": (
+            "# Knowledge Base Index\n\n"
+            "| Article | Project | Summary | Compiled From | Updated |\n"
+            "|---|---|---|---|---|\n"
+        ),
         "knowledge/log.md": "# Build Log\n",
         "scripts/state.json": '{"ingested":{},"query_count":0,"total_cost":1.25}',
     }.items():
@@ -96,6 +101,39 @@ class _RoutedWorkspace:
 
     async def edit_workspace(self, _request, **_kwargs):
         return self.routed
+
+
+def _write_file_answer(stage: Path) -> None:
+    article = stage / "knowledge/qa/what-changed.md"
+    article.parent.mkdir(parents=True, exist_ok=True)
+    article.write_text(
+        "---\ntitle: Q What changed\nquestion: What changed?\n"
+        "consulted:\n  - concepts/example\nfiled: 2026-08-11\n---\n"
+        "# Q What changed\n\n## Answer\nNothing.\n",
+        encoding="utf-8",
+    )
+    with (stage / "knowledge/index.md").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "| [[qa/what-changed]] | memory | Answer | daily/2026-08-11.md | 2026-08-11 |\n"
+        )
+    with (stage / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\n## [2026-08-11T12:00:00+00:00] query (filed) | what changed\n"
+            "- Filed to: [[qa/what-changed]]\n"
+        )
+
+
+class _ValidCompileRouter:
+    async def edit_workspace(self, request):
+        with (request.cwd / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n## [2026-08-11T12:00:00+00:00] compile | 2026-08-11.md\n"
+                "- Articles created: (none)\n"
+            )
+        attempt = ProviderResult(
+            "codex", "gpt-5.6-terra", request.task, "success", text="done"
+        )
+        return RoutedResult.from_result(attempt, (attempt,), None)
 
 
 def test_legacy_state_round_trip_preserves_unknown_fields_and_costs(tmp_path, monkeypatch):
@@ -470,3 +508,193 @@ def test_compile_bookkeeping_preserves_legacy_ingested_extension_fields(tmp_path
     assert saved["ingested"][daily.name]["legacy_extension"] == "keep"
     assert saved["ingested"][daily.name]["cost_usd"] == 0.52
     assert saved["total_cost"] == 1.25
+
+
+def test_new_compile_bookkeeping_does_not_fabricate_legacy_cost(tmp_path):
+    home = _memory_home(tmp_path)
+    state, baseline = query._state_with_baseline(home)
+
+    asyncio.run(
+        compile_module.compile_daily_log(
+            home / "daily/2026-08-11.md",
+            state,
+            baseline,
+            router=_ValidCompileRouter(),
+            memory_home=home,
+        )
+    )
+
+    saved = json.loads((home / "scripts/state.json").read_text())
+    assert "cost_usd" not in saved["ingested"]["2026-08-11.md"]
+
+
+def test_reconcile_new_entry_does_not_fabricate_legacy_cost(tmp_path, monkeypatch):
+    home = _memory_home(tmp_path)
+    (home / "knowledge/log.md").write_text(
+        "# Build Log\n\n## [2026-08-11T12:00:00+00:00] compile | 2026-08-11.md\n",
+        encoding="utf-8",
+    )
+    module_path = Path(__file__).resolve().parents[1] / "reconcile-state.py"
+    spec = importlib.util.spec_from_file_location("task10_reconcile", module_path)
+    assert spec is not None and spec.loader is not None
+    reconcile = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reconcile)
+    monkeypatch.setattr(reconcile, "DAILY_DIR", home / "daily")
+    monkeypatch.setattr(reconcile, "KNOWLEDGE_DIR", home / "knowledge")
+    monkeypatch.setattr(reconcile, "LOG_MD_PATH", home / "knowledge/log.md")
+    monkeypatch.setattr(reconcile, "load_state_with_baseline", lambda: query._state_with_baseline(home))
+    monkeypatch.setattr("sys.argv", [str(module_path)])
+
+    reconcile.main()
+
+    saved = json.loads((home / "scripts/state.json").read_text())
+    assert "cost_usd" not in saved["ingested"]["2026-08-11.md"]
+
+
+def test_file_back_invalid_codex_stage_records_authoritative_fallback_usage(tmp_path):
+    home = _memory_home(tmp_path)
+
+    class Codex:
+        async def edit_workspace(self, request):
+            (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
+            return ProviderResult(
+                "codex", "gpt-5.6-terra", request.task, "success", text="bad"
+            )
+
+    class Claude:
+        _model = "claude-sonnet-5"
+
+        async def edit_workspace(self, request):
+            _write_file_answer(request.cwd)
+            return ProviderResult(
+                "claude",
+                "claude-sonnet-5",
+                request.task,
+                "success",
+                text="fallback answer",
+                input_tokens=7,
+                output_tokens=3,
+                elapsed_ms=8,
+            )
+
+    def factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(
+            Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory
+        )
+
+    assert asyncio.run(
+        query.run_query(
+            "What changed?",
+            file_back=True,
+            router_factory=factory,
+            memory_home=home,
+        )
+    ) == "fallback answer"
+
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [(record["provider"], record["outcome"]) for record in records] == [
+        ("codex", "invalid_output"),
+        ("claude", "success"),
+    ]
+    assert records[-1]["fallback_reason"].startswith("codex:invalid_output:")
+    assert (records[-1]["input_tokens"], records[-1]["output_tokens"]) == (7, 3)
+
+
+def test_file_back_invalid_claude_fallback_records_authoritative_failure(tmp_path):
+    home = _memory_home(tmp_path)
+
+    class Codex:
+        async def edit_workspace(self, request):
+            (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
+            return ProviderResult("codex", "terra", request.task, "success")
+
+    class Claude:
+        _model = "sonnet"
+
+        async def edit_workspace(self, request):
+            return ProviderResult("claude", "sonnet", request.task, "timeout", reason="slow")
+
+    def factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory)
+
+    answer = asyncio.run(
+        query.run_query("What?", file_back=True, router_factory=factory, memory_home=home)
+    )
+    assert answer.startswith("Error querying knowledge base:")
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [(record["provider"], record["outcome"]) for record in records] == [
+        ("codex", "invalid_output"),
+        ("claude", "timeout"),
+    ]
+
+
+def test_file_back_invalid_successful_claude_stage_records_invalid_output(tmp_path):
+    home = _memory_home(tmp_path)
+
+    class Codex:
+        async def edit_workspace(self, request):
+            (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
+            return ProviderResult("codex", "terra", request.task, "success")
+
+    class Claude:
+        _model = "sonnet"
+
+        async def edit_workspace(self, request):
+            return ProviderResult("claude", "sonnet", request.task, "success")
+
+    def factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory)
+
+    answer = asyncio.run(
+        query.run_query("What?", file_back=True, router_factory=factory, memory_home=home)
+    )
+    assert answer.startswith("Error querying knowledge base:")
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [(record["provider"], record["outcome"]) for record in records] == [
+        ("codex", "invalid_output"),
+        ("claude", "invalid_output"),
+    ]
+
+
+def test_connections_records_authoritative_usage(tmp_path):
+    home = _memory_home(tmp_path)
+    for slug in ("a", "b"):
+        path = home / f"knowledge/concepts/{slug}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ntitle: {slug}\nproject: memory\nsources:\n  - daily/2026-08-11.md\n"
+            "created: 2026-08-11\nupdated: 2026-08-11\n---\n",
+            encoding="utf-8",
+        )
+    attempt = ProviderResult(
+        "codex", "gpt-5.6-terra", TaskKind.CONNECTIONS, "success", text="done"
+    )
+    routed = RoutedResult.from_result(attempt, (attempt,), None)
+
+    class ValidConnectionsRouter:
+        async def edit_workspace(self, request, **_kwargs):
+            with (request.cwd / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n## [2026-08-11T12:00:00+00:00] connections | swanson-pass\n"
+                    "- Candidates evaluated: 1\n"
+                    "- Connections created: none\n"
+                    "- Rejected (co-occurrence / too weak): concepts/a <-> concepts/b - weak\n"
+                )
+            return routed
+
+    asyncio.run(
+        connections.synthesize_connections(
+            [connections.Candidate("a", "b", ["bridge"], 1.0)],
+            router=ValidConnectionsRouter(),
+            memory_home=home,
+        )
+    )
+
+    record = json.loads((home / "scripts/logs/usage.jsonl").read_text().splitlines()[0])
+    assert record["task"] == "connections"
