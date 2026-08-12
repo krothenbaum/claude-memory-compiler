@@ -29,6 +29,26 @@ _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 
 
+def routed_invalid_output(result: RoutedResult, reason: object) -> RoutedResult:
+    """Replace a routed success whose staged output failed host validation."""
+    failed = ProviderResult(
+        provider=result.provider,
+        model=result.model,
+        task=result.task,
+        outcome="invalid_output",
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        elapsed_ms=result.elapsed_ms,
+        reason=str(reason),
+    )
+    attempts = result.attempts
+    if attempts and attempts[-1].provider == result.provider:
+        attempts = (*attempts[:-1], failed)
+    else:
+        attempts = (*attempts, failed)
+    return RoutedResult.from_result(failed, attempts, result.fallback_reason)
+
+
 def _timestamp(value: datetime | str | None) -> str:
     if value is None:
         parsed = datetime.now(timezone.utc)

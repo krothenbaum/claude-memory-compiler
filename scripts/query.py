@@ -14,7 +14,6 @@ from providers import (
     CodexProvider,
     ProviderResult,
     ProviderRouter,
-    RoutedResult,
     TaskKind,
     TextRequest,
     WorkspaceRequest,
@@ -31,7 +30,7 @@ from staging import (
     validate_stage,
 )
 from utils import FileBaseline, read_text_with_baseline
-from usage import record_routed_usage
+from usage import record_routed_usage, routed_invalid_output
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _STATE_UPDATE_ATTEMPTS = 3
@@ -240,21 +239,7 @@ async def _file_answer(
                 fallback, allowed_paths=allowed, task=TaskKind.FILE_ANSWER
             )
         except StageValidationError as fallback_error:
-            failed_claude = ProviderResult(
-                provider="claude",
-                model=retry.model,
-                task=TaskKind.FILE_ANSWER,
-                outcome="invalid_output",
-                input_tokens=retry.input_tokens,
-                output_tokens=retry.output_tokens,
-                elapsed_ms=retry.elapsed_ms,
-                reason=str(fallback_error),
-            )
-            authoritative_result = RoutedResult.from_result(
-                failed_claude,
-                (*retry.attempts[:-1], failed_claude),
-                retry.fallback_reason,
-            )
+            authoritative_result = routed_invalid_output(retry, fallback_error)
             return f"Error querying knowledge base: {fallback_error}"
         try:
             _apply_file_answer_with_state(validated, home)

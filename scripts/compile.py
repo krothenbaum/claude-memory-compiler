@@ -40,7 +40,7 @@ from utils import (
     notify_terminal,
     read_text_with_baseline,
 )
-from usage import record_routed_usage
+from usage import record_routed_usage, routed_invalid_output
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_FILE = Path(__file__).resolve().parent / "compile.log"
@@ -313,7 +313,13 @@ async def compile_daily_log(
                         discard_stage(candidate)
                 return 0.0
             selected = fallback_holder[-1]
-            validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
+            try:
+                validated = validate_stage(
+                    selected, allowed_paths=allowed, task=TaskKind.COMPILE
+                )
+            except StageValidationError as fallback_validation_error:
+                result = routed_invalid_output(result, fallback_validation_error)
+                raise
         record_usage(result)
     except Exception as exc:
         record_usage(locals().get("result"))

@@ -662,6 +662,76 @@ def test_file_back_invalid_successful_claude_stage_records_invalid_output(tmp_pa
     ]
 
 
+@pytest.mark.parametrize("operation", ["compile", "connections"])
+def test_invalid_successful_claude_workspace_records_authoritative_invalid_output(
+    tmp_path, operation
+):
+    home = _memory_home(tmp_path)
+    for slug in ("a", "b"):
+        path = home / f"knowledge/concepts/{slug}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ntitle: {slug}\nproject: memory\nsources:\n  - daily/2026-08-11.md\n"
+            "created: 2026-08-11\nupdated: 2026-08-11\n---\n",
+            encoding="utf-8",
+        )
+
+    class Codex:
+        async def edit_workspace(self, request):
+            (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
+            return ProviderResult("codex", "terra", request.task, "success")
+
+    class Claude:
+        _model = "sonnet"
+
+        async def edit_workspace(self, request):
+            return ProviderResult(
+                "claude",
+                "sonnet",
+                request.task,
+                "success",
+                input_tokens=11,
+                output_tokens=5,
+                elapsed_ms=17,
+            )
+
+    def factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+
+        return ProviderRouter(Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory)
+
+    if operation == "compile":
+        state, baseline = query._state_with_baseline(home)
+        asyncio.run(
+            compile_module.compile_daily_log(
+                home / "daily/2026-08-11.md",
+                state,
+                baseline,
+                router_factory=factory,
+                memory_home=home,
+            )
+        )
+    else:
+        asyncio.run(
+            connections.synthesize_connections(
+                [connections.Candidate("a", "b", [], 1.0)],
+                router_factory=factory,
+                memory_home=home,
+            )
+        )
+
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [(record["provider"], record["outcome"]) for record in records] == [
+        ("codex", "invalid_output"),
+        ("claude", "invalid_output"),
+    ]
+    assert records[-1]["fallback_reason"].startswith("codex:invalid_output:")
+    assert records[-1]["model"] == "sonnet"
+    assert (records[-1]["input_tokens"], records[-1]["output_tokens"]) == (11, 5)
+    assert records[-1]["elapsed_ms"] == 17
+    assert list((home / "scripts/staging").iterdir()) == []
+
+
 def test_connections_records_authoritative_usage(tmp_path):
     home = _memory_home(tmp_path)
     for slug in ("a", "b"):

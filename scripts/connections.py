@@ -36,7 +36,7 @@ from staging import (
     validate_stage,
 )
 from utils import notify_terminal, read_wiki_index
-from usage import record_routed_usage
+from usage import record_routed_usage, routed_invalid_output
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
 CONNECTS_RE = re.compile(r'''["']concepts/([a-z0-9-]+)["']''')
@@ -323,12 +323,16 @@ async def synthesize_connections(
                     discard_stage(stage)
                 return 0.0
             selected = fallback_holder[-1]
-            validated = validate_stage(
-                selected,
-                allowed_paths=allowed,
-                task=TaskKind.CONNECTIONS,
-                expected_candidate_count=len(cands),
-            )
+            try:
+                validated = validate_stage(
+                    selected,
+                    allowed_paths=allowed,
+                    task=TaskKind.CONNECTIONS,
+                    expected_candidate_count=len(cands),
+                )
+            except StageValidationError as fallback_validation_error:
+                result = routed_invalid_output(result, fallback_validation_error)
+                raise
         record_usage()
         apply_validated_stage(validated, validated.before, ApplyBookkeeping())
     except Exception as exc:
