@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 # This must precede imports of the capture/queue modules: those modules can
@@ -31,6 +31,7 @@ MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
 LIVE_TRANSCRIPT_TAIL_BYTES = 1_000_000
+MAX_LIVE_TRANSCRIPT_SCAN_BYTES = 16_000_000
 MAX_LIVE_JSONL_RECORD_BYTES = 500_000
 
 
@@ -111,52 +112,104 @@ def _metadata_prefix(first_record: bytes) -> bytes:
     return json.dumps(preserved, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
-def _bounded_tail(source: Path) -> bytes:
-    """Read a deterministic JSONL tail without retaining a partial first line."""
-    size = source.stat().st_size
+def _validated_jsonl(records: bytes) -> bytes:
+    """Return complete UTF-8 JSON-object records or reject the whole slice."""
+    validated: list[bytes] = []
+    for line in records.splitlines():
+        if not line.strip():
+            continue
+        if len(line) > MAX_LIVE_JSONL_RECORD_BYTES:
+            raise LiveTranscriptRejected(
+                "live transcript contains an oversized JSONL record"
+            )
+        try:
+            text = line.decode("utf-8", errors="strict")
+            record = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise LiveTranscriptRejected(
+                "live transcript contains malformed JSONL"
+            ) from error
+        if not isinstance(record, dict):
+            raise LiveTranscriptRejected(
+                "live transcript JSONL records must be objects"
+            )
+        validated.append(line + b"\n")
+    return b"".join(validated)
+
+
+def _bounded_tail(
+    source: Path,
+    *,
+    size: int,
+    window_bytes: int,
+    metadata_prefix: bytes,
+) -> tuple[bytes, bool]:
+    """Read and validate one deterministic tail window."""
+    start = max(0, size - window_bytes)
     with source.open("rb") as stream:
-        first_record = stream.readline(MAX_LIVE_JSONL_RECORD_BYTES + 1).rstrip(b"\r\n")
-        start = max(0, size - LIVE_TRANSCRIPT_TAIL_BYTES)
         stream.seek(start)
-        tail = stream.read(LIVE_TRANSCRIPT_TAIL_BYTES)
+        tail = stream.read(min(window_bytes, size))
 
     if start:
         boundary = tail.find(b"\n")
         tail = b"" if boundary < 0 else tail[boundary + 1 :]
-        prefix = _metadata_prefix(first_record)
+        prefix = metadata_prefix
     else:
         prefix = b""
+    return prefix + _validated_jsonl(tail), start == 0
 
-    lines = tail.splitlines(keepends=True)
-    for line in lines:
-        record = line.rstrip(b"\r\n")
-        if len(record) > MAX_LIVE_JSONL_RECORD_BYTES:
-            raise LiveTranscriptRejected("live transcript contains an oversized JSONL record")
 
-    # A concurrently written final line is safe only when it is complete JSON.
-    if lines and not lines[-1].endswith((b"\n", b"\r")):
-        try:
-            json.loads(lines[-1])
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            lines.pop()
-    return prefix + b"".join(lines)
+def _write_private_slice(path: Path, payload: bytes, *, durable: bool) -> None:
+    with path.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        if durable:
+            os.fsync(stream.fileno())
 
 
 @contextmanager
-def bounded_transcript_slice(source: Path) -> Iterator[Path]:
-    """Yield an owner-private bounded live JSONL slice and always remove it."""
-    payload = _bounded_tail(source)
+def bounded_transcript_slice(
+    source: Path,
+    previewer: Callable[[Path], object],
+) -> Iterator[tuple[Path, object]]:
+    """Select a semantic tail under a hard 16 MB fail-closed scan budget.
+
+    Windows expand geometrically until the shared normalizer finds a durable
+    turn or the file start is reached. A larger file with no signal in the
+    final 16 MB is pathological live input and is rejected for later recovery.
+    """
+    size = source.stat().st_size
+    with source.open("rb") as stream:
+        first_record = stream.readline(MAX_LIVE_JSONL_RECORD_BYTES + 1).rstrip(
+            b"\r\n"
+        )
+    metadata_prefix = _metadata_prefix(first_record)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix="ai-memory-live-", suffix=".jsonl"
     )
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        yield temporary
+        os.close(descriptor)
+        window = min(LIVE_TRANSCRIPT_TAIL_BYTES, MAX_LIVE_TRANSCRIPT_SCAN_BYTES)
+        while True:
+            payload, reached_start = _bounded_tail(
+                source,
+                size=size,
+                window_bytes=window,
+                metadata_prefix=metadata_prefix,
+            )
+            _write_private_slice(temporary, payload, durable=False)
+            preview = previewer(temporary)
+            if getattr(preview, "turns", ()) or reached_start:
+                _write_private_slice(temporary, payload, durable=True)
+                yield temporary, preview
+                return
+            if window >= MAX_LIVE_TRANSCRIPT_SCAN_BYTES:
+                raise LiveTranscriptRejected(
+                    "no durable signal found within the 16 MB live scan budget"
+                )
+            window = min(window * 2, MAX_LIVE_TRANSCRIPT_SCAN_BYTES)
     except BaseException:
         try:
             os.close(descriptor)
@@ -242,17 +295,28 @@ def main() -> None:
     hook_input.setdefault("project", Path(cwd).name or "unknown")
 
     try:
-        with bounded_transcript_slice(transcript_path) as live_slice:
-            context, turn_count = extract_conversation_context(
-                live_slice,
-                {
-                    "session_id": hook_input.get("session_id", ""),
-                    "cwd": cwd,
-                    "project": hook_input["project"],
-                    "timestamp": hook_input.get("timestamp", ""),
-                    "trigger": "session_end",
-                },
+        metadata = {
+            "session_id": hook_input.get("session_id", ""),
+            "cwd": cwd,
+            "project": hook_input["project"],
+            "timestamp": hook_input.get("timestamp", ""),
+            "trigger": "session_end",
+        }
+
+        def previewer(path: Path):
+            return parse_claude_transcript(
+                path, metadata, limits={"max_turns": MAX_TURNS}
             )
+
+        with bounded_transcript_slice(transcript_path, previewer) as selected:
+            live_slice, preview = selected
+            context = render_turns(preview)
+            if len(context) > MAX_CONTEXT_CHARS:
+                context = context[-MAX_CONTEXT_CHARS:]
+                boundary = context.find("\n**")
+                if boundary > 0:
+                    context = context[boundary + 1 :]
+            turn_count = len(preview.turns)
             if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
                 logger.info("skip: empty or too-short transcript")
                 return

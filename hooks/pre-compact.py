@@ -119,17 +119,28 @@ def main() -> None:
 
     try:
         helpers = _live_capture_helpers()
-        with helpers.bounded_transcript_slice(transcript_path) as live_slice:
-            context, turn_count = extract_conversation_context(
-                live_slice,
-                {
-                    "session_id": hook_input.get("session_id", ""),
-                    "cwd": cwd,
-                    "project": hook_input["project"],
-                    "timestamp": hook_input.get("timestamp", ""),
-                    "trigger": "pre_compact",
-                },
+        metadata = {
+            "session_id": hook_input.get("session_id", ""),
+            "cwd": cwd,
+            "project": hook_input["project"],
+            "timestamp": hook_input.get("timestamp", ""),
+            "trigger": "pre_compact",
+        }
+
+        def previewer(path: Path):
+            return parse_claude_transcript(
+                path, metadata, limits={"max_turns": MAX_TURNS}
             )
+
+        with helpers.bounded_transcript_slice(transcript_path, previewer) as selected:
+            live_slice, preview = selected
+            context = render_turns(preview)
+            if len(context) > MAX_CONTEXT_CHARS:
+                context = context[-MAX_CONTEXT_CHARS:]
+                boundary = context.find("\n**")
+                if boundary > 0:
+                    context = context[boundary + 1 :]
+            turn_count = len(preview.turns)
             if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
                 logger.info("skip: empty or too-short transcript")
                 return

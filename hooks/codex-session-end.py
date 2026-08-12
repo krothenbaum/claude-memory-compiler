@@ -84,18 +84,23 @@ def main() -> None:
 
     try:
         helpers = _live_capture_helpers()
-        with helpers.bounded_transcript_slice(transcript_path) as live_slice:
-            preview = parse_codex_transcript(
-                live_slice,
-                {
-                    "session_id": value.get("session_id", ""),
-                    "cwd": value.get("cwd", ""),
-                    "timestamp": value.get("timestamp", ""),
-                    "project": value.get("project", ""),
-                    "trigger": "session_end",
-                },
+        metadata = {
+            "session_id": value.get("session_id", ""),
+            "cwd": value.get("cwd", ""),
+            "timestamp": value.get("timestamp", ""),
+            "project": value.get("project", ""),
+            "trigger": "session_end",
+        }
+
+        def previewer(path: Path):
+            return parse_codex_transcript(
+                path,
+                metadata,
                 limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
             )
+
+        with helpers.bounded_transcript_slice(transcript_path, previewer) as selected:
+            live_slice, preview = selected
             if not preview.turns:
                 logger.info("skip: empty normalized transcript")
                 return

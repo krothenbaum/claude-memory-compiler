@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 HOOKS = ROOT / "hooks"
@@ -351,6 +353,209 @@ def test_oversized_final_jsonl_record_fails_closed_without_partial_job(tmp_path)
             "session_id": "oversized",
             "transcript_path": str(source),
             "cwd": "/projects/oversized",
+        },
+        memory_home,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0
+    assert elapsed < 3
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "spool").exists()
+    assert list(hook_tmp.iterdir()) == []
+
+
+def _write_signal_before_routine_tail(
+    path: Path,
+    *,
+    agent: str,
+    routine_records: int,
+) -> None:
+    padding = "r" * 60_000
+    with path.open("w", encoding="utf-8") as stream:
+        if agent == "claude":
+            stream.write(
+                json.dumps(
+                    {
+                        "sessionId": "semantic-claude-session",
+                        "cwd": "/projects/semantic-claude",
+                    }
+                )
+                + "\n"
+            )
+            for index in range(5):
+                stream.write(
+                    json.dumps(
+                        {
+                            "message": {
+                                "role": "user" if index % 2 == 0 else "assistant",
+                                "content": f"LAST_DURABLE_SIGNAL_{index}",
+                            }
+                        }
+                    )
+                    + "\n"
+                )
+            routine = {"type": "progress", "data": padding}
+        else:
+            stream.write(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-11T10:15:00Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "semantic-codex-session",
+                            "cwd": "/projects/semantic-codex",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "LAST_DURABLE_SIGNAL_CODEX",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            routine = {
+                "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": padding},
+            }
+        encoded = json.dumps(routine) + "\n"
+        for _ in range(routine_records):
+            stream.write(encoded)
+
+
+def _only_job_payload(memory_home: Path) -> dict[str, object]:
+    database = memory_home / "scripts" / "jobs.sqlite3"
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute("SELECT payload_json FROM jobs").fetchall()
+    assert len(rows) == 1
+    return json.loads(rows[0][0])
+
+
+def test_claude_semantic_tail_expansion_preserves_signal_and_dedup(tmp_path):
+    source = tmp_path / "claude-semantic.jsonl"
+    _write_signal_before_routine_tail(
+        source, agent="claude", routine_records=65
+    )
+    assert source.stat().st_size > 3_700_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+    payload = {
+        "session_id": "semantic-claude-session",
+        "transcript_path": str(source),
+        "cwd": "/projects/semantic-claude",
+    }
+
+    precompact, precompact_elapsed = _run_hook(
+        "pre-compact.py",
+        payload,
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+    session_end, session_end_elapsed = _run_hook(
+        "session-end.py",
+        payload,
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert precompact.returncode == session_end.returncode == 0
+    assert precompact_elapsed < 3
+    assert session_end_elapsed < 3
+    assert len(_job_rows(memory_home)) == 1
+    rendered = _only_job_payload(memory_home)["rendered_context"]
+    assert "LAST_DURABLE_SIGNAL_0" in rendered
+    assert "LAST_DURABLE_SIGNAL_4" in rendered
+    snapshot = _only_job_source_path(memory_home)
+    assert all(
+        isinstance(json.loads(line), dict)
+        for line in snapshot.read_text(encoding="utf-8").splitlines()
+    )
+    assert list(hook_tmp.iterdir()) == []
+
+
+def test_codex_semantic_tail_expansion_preserves_signal_behind_larger_tail(tmp_path):
+    source = tmp_path / "codex-semantic.jsonl"
+    _write_signal_before_routine_tail(
+        source, agent="codex", routine_records=150
+    )
+    assert source.stat().st_size > 8_500_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "codex-session-end.py",
+        {"transcript_path": str(source)},
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 3
+    assert "LAST_DURABLE_SIGNAL_CODEX" in _only_job_payload(memory_home)[
+        "rendered_context"
+    ]
+    snapshot = _only_job_source_path(memory_home)
+    assert snapshot.stat().st_size < 16_100_000
+    assert all(
+        isinstance(json.loads(line), dict)
+        for line in snapshot.read_text(encoding="utf-8").splitlines()
+    )
+    assert list(hook_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "malformed_record",
+    [
+        b'{"malformed":"unterminated"\n',
+        b'{"invalid_utf8":"\xff"}\n',
+        b'{"incomplete_final":',
+    ],
+    ids=["malformed-json", "invalid-utf8", "incomplete-final"],
+)
+def test_malformed_retained_record_fails_closed_without_artifacts(
+    tmp_path, malformed_record
+):
+    source = tmp_path / "malformed-private-name.jsonl"
+    source.write_bytes(
+        json.dumps(
+            {"message": {"role": "user", "content": "VALID_SIGNAL"}}
+        ).encode()
+        + b"\n"
+        + malformed_record
+    )
+    memory_home = tmp_path / "memory"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "malformed",
+            "transcript_path": str(source),
+            "cwd": "/projects/malformed",
         },
         memory_home,
         extra_env={"TMPDIR": str(hook_tmp)},
