@@ -10,11 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import errno
 import os
 from pathlib import Path
 import stat
 import tempfile
 import hashlib
+import re
 from typing import Literal, Mapping
 
 try:
@@ -30,7 +32,8 @@ MAX_USAGE_BYTES = 8 * 1024 * 1024
 MAX_USAGE_LINE_BYTES = 64 * 1024
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
-_ATTEMPT_INDEX: dict[Path, tuple[tuple[int, int, int, int, int], set[tuple[str, int]]]] = {}
+_ATTEMPT_INDEX: dict[Path, tuple[tuple[object, ...], set[tuple[str, int]]]] = {}
+_ARCHIVE_NAME = re.compile(r"usage\.archive-([0-9a-f]{64})\.jsonl\Z")
 
 
 class UnsafeUsagePathError(ValueError):
@@ -313,22 +316,50 @@ def _validate_usage_file(path: Path) -> os.stat_result:
         raise UnsafeUsagePathError("usage log must not be hard-linked")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise UnsafeUsagePathError("usage log has an unsafe owner")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise UnsafeUsagePathError("usage log must be owner-only")
     return info
 
 
-def _log_signature(logs: Path) -> tuple[int, int, int, int, int]:
+def _log_signature(logs: Path) -> tuple[object, ...]:
     directory = logs.stat()
+    archives = tuple(
+        (
+            path.name,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        for path in sorted(logs.glob("usage.archive-*.jsonl"))
+        for info in (_validate_usage_file(path),)
+    )
     active = logs / "usage.jsonl"
     if not active.exists() and not active.is_symlink():
-        return directory.st_ino, directory.st_mtime_ns, 0, 0, 0
-    info = _validate_usage_file(active)
+        active_signature = (0, 0, 0, 0)
+    else:
+        info = _validate_usage_file(active)
+        active_signature = (
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
     return (
         directory.st_ino,
         directory.st_mtime_ns,
-        info.st_ino,
-        info.st_size,
-        info.st_mtime_ns,
+        archives,
+        active_signature,
     )
+
+
+def _read_verified_archive(path: Path) -> bytes:
+    _validate_usage_file(path)
+    matched = _ARCHIVE_NAME.fullmatch(path.name)
+    data = _read_private_log(path)
+    if matched is None or hashlib.sha256(data).hexdigest() != matched.group(1):
+        raise ValueError("usage archive content does not match its filename digest")
+    return data
 
 
 def _indexed_attempts(logs: Path, *, recover_active: bool = False) -> set[tuple[str, int]]:
@@ -339,7 +370,12 @@ def _indexed_attempts(logs: Path, *, recover_active: bool = False) -> set[tuple[
     attempts: set[tuple[str, int]] = set()
     for path in _usage_log_paths(logs):
         _validate_usage_file(path)
-        records, corrupt = _valid_usage_records(_read_private_log(path))
+        data = (
+            _read_verified_archive(path)
+            if path.name.startswith("usage.archive-")
+            else _read_private_log(path)
+        )
+        records, corrupt = _valid_usage_records(data)
         if corrupt:
             if path.name != "usage.jsonl":
                 raise ValueError("usage archive contains malformed JSONL")
@@ -406,6 +442,30 @@ def _recover_usage_unlocked(path: Path, original: bytes) -> bytes:
     return canonical
 
 
+def _quarantine_archive_unlocked(path: Path, data: bytes) -> None:
+    digest = hashlib.sha256(data).hexdigest()
+    quarantine = path.parent / f"usage.corrupt-{digest}.jsonl"
+    _validate_existing_quarantine(quarantine, data)
+    if quarantine.exists():
+        path.unlink()
+    else:
+        os.replace(path, quarantine)
+        quarantine.chmod(0o600)
+    _fsync_directory(path.parent)
+
+
+def _recover_archives_unlocked(logs: Path) -> None:
+    for path in sorted(logs.glob("usage.archive-*.jsonl")):
+        data = _read_private_log(path)
+        try:
+            _read_verified_archive(path)
+            _records, corrupt = _valid_usage_records(data)
+            if corrupt:
+                raise ValueError("usage archive contains malformed JSONL")
+        except ValueError:
+            _quarantine_archive_unlocked(path, data)
+
+
 def _validate_archive(path: Path, expected: bytes) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -447,7 +507,15 @@ def _append_private(path: Path, serialized: bytes) -> None:
             raise UnsafeUsagePathError("usage log has an unsafe owner")
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
-        os.write(descriptor, serialized)
+        remaining = memoryview(serialized)
+        while remaining:
+            try:
+                written = os.write(descriptor, remaining)
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError(errno.EIO, "usage append wrote zero bytes")
+            remaining = remaining[written:]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -506,7 +574,13 @@ def recover_usage_log(memory_home: Path | str) -> Path:
     path = home / "scripts/logs/usage.jsonl"
     if logs is None:
         return path
+    archives = tuple(logs.glob("usage.archive-*.jsonl"))
     if not path.exists() and not path.is_symlink():
+        if archives:
+            with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
+                _prepare_usage_tree(home, create_logs=False)
+                _recover_archives_unlocked(logs)
+                _ATTEMPT_INDEX.pop(logs, None)
         return path
     original = _read_private_log(path)
     records, corrupt = _valid_usage_records(original)
@@ -514,10 +588,11 @@ def recover_usage_log(memory_home: Path | str) -> Path:
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
         for value in records
     )
-    if not corrupt and canonical == original:
+    if not archives and not corrupt and canonical == original:
         return path
     with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
         _prepare_usage_tree(home, create_logs=False)
+        _recover_archives_unlocked(logs)
         original = _read_private_log(path)
         _recover_usage_unlocked(path, original)
         _ATTEMPT_INDEX.pop(logs, None)

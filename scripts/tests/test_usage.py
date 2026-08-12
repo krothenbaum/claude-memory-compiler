@@ -384,7 +384,7 @@ def test_usage_rotation_continues_projection_and_reopen_is_idempotent(
 ):
     home = tmp_path / "memory"
     queue_path = home / "scripts/jobs.sqlite3"
-    monkeypatch.setattr(queue_usage, "MAX_USAGE_BYTES", 700)
+    monkeypatch.setattr(queue_usage, "MAX_USAGE_BYTES", 500)
     with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
         job_id = repository.enqueue_capture(_session(home)).job_id
         for _ in range(8):
@@ -405,6 +405,98 @@ def test_usage_rotation_continues_projection_and_reopen_is_idempotent(
         pass
     after = {path.name: path.read_bytes() for path in (home / "scripts/logs").iterdir()}
     assert after == before
+
+
+def test_tampered_archive_is_quarantined_and_db_attempt_reprojects(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    monkeypatch.setattr(queue_usage, "MAX_USAGE_BYTES", 500)
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job_id = repository.enqueue_capture(_session(home)).job_id
+        for _ in range(2):
+            repository.record_attempt(job_id, _attempt("codex"))
+
+    archive = next((home / "scripts/logs").glob("usage.archive-*.jsonl"))
+    original = archive.read_bytes()
+    tampered = original.replace(b'"provider":"codex"', b'"provider":"evilx"', 1)
+    assert len(tampered) == len(original) and tampered != original
+    archive.write_bytes(tampered)
+    tampered_attempt = json.loads(tampered.splitlines()[0])["provider_attempt_id"]
+
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+
+    assert not archive.exists()
+    quarantine = list((home / "scripts/logs").glob("usage.corrupt-*.jsonl"))
+    assert len(quarantine) == 1
+    assert quarantine[0].read_bytes() == tampered
+    active = [
+        json.loads(line)
+        for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()
+    ]
+    repaired = [
+        record for record in active
+        if record.get("provider_attempt_id") == tampered_attempt
+    ]
+    assert len(repaired) == 1
+    assert repaired[0]["provider"] == "codex"
+
+
+def test_private_append_retries_short_and_interrupted_writes(tmp_path, monkeypatch):
+    path = tmp_path / "usage.jsonl"
+    payload = b'{"provider":"codex"}\n'
+    real_write = os.write
+    actions: list[int | str] = [3, "interrupt", 2, 100]
+
+    def scripted_write(descriptor, data):
+        action = actions.pop(0)
+        if action == "interrupt":
+            raise InterruptedError()
+        count = min(action, len(data))
+        return real_write(descriptor, data[:count])
+
+    monkeypatch.setattr(usage.os, "write", scripted_write)
+
+    usage._append_private(path, payload)
+
+    assert path.read_bytes() == payload
+    assert actions == []
+
+
+def test_zero_or_failed_append_leaves_recoverable_torn_tail(tmp_path, monkeypatch):
+    record = usage.UsageRecord.from_attempt(
+        _attempt(), job_id=1, source_agent="system", timestamp=NOW
+    )
+    path = usage.append_usage_record(tmp_path, record)
+    before = path.read_bytes()
+    real_write = os.write
+    calls = 0
+
+    def torn_write(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(descriptor, data[:5])
+        if calls == 2:
+            raise OSError("disk stopped")
+        return 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(usage.os, "write", torn_write)
+        with pytest.raises(OSError, match="disk stopped"):
+            usage._append_private(path, b'{"torn":true}\n')
+
+    usage.recover_usage_log(tmp_path)
+    assert path.read_bytes() == before
+    assert len(list(path.parent.glob("usage.corrupt-*.jsonl"))) == 1
+
+    with monkeypatch.context() as patch:
+        patch.setattr(usage.os, "write", lambda *_args: 0)
+        with pytest.raises(OSError, match="zero bytes"):
+            usage._append_private(path, b"more\n")
+    assert path.read_bytes() == before
 
 
 def test_queue_attempt_is_source_of_truth_and_emits_observability_record(tmp_path):
