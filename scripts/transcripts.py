@@ -63,6 +63,34 @@ def _read_jsonl(path: Path) -> Iterator[dict]:
                 yield record
 
 
+def read_codex_session_meta(path: Path | str) -> dict[str, object] | None:
+    """Return the first well-formed Codex ``session_meta`` payload.
+
+    Historical discovery uses this small, side-effect-free probe to distinguish
+    rollouts from malformed or unrelated JSONL files before doing full parsing.
+    """
+    for record in _read_jsonl(Path(path)):
+        payload = record.get("payload")
+        if record.get("type") == "session_meta" and isinstance(payload, dict):
+            return dict(payload)
+    return None
+
+
+def codex_transcript_is_well_formed(path: Path | str) -> bool:
+    """Return false when any non-empty JSONL record is invalid or non-object."""
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    return False
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def _nonempty_string(value: object) -> str:
     return value if isinstance(value, str) and value else ""
 
@@ -697,15 +725,10 @@ def chunk_session(
 
     total_chars = sum(len(_render_turn(turn)) for turn in session.turns)
     if total_chars <= target_chars * 1.3:
-        return [
-            _session_with_turns(
-                session,
-                session.turns,
-                ordinal=0,
-                turn_start=0,
-                turn_end=len(session.turns),
-            )
-        ]
+        # A whole-session historical job must use the same normalized identity
+        # as an equivalent live capture.  Derived chunk hashes are needed only
+        # when a session actually splits.
+        return [session]
 
     chunks: list[NormalizedSession] = []
     current: list[Turn] = []

@@ -17,36 +17,47 @@ Usage:
 
 from __future__ import annotations
 
-# Recursion prevention — set before any imports that might trigger Claude
 import os
-os.environ["CLAUDE_INVOKED_BY"] = "batch_flush"
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 import json
 import logging
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timezone
+import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from transcripts import (
     NormalizedSession,
     Turn as NormalizedTurn,
     chunk_session,
+    codex_transcript_is_well_formed,
     parse_claude_transcript,
+    parse_codex_transcript,
+    read_codex_session_meta,
     render_turns,
 )
+
+from config import TASK_MODELS, load_config
+from providers import ClaudeProvider, CodexProvider, ProviderRouter, TaskKind
+from queue import QueueRepository
+from utils import append_daily_entry
+from worker import MemoryWorker
 
 DAILY_DIR = ROOT / "daily"
 STATE_FILE = SCRIPTS_DIR / "state.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
 
 def default_transcripts_dir(cwd: Path | None = None) -> Path:
@@ -98,18 +109,29 @@ MIN_FILE_SIZE = 5_000           # Skip files < 5KB
 CHUNK_TARGET_CHARS = 25_000     # Target chunk size for LLM extraction
 FLUSH_COST_ESTIMATE = 0.04      # Estimated cost per flush call
 
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [batch] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
-# Also log to stderr for interactive use
-console = logging.StreamHandler(sys.stderr)
-console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter("%(message)s"))
-logging.getLogger().addHandler(console)
+def configure_logging(*, dry_run: bool) -> None:
+    """Configure interactive logging without creating files during imports/dry runs."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if not any(getattr(handler, "_memory_batch_console", False) for handler in root_logger.handlers):
+        console = logging.StreamHandler(sys.stderr)
+        console.setLevel(logging.INFO)
+        console.setFormatter(logging.Formatter("%(message)s"))
+        console._memory_batch_console = True  # type: ignore[attr-defined]
+        root_logger.addHandler(console)
+    if dry_run or any(
+        getattr(handler, "_memory_batch_file", False) for handler in root_logger.handlers
+    ):
+        return
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [batch] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    file_handler._memory_batch_file = True  # type: ignore[attr-defined]
+    root_logger.addHandler(file_handler)
 
 
 # ── Data classes ─────────────────────────────────────────────────────────
@@ -150,6 +172,117 @@ class Target:
     project_key: str
     project_cwd: str        # may be empty if the path could not be decoded
     transcripts_dir: Path
+
+
+@dataclass(frozen=True)
+class HistoricalSession:
+    session: NormalizedSession
+    path: Path
+    date: str
+    directory_date: str | None = None
+
+
+@dataclass(frozen=True)
+class CodexDiscovery:
+    sessions: tuple[HistoricalSession, ...]
+    malformed: tuple[Path, ...] = ()
+    duplicates: tuple[Path, ...] = ()
+    date_disagreements: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImportReport:
+    sessions: int
+    chunks: int
+    projects: tuple[str, ...]
+    dates: tuple[str, ...]
+    estimated_tokens: int
+    enqueued: int = 0
+    succeeded: int = 0
+    skipped: int = 0
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _directory_date(root: Path, path: Path) -> str | None:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return None
+    for index in range(max(0, len(parts) - 3)):
+        year, month, day = parts[index : index + 3]
+        try:
+            return date(int(year), int(month), int(day)).isoformat()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def discover_codex_sessions(sessions_root: Path | str = CODEX_SESSIONS_DIR) -> CodexDiscovery:
+    """Recursively discover valid local Codex rollouts by normalized identity."""
+    root = Path(sessions_root).expanduser()
+    if not root.is_dir():
+        return CodexDiscovery(())
+
+    sessions: list[HistoricalSession] = []
+    malformed: list[Path] = []
+    duplicates: list[Path] = []
+    disagreements: list[Path] = []
+    seen: set[tuple[str, str]] = set()
+    for path in sorted(root.rglob("*.jsonl")):
+        try:
+            if not codex_transcript_is_well_formed(path):
+                malformed.append(path)
+                continue
+            meta = read_codex_session_meta(path)
+            if meta is None:
+                malformed.append(path)
+                continue
+            normalized = parse_codex_transcript(path, {"trigger": "historical"})
+        except (OSError, UnicodeError, ValueError):
+            malformed.append(path)
+            continue
+        if not normalized.turns or normalized.timestamp == "1970-01-01T00:00:00Z":
+            malformed.append(path)
+            continue
+        timestamp = _parse_timestamp(normalized.timestamp)
+        if timestamp is None:
+            malformed.append(path)
+            continue
+        identity = (normalized.session_id, normalized.source_hash)
+        if identity in seen:
+            duplicates.append(path)
+            continue
+        seen.add(identity)
+        encoded_date = _directory_date(root, path)
+        session_date = timestamp.date().isoformat()
+        discovered = HistoricalSession(
+            session=normalized,
+            path=path,
+            date=session_date,
+            directory_date=encoded_date,
+        )
+        sessions.append(discovered)
+        if encoded_date is not None and encoded_date != session_date:
+            disagreements.append(path)
+
+    sessions.sort(key=lambda item: (item.session.timestamp, str(item.path)))
+    return CodexDiscovery(
+        tuple(sessions),
+        tuple(malformed),
+        tuple(duplicates),
+        tuple(disagreements),
+    )
 
 
 # ── Project discovery ───────────────────────────────────────────────────
@@ -239,6 +372,176 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
 
     results.sort(key=lambda t: t.mtime)
     return results
+
+
+def discover_claude_sessions(targets: Sequence[Target]) -> list[HistoricalSession]:
+    """Normalize historical Claude transcripts while preserving project decoding."""
+    discovered: list[HistoricalSession] = []
+    seen: set[tuple[str, str]] = set()
+    for target in targets:
+        for info in scan_transcripts(target.transcripts_dir):
+            if info.size < MIN_FILE_SIZE:
+                continue
+            try:
+                session = parse_claude_transcript(
+                    info.path,
+                    {
+                        "session_id": info.session_id,
+                        "cwd": target.project_cwd,
+                        "project": target.project_key,
+                        "timestamp": info.mtime.isoformat(),
+                        "trigger": "historical",
+                    },
+                )
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if not session.turns:
+                continue
+            identity = (session.session_id, session.source_hash)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            discovered.append(
+                HistoricalSession(session, info.path, info.date, info.date)
+            )
+    return sorted(discovered, key=lambda item: (item.session.timestamp, str(item.path)))
+
+
+def filter_historical_sessions(
+    sessions: Sequence[HistoricalSession], args: argparse.Namespace
+) -> list[HistoricalSession]:
+    selected_dates = set(args.dates.split(",")) if args.dates else None
+    return [
+        item
+        for item in sessions
+        if (selected_dates is None or item.date in selected_dates)
+        and (args.from_date is None or item.date >= args.from_date)
+        and (args.to_date is None or item.date <= args.to_date)
+    ]
+
+
+def _plan_chunks(
+    sessions: Sequence[HistoricalSession], max_cost: float | None
+) -> list[NormalizedSession]:
+    planned = [
+        chunk
+        for historical in sessions
+        for chunk in chunk_session(historical.session, CHUNK_TARGET_CHARS)
+    ]
+    if max_cost is not None:
+        planned = planned[: max(0, int(max_cost / FLUSH_COST_ESTIMATE))]
+    return planned
+
+
+def _historical_writer(memory_home: Path):
+    def write(job, text: str) -> Path:
+        payload = job.payload
+        timestamp = _parse_timestamp(str(payload.get("timestamp", "")))
+        return append_daily_entry(
+            memory_home,
+            text,
+            project_key=job.project,
+            cwd=job.cwd,
+            agent=job.source_agent,
+            capture_identity=hashlib.sha256(
+                "\0".join(
+                    (job.kind, job.source_agent, job.session_id, job.source_hash)
+                ).encode()
+            ).hexdigest(),
+            now=timestamp,
+        )
+
+    return write
+
+
+class _BoundedRouter:
+    def __init__(self, router: object, semaphore: asyncio.Semaphore) -> None:
+        self._router = router
+        self._semaphore = semaphore
+
+    async def generate_text(self, request):
+        async with self._semaphore:
+            return await self._router.generate_text(request)
+
+
+def _default_router() -> ProviderRouter:
+    config = load_config(os.environ)
+    return ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+    )
+
+
+def _print_import_report(report: ImportReport) -> None:
+    print(f"sessions: {report.sessions}")
+    print(f"chunks: {report.chunks}")
+    print(f"projects: {', '.join(report.projects) if report.projects else '(none)'}")
+    print(f"dates: {', '.join(report.dates) if report.dates else '(none)'}")
+    print(f"models: {TASK_MODELS[TaskKind.EXTRACT]} (Claude fallback: claude-sonnet-5)")
+    print(f"estimated tokens: {report.estimated_tokens}")
+    if report.enqueued or report.succeeded or report.skipped:
+        print(f"enqueued: {report.enqueued}")
+        print(f"succeeded: {report.succeeded}")
+        print(f"skipped: {report.skipped}")
+
+
+async def execute_historical_import(
+    sessions: Sequence[HistoricalSession],
+    args: argparse.Namespace,
+    *,
+    memory_home: Path | str,
+    router: object | None = None,
+) -> ImportReport:
+    """Plan, enqueue, and drain historical captures through the live queue contract."""
+    selected = filter_historical_sessions(sessions, args)
+    planned = _plan_chunks(selected, args.max_cost)
+    report = ImportReport(
+        sessions=len(selected),
+        chunks=len(planned),
+        projects=tuple(sorted({item.session.project for item in selected})),
+        dates=tuple(sorted({item.date for item in selected})),
+        estimated_tokens=sum(
+            max(1, (len(render_turns(chunk)) + 3) // 4) for chunk in planned
+        ),
+    )
+    if args.dry_run:
+        _print_import_report(report)
+        return report
+
+    home = Path(memory_home).expanduser().resolve()
+    queue_path = home / "scripts" / "jobs.sqlite3"
+    repository = QueueRepository(queue_path)
+    try:
+        enqueued = [repository.enqueue_capture(chunk) for chunk in planned]
+        created = sum(result.created for result in enqueued)
+        skipped = len(enqueued) - created
+        if planned:
+            bounded_router = _BoundedRouter(
+                router or _default_router(), asyncio.Semaphore(args.concurrency)
+            )
+            workers = [
+                MemoryWorker(
+                    repository,
+                    bounded_router,
+                    daily_writer=_historical_writer(home),
+                    owner=f"historical-{index}",
+                    lock_path=home / "scripts" / "memory-worker.lock",
+                )
+                for index in range(args.concurrency)
+            ]
+            await asyncio.gather(*(worker.drain() for worker in workers))
+        succeeded = sum(
+            repository.get_job(result.job_id).status == "succeeded"
+            for result in enqueued
+            if result.created
+        )
+        report = replace(
+            report, enqueued=created, succeeded=succeeded, skipped=skipped
+        )
+    finally:
+        repository.close()
+    _print_import_report(report)
+    return report
 
 
 # ── Conversation extraction ──────────────────────────────────────────────
@@ -722,41 +1025,41 @@ async def process_one_project(
 
 # ── Orchestrator ─────────────────────────────────────────────────────────
 
-async def run_batch(args: argparse.Namespace) -> None:
-    """Top-level entry point — picks single-project or all-projects mode and dispatches."""
-    if args.all_projects:
-        if args.transcripts_dir or args.project_cwd or args.project_key:
-            logging.warning(
-                "--all-projects ignores --transcripts-dir/--project-cwd/--project-key"
-            )
-        targets = discover_all_projects()
-        if not targets:
-            logging.info("No project directories found under %s", CLAUDE_PROJECTS_DIR)
-            return
-        logging.info("=== All-Projects Mode ===")
-        logging.info("Discovered %d project directories under %s", len(targets), CLAUDE_PROJECTS_DIR)
-    else:
-        targets = [resolve_single_target(args)]
+async def run_batch(args: argparse.Namespace) -> ImportReport:
+    """Discover selected agent sources and process them through the durable queue."""
+    sessions: list[HistoricalSession] = []
+    if args.source in {"claude", "all"}:
+        if args.all_projects:
+            if args.transcripts_dir or args.project_cwd or args.project_key:
+                logging.warning(
+                    "--all-projects ignores --transcripts-dir/--project-cwd/--project-key"
+                )
+            targets = discover_all_projects()
+        else:
+            targets = [resolve_single_target(args)]
+        sessions.extend(discover_claude_sessions(targets))
 
-    batch_state = load_batch_state()
-    cumulative_cost = batch_state.get("total_cost", 0.0)
-    processed_count = 0
-    halted_due_to_cost = False
-
-    for idx, tgt in enumerate(targets, start=1):
-        if halted_due_to_cost:
-            logging.info("Skipping remaining projects (cost limit reached)")
-            break
-
-        label_prefix = f"[{idx}/{len(targets)} {tgt.project_key}] " if args.all_projects else ""
-        cumulative_cost, halted_due_to_cost = await process_one_project(
-            args, tgt, batch_state, cumulative_cost, label_prefix
+    if args.source in {"codex", "all"}:
+        codex_root = (
+            Path(args.codex_sessions_dir).expanduser()
+            if args.codex_sessions_dir
+            else Path.home() / ".codex" / "sessions"
         )
-        processed_count += 1
+        discovery = discover_codex_sessions(codex_root)
+        sessions.extend(discovery.sessions)
+        for path in discovery.malformed:
+            logging.warning("Skipping malformed Codex transcript: %s", path)
+        for path in discovery.duplicates:
+            logging.info("Skipping duplicate Codex transcript: %s", path)
+        for path in discovery.date_disagreements:
+            logging.warning("Codex transcript timestamp disagrees with directory date: %s", path)
 
-    logging.info("")
-    logging.info("=== Final ===")
-    logging.info("Touched %d project(s); total cost $%.2f", processed_count, cumulative_cost)
+    config = load_config(os.environ)
+    report = await execute_historical_import(
+        sessions,
+        args,
+        memory_home=config.root_dir,
+    )
 
     if args.compile and not args.dry_run:
         logging.info("")
@@ -765,15 +1068,41 @@ async def run_batch(args: argparse.Namespace) -> None:
         cmd = ["uv", "run", "--directory", str(ROOT), "python", str(SCRIPTS_DIR / "compile.py"), "--all"]
         logging.info("Running: %s", " ".join(cmd))
         subprocess.run(cmd, cwd=str(ROOT))
+    return report
 
 
-def main():
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _date_string(value: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be YYYY-MM-DD") from exc
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch extract knowledge from historical transcripts")
+    parser.add_argument(
+        "--source", choices=("claude", "codex", "all"), default="claude",
+        help="Historical transcript source (default: claude)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Preview what would be processed")
     parser.add_argument("--compile", action="store_true", help="Run compile.py after extraction")
     parser.add_argument("--max-cost", type=float, default=None, help="Stop after spending this much ($, global across all projects in --all-projects mode)")
     parser.add_argument("--resume", action="store_true", help="Skip already-processed sessions")
     parser.add_argument("--dates", type=str, default=None, help="Comma-separated dates to process (YYYY-MM-DD)")
+    parser.add_argument("--from-date", type=_date_string, default=None)
+    parser.add_argument("--to-date", type=_date_string, default=None)
+    parser.add_argument("--concurrency", type=_positive_int, default=2)
+    parser.add_argument(
+        "--codex-sessions-dir", type=str, default=None,
+        help="Codex rollout root (defaults to ~/.codex/sessions)",
+    )
     parser.add_argument(
         "--all-projects", action="store_true",
         help=f"Seed every project under {CLAUDE_PROJECTS_DIR}/. Overrides --transcripts-dir/--project-cwd/--project-key.",
@@ -790,10 +1119,43 @@ def main():
         "--project-key", type=str, default=None,
         help="Project key for daily-log tagging (defaults to basename of --project-cwd or current cwd, matching the live hook).",
     )
-    args = parser.parse_args()
+    return parser
 
-    asyncio.run(run_batch(args))
+
+def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_cost is not None and args.max_cost <= 0:
+        parser.error("--max-cost must be positive")
+    if args.source in {"codex", "all"} and args.max_cost is not None:
+        parser.error("--max-cost is legacy Claude-only accounting and cannot include Codex")
+    if args.dates:
+        values = args.dates.split(",")
+        if not values or any(not value for value in values):
+            parser.error("--dates requires comma-separated YYYY-MM-DD values")
+        try:
+            args.dates = ",".join(_date_string(value) for value in values)
+        except argparse.ArgumentTypeError as exc:
+            parser.error(str(exc))
+    if args.from_date and args.to_date and args.from_date > args.to_date:
+        parser.error("--from-date must not be after --to-date")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_cli_args(argv)
+    configure_logging(dry_run=args.dry_run)
+    previous_guard = os.environ.get("CLAUDE_INVOKED_BY")
+    os.environ["CLAUDE_INVOKED_BY"] = previous_guard or "batch_flush"
+    try:
+        asyncio.run(run_batch(args))
+    finally:
+        if previous_guard is None:
+            os.environ.pop("CLAUDE_INVOKED_BY", None)
+        else:
+            os.environ["CLAUDE_INVOKED_BY"] = previous_guard
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
