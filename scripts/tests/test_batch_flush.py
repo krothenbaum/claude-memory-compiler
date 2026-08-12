@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sqlite3
 import stat
@@ -110,6 +111,26 @@ def metadata_manifest(root: Path) -> dict[str, tuple[str, int, int, int]]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def copy_runtime_tree(tmp_path: Path) -> Path:
+    source_root = tmp_path / "runtime"
+    scripts_dir = Path(__file__).resolve().parents[1]
+    shutil.copytree(
+        scripts_dir,
+        source_root / "scripts",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.log", "tests"),
+    )
+    return source_root
+
+
+def subprocess_environment(memory_home: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["AI_MEMORY_HOME"] = str(memory_home)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.pop("PYTHONPATH", None)
+    return environment
 
 
 def test_recursive_codex_discovery_uses_session_metadata_and_reports_date_disagreement(
@@ -652,6 +673,99 @@ def test_strict_dry_run_is_no_write_no_model_and_reports_plan(
     assert manifest(memory_home) == before
     assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
     assert not (memory_home / "scripts" / "state.json").exists()
+
+
+def test_batch_main_dry_run_subprocess_preserves_runtime_and_memory_manifests(
+    tmp_path,
+):
+    source_root = copy_runtime_tree(tmp_path)
+    memory_home = tmp_path / "memory"
+    (memory_home / "scripts").mkdir(parents=True)
+    (memory_home / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    sessions_root = tmp_path / ".codex" / "sessions"
+    write_codex(
+        sessions_root / "2026" / "08" / "10" / "rollout.jsonl",
+        session_id="dry-subprocess",
+        cwd="/repo/dry-subprocess",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    runtime_before = metadata_manifest(source_root)
+    memory_before = metadata_manifest(memory_home)
+    probe = """
+import importlib.util
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+path = root / "scripts" / "batch-flush.py"
+sys.path.insert(0, str(root))
+sys.path.insert(0, str(path.parent))
+spec = importlib.util.spec_from_file_location("dry_run_batch_main", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def forbidden_provider(*args, **kwargs):
+    raise AssertionError("dry run constructed a provider")
+
+def forbidden_queue(*args, **kwargs):
+    raise AssertionError("dry run constructed a writable queue")
+
+module._default_router = forbidden_provider
+module.QueueRepository = forbidden_queue
+raise SystemExit(module.main([
+    "--source", "codex",
+    "--codex-sessions-dir", sys.argv[2],
+    "--dates", "2026-08-10",
+    "--dry-run",
+]))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(source_root), str(sessions_root)],
+        cwd=tmp_path,
+        env=subprocess_environment(memory_home),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert metadata_manifest(source_root) == runtime_before
+    assert metadata_manifest(memory_home) == memory_before
+    assert not (source_root / "scripts" / "flush.log").exists()
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "state.json").exists()
+
+
+def test_flush_logging_is_lazy_until_explicitly_configured(tmp_path):
+    source_root = copy_runtime_tree(tmp_path)
+    memory_home = tmp_path / "memory"
+    memory_home.mkdir()
+    probe = """
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+import scripts.flush as flush
+
+log_path = root / "scripts" / "flush.log"
+assert not log_path.exists()
+flush.configure_logging()
+assert log_path.exists()
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(source_root)],
+        cwd=tmp_path,
+        env=subprocess_environment(memory_home),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("artifact", ["missing", "corrupt-db", "corrupt-state"])

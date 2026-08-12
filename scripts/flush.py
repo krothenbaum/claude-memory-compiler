@@ -38,15 +38,17 @@ from providers import (  # noqa: E402
     TextRequest,
 )
 
-# Set up file-based logging so we can verify the background process ran.
-# The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
-# file handle bug on Windows), so this is our only observability channel.
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+def configure_logging() -> None:
+    """Configure file logging only when the flush CLI actually runs."""
+    # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
+    # file handle bug on Windows), so this is the flush process's observability
+    # channel. Keeping setup out of module import makes prompt reuse read-only.
+    logging.basicConfig(
+        filename=str(LOG_FILE),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def load_flush_state() -> dict:
@@ -303,6 +305,7 @@ def maybe_trigger_compilation() -> None:
 
 
 def main():
+    configure_logging()
     os.environ.setdefault("CLAUDE_INVOKED_BY", "memory_flush")
     os.environ.setdefault("AI_MEMORY_INTERNAL_JOB", "1")
     if len(sys.argv) < 3:
