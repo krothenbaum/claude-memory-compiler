@@ -73,7 +73,7 @@ The resulting source entry keeps the existing daily-log schema and adds provenan
 **CWD:** /full/path/to/project
 ```
 
-Transcripts, queue rows, stages, spools, daily logs, and knowledge files remain stored locally. Model-backed operations send the selected ChatGPT-authenticated Codex or Claude subscription provider the normalized transcript content and minimum task-specific inputs it needs. Depending on the task, those inputs can include the prompt plus staged copies of a selected daily log, the index, and relevant articles. The exclusions above still apply before extraction, and local structural lint sends nothing to either provider. Structured logs omit transcript bodies and credentials. Codex conversations that exist only in cloud history remain unavailable: live capture and historical import require a local transcript or hook event.
+Transcripts, queue rows, stages, spools, daily logs, and knowledge files remain stored locally. Model-backed operations send the selected ChatGPT-authenticated Codex or Claude subscription provider only their minimum task-specific inputs. Extraction may send normalized transcript content; text queries and semantic lint send their prompts and relevant text; staged compile, connection, and filed-answer tasks send their prompts plus the minimum staged daily-log, index, build-log, article, or state copies they need. The exclusions above still apply before extraction, and local structural lint sends nothing to either provider. Structured logs omit transcript bodies and credentials. Codex conversations that exist only in cloud history remain unavailable: live capture and historical import require a local transcript or hook event.
 
 ## Commands
 
