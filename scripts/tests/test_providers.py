@@ -47,13 +47,20 @@ class FakeCommandResult:
 
 
 class FakeRunner:
-    def __init__(self, *responses):
+    def __init__(self, *responses, version_response=None):
         self.responses = list(responses)
         self.calls = []
+        self.version_response = version_response or FakeCommandResult(
+            stdout="codex-cli 0.146.1\n"
+        )
 
     async def __call__(self, command, **kwargs):
         self.calls.append((list(command), kwargs))
-        response = self.responses.pop(0)
+        response = (
+            self.version_response
+            if list(command) == ["codex", "--version"]
+            else self.responses.pop(0)
+        )
         if isinstance(response, BaseException):
             raise response
         if callable(response):
@@ -68,8 +75,8 @@ def text_request(tmp_path):
 
 @pytest.fixture
 def fake_runner():
-    def make(*responses):
-        return FakeRunner(*responses)
+    def make(*responses, version_response=None):
+        return FakeRunner(*responses, version_response=version_response)
 
     return make
 
@@ -95,6 +102,71 @@ def _codex_provider(runner, **kwargs):
 
 def _chatgpt_login():
     return FakeCommandResult(stdout="Logged in using ChatGPT\n")
+
+
+@pytest.mark.parametrize(
+    "version_output",
+    ["codex-cli 0.146.1\n", "codex 0.146.1\n", "codex-cli 0.147.0\n", "codex-cli 1.0.0\n"],
+)
+def test_codex_preflight_accepts_supported_cli_versions(
+    fake_runner, text_request, version_output
+):
+    runner = fake_runner(
+        _chatgpt_login(),
+        _write_codex_output("answer"),
+        version_response=FakeCommandResult(stdout=version_output),
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert runner.calls[0][0] == ["codex", "--version"]
+    assert runner.calls[0][1]["max_output_bytes"] == 64 * 1024
+    assert runner.calls[1][0] == ["codex", "login", "status"]
+
+
+@pytest.mark.parametrize("version_output", ["codex-cli 0.146.0", "codex-cli 0.145.99"])
+def test_codex_preflight_rejects_unsupported_cli_versions_without_raw_output(
+    fake_runner, text_request, version_output
+):
+    secret = "sk-proj-version-secret"
+    runner = fake_runner(version_response=FakeCommandResult(stdout=version_output))
+
+    result = _run(
+        _codex_provider(runner, env={"OPENAI_API_KEY": secret}).generate_text(
+            text_request
+        )
+    )
+
+    assert result.outcome == "error"
+    assert result.reason == "unsupported Codex CLI version"
+    assert secret not in result.reason
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("version_result", "reason"),
+    [
+        (FakeCommandResult(stdout="codex-cli unknown"), "invalid Codex CLI version output"),
+        (FakeCommandResult(stdout="codex-cli 0.146.1-beta"), "invalid Codex CLI version output"),
+        (FakeCommandResult(7, stderr="fatal sk-proj-version-secret"), "Codex CLI version check failed"),
+        (
+            FakeCommandResult(stdout="codex-cli 0.146.1", output_truncated=True),
+            "Codex CLI version output too large",
+        ),
+    ],
+)
+def test_codex_preflight_fails_closed_for_unusable_version_result(
+    fake_runner, text_request, version_result, reason
+):
+    runner = fake_runner(version_response=version_result)
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "error"
+    assert result.reason == reason
+    assert "sk-proj" not in result.reason
+    assert len(runner.calls) == 1
 
 
 def _run(awaitable):
@@ -265,7 +337,8 @@ def test_codex_accepts_chatgpt_login(fake_runner, text_request):
 
     assert result.outcome == "success"
     assert result.text == "codex answer"
-    assert runner.calls[0][0] == ["codex", "login", "status"]
+    assert runner.calls[0][0] == ["codex", "--version"]
+    assert runner.calls[1][0] == ["codex", "login", "status"]
 
 
 def test_codex_caps_only_login_status_capture(fake_runner, text_request):
@@ -275,7 +348,8 @@ def test_codex_caps_only_login_status_capture(fake_runner, text_request):
 
     assert result.outcome == "success"
     assert runner.calls[0][1]["max_output_bytes"] == 64 * 1024
-    assert "max_output_bytes" not in runner.calls[1][1]
+    assert runner.calls[1][1]["max_output_bytes"] == 64 * 1024
+    assert "max_output_bytes" not in runner.calls[2][1]
 
 
 def test_codex_accepts_exact_chatgpt_login_from_stderr(fake_runner, text_request):
@@ -326,7 +400,7 @@ def test_codex_rejects_nonexact_chatgpt_login_mentions(
 
     assert result.outcome == "auth_failed"
     assert result.text == ""
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_rejects_api_key_status_even_with_chatgpt_status(
@@ -343,7 +417,7 @@ def test_codex_rejects_api_key_status_even_with_chatgpt_status(
 
     assert result.outcome == "auth_failed"
     assert result.text == ""
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -363,7 +437,7 @@ def test_codex_rejects_other_exact_login_mode_beside_chatgpt(
 
     assert result.outcome == "auth_failed"
     assert result.text == ""
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -390,7 +464,7 @@ def test_codex_rejects_any_nonexact_status_shaped_login_line(
     assert result.outcome == "auth_failed"
     assert result.reason == "unsupported login type"
     assert result.text == ""
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_accepts_duplicate_exact_chatgpt_status_lines(
@@ -417,7 +491,7 @@ def test_codex_login_status_matching_is_case_sensitive(fake_runner, text_request
 
     assert result.outcome == "auth_failed"
     assert result.text == ""
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_rejects_nonzero_chatgpt_status_without_leaking_secret(
@@ -439,7 +513,7 @@ def test_codex_rejects_nonzero_chatgpt_status_without_leaking_secret(
     assert result.outcome == "error"
     assert result.text == ""
     assert secret not in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_rejects_api_key_login(fake_runner, text_request):
@@ -448,7 +522,7 @@ def test_codex_rejects_api_key_login(fake_runner, text_request):
     result = _run(_codex_provider(runner).generate_text(text_request))
 
     assert result.outcome == "auth_failed"
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_rejects_unknown_login_output(fake_runner, text_request):
@@ -458,7 +532,7 @@ def test_codex_rejects_unknown_login_output(fake_runner, text_request):
 
     assert result.outcome == "auth_failed"
     assert "unsupported" in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_preflight_classifies_capacity(fake_runner, text_request):
@@ -471,7 +545,7 @@ def test_codex_preflight_classifies_capacity(fake_runner, text_request):
     assert result.outcome == "capacity"
     assert result.reason == "login status failed"
     assert "sk-proj-preflight-secret" not in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_preflight_classifies_unknown_nonzero_as_error(
@@ -486,7 +560,7 @@ def test_codex_preflight_classifies_unknown_nonzero_as_error(
     assert result.outcome == "error"
     assert result.reason == "login status failed"
     assert "sk-proj-sentinel" not in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_unsupported_login_reason_never_echoes_status_output(
@@ -540,7 +614,7 @@ def test_codex_text_command_is_ephemeral_read_only_and_noninteractive(
 
     _run(_codex_provider(runner).generate_text(text_request))
 
-    command, kwargs = runner.calls[1]
+    command, kwargs = runner.calls[2]
     assert command[:4] == ["codex", "--ask-for-approval", "never", "exec"]
     assert "--ask-for-approval" not in command[4:]
     assert command.count("--skip-git-repo-check") == 1
@@ -574,7 +648,7 @@ def test_codex_workspace_command_writes_only_in_stage(fake_runner, tmp_path):
     result = _run(_codex_provider(runner).edit_workspace(request))
 
     assert result.outcome == "success"
-    command, kwargs = runner.calls[1]
+    command, kwargs = runner.calls[2]
     assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert command[command.index("--cd") + 1] == str(stage)
     assert command.count("--skip-git-repo-check") == 1
@@ -593,8 +667,8 @@ def test_codex_timeout_terminates_process_group(fake_runner, text_request):
     result = _run(_codex_provider(runner).generate_text(text_request))
 
     assert result.outcome == "timeout"
-    assert runner.calls[1][1]["start_new_session"] is True
-    assert runner.calls[1][1]["terminate_process_group_on_timeout"] is True
+    assert runner.calls[2][1]["start_new_session"] is True
+    assert runner.calls[2][1]["terminate_process_group_on_timeout"] is True
 
 
 class FakeBoundaryProcess:
@@ -798,7 +872,7 @@ def test_codex_rejects_truncated_status_hiding_api_key_suffix(
     assert result.outcome == "error"
     assert result.reason == "login status output too large"
     assert "Logged in using" not in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_rejects_truncated_benign_status_output(
@@ -820,7 +894,7 @@ def test_codex_rejects_truncated_benign_status_output(
     assert result.outcome == "error"
     assert result.reason == "login status output too large"
     assert sentinel not in result.reason
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
 
 
 def test_codex_accepts_exactly_capped_nontruncated_chatgpt_status(
@@ -917,7 +991,7 @@ def test_codex_command_propagates_output_schema(fake_runner, tmp_path):
 
     result = _run(_codex_provider(runner).generate_text(request))
 
-    command = runner.calls[1][0]
+    command = runner.calls[2][0]
     assert result.outcome == "success"
     assert command[command.index("--output-schema") + 1] == str(schema_path)
 
@@ -949,8 +1023,9 @@ def test_codex_malformed_schema_still_preflights_without_leaking_content(
 
     result = _run(_codex_provider(runner).generate_text(request))
 
-    assert runner.calls[0][0] == ["codex", "login", "status"]
-    assert len(runner.calls) == 1
+    assert runner.calls[0][0] == ["codex", "--version"]
+    assert runner.calls[1][0] == ["codex", "login", "status"]
+    assert len(runner.calls) == 2
     assert result.outcome == "error"
     assert secret_content not in result.reason
     assert request.prompt not in result.reason
@@ -1368,6 +1443,31 @@ def test_router_records_reason_and_falls_back_to_claude(text_request):
     assert result.provider == "claude"
     assert result.fallback_reason == "codex:capacity:usage limit exceeded"
     assert [attempt.provider for attempt in result.attempts] == ["codex", "claude"]
+
+
+def test_router_records_unsupported_codex_version_and_falls_back(
+    fake_runner, text_request
+):
+    import providers
+
+    runner = fake_runner(
+        version_response=FakeCommandResult(stdout="codex-cli 0.146.0")
+    )
+    codex = _codex_provider(runner)
+    claude = FakeProvider(result=success_result("claude", "saved"))
+    seen = []
+
+    result = _run(
+        providers.ProviderRouter(
+            codex, claude, attempt_callback=seen.append
+        ).generate_text(text_request)
+    )
+
+    assert result.provider == "claude"
+    assert result.outcome == "success"
+    assert [attempt.outcome for attempt in seen] == ["error", "success"]
+    assert result.fallback_reason == "codex:error:unsupported Codex CLI version"
+    assert len(runner.calls) == 1
 
 
 def test_router_successful_codex_never_calls_claude(text_request):

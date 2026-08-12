@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import platform
+import re
 import subprocess
 import signal
 import sys
@@ -330,6 +331,11 @@ _MAX_REASON_LENGTH = 500
 _CODEX_LOGIN_STATUS_MARKER = "Logged in using"
 _CODEX_CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT"
 _CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES = 64 * 1024
+_CODEX_VERSION_MAX_OUTPUT_BYTES = 64 * 1024
+_MINIMUM_CODEX_VERSION = (0, 146, 1)
+_CODEX_VERSION_PATTERN = re.compile(
+    r"(?:codex-cli|codex) ([0-9]+)\.([0-9]+)\.([0-9]+)\Z"
+)
 
 
 def subscription_child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -466,6 +472,51 @@ class CodexProvider:
         self, request: TextRequest, started: float
     ) -> ProviderResult | None:
         try:
+            version = await self._run_command(
+                ["codex", "--version"],
+                request,
+                max_output_bytes=_CODEX_VERSION_MAX_OUTPUT_BYTES,
+            )
+            if version.output_truncated:
+                return self._result(
+                    request,
+                    "error",
+                    started,
+                    reason="Codex CLI version output too large",
+                )
+            if version.returncode != 0:
+                return self._result(
+                    request,
+                    "error",
+                    started,
+                    reason="Codex CLI version check failed",
+                )
+            version_lines = [
+                line.strip()
+                for stream in (version.stdout, version.stderr)
+                for line in stream.splitlines()
+                if line.strip()
+            ]
+            match = (
+                _CODEX_VERSION_PATTERN.fullmatch(version_lines[0])
+                if len(version_lines) == 1
+                else None
+            )
+            if match is None:
+                return self._result(
+                    request,
+                    "error",
+                    started,
+                    reason="invalid Codex CLI version output",
+                )
+            parsed_version = tuple(int(part) for part in match.groups())
+            if parsed_version < _MINIMUM_CODEX_VERSION:
+                return self._result(
+                    request,
+                    "error",
+                    started,
+                    reason="unsupported Codex CLI version",
+                )
             status = await self._run_command(
                 ["codex", "login", "status"],
                 request,
