@@ -32,6 +32,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import hashlib
 from pathlib import Path
 
@@ -471,7 +472,9 @@ def filter_historical_sessions(
 
 
 def _plan_chunks(
-    sessions: Sequence[HistoricalSession], max_cost: float | Decimal | None
+    sessions: Sequence[HistoricalSession],
+    max_cost: Decimal | None,
+    accumulated_cost: Decimal = Decimal(0),
 ) -> list[NormalizedSession]:
     planned = [
         chunk
@@ -479,9 +482,9 @@ def _plan_chunks(
         for chunk in chunk_session(historical.session, CHUNK_TARGET_CHARS)
     ]
     if max_cost is not None:
-        budget = Decimal(str(max_cost))
-        estimate = Decimal(str(FLUSH_COST_ESTIMATE))
-        planned = planned[: max(0, int(budget // estimate))]
+        remaining = Fraction(max_cost) - Fraction(accumulated_cost)
+        estimate = Fraction(Decimal(str(FLUSH_COST_ESTIMATE)))
+        planned = planned[: max(0, remaining // estimate)]
     return planned
 
 
@@ -616,7 +619,9 @@ def _read_legacy_total_cost(state_path: Path) -> Decimal:
     if not state_path.is_file():
         return Decimal(0)
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(
+            state_path.read_text(encoding="utf-8"), parse_float=Decimal
+        )
         value = state.get("batch_flush", {}).get("total_cost", 0)
         total = Decimal(str(value))
     except (
@@ -695,11 +700,10 @@ async def execute_historical_import(
     home = Path(memory_home).expanduser().resolve()
     config = _config_for_home(home)
     selected = filter_historical_sessions(sessions, args)
-    cost_budget: Decimal | None = None
+    accumulated = Decimal(0)
     if args.max_cost is not None:
         accumulated = _read_legacy_total_cost(home / "scripts" / "state.json")
-        cost_budget = max(Decimal(0), Decimal(str(args.max_cost)) - accumulated)
-    all_planned = _plan_chunks(selected, cost_budget)
+    all_planned = _plan_chunks(selected, args.max_cost, accumulated)
     planned, deduplicated, would_create = _dedup_plan(
         all_planned, home, resume=args.resume
     )
@@ -1295,6 +1299,16 @@ def _date_string(value: str) -> str:
         raise argparse.ArgumentTypeError("must be YYYY-MM-DD") from exc
 
 
+def _positive_decimal(value: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch extract knowledge from historical transcripts")
     parser.add_argument(
@@ -1303,7 +1317,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview what would be processed")
     parser.add_argument("--compile", action="store_true", help="Run compile.py after extraction")
-    parser.add_argument("--max-cost", type=float, default=None, help="Stop after spending this much ($, global across all projects in --all-projects mode)")
+    parser.add_argument("--max-cost", type=_positive_decimal, default=None, help="Stop after spending this much ($, global across all projects in --all-projects mode)")
     parser.add_argument("--resume", action="store_true", help="Skip already-processed sessions")
     parser.add_argument("--dates", type=str, default=None, help="Comma-separated dates to process (YYYY-MM-DD)")
     parser.add_argument("--from-date", type=_date_string, default=None)
@@ -1335,8 +1349,6 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.max_cost is not None and args.max_cost <= 0:
-        parser.error("--max-cost must be positive")
     if args.source in {"codex", "all"} and args.max_cost is not None:
         parser.error("--max-cost is legacy Claude-only accounting and cannot include Codex")
     if args.dates:

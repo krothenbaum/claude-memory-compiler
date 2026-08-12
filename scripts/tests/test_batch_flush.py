@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
+from decimal import Decimal
 import hashlib
 import importlib.util
 import json
@@ -340,6 +341,47 @@ def test_cli_accepts_sources_and_date_filters(batch, source):
 def test_cli_rejects_invalid_ranges_concurrency_and_codex_dollar_budget(batch, argv):
     with pytest.raises(SystemExit):
         batch.parse_cli_args(argv)
+
+
+@pytest.mark.parametrize(
+    "value", ["nan", "NaN", "inf", "-inf", "0", "-1", "not-a-number"]
+)
+def test_cli_rejects_nonfinite_nonpositive_and_malformed_max_cost(
+    batch, value, capsys
+):
+    with pytest.raises(SystemExit):
+        batch.parse_cli_args(["--source", "claude", "--max-cost", value])
+
+    assert "--max-cost" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("value", "capacity"),
+    [
+        ("0.039999999999999999", 0),
+        ("0.11999999999999999999999999999", 2),
+    ],
+)
+def test_cli_preserves_exact_max_cost_token_for_chunk_capacity(
+    batch, tmp_path, value, capacity
+):
+    args = batch.parse_cli_args(
+        ["--source", "claude", "--max-cost", value, "--dry-run"]
+    )
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 3)
+    ]
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, args, memory_home=tmp_path / "memory", router=None
+        )
+    )
+
+    assert args.max_cost == Decimal(value)
+    assert report.chunks == capacity
+    assert report.enqueued == capacity
 
 
 def test_filter_uses_session_timestamp_not_directory_date(batch, tmp_path):
@@ -769,6 +811,47 @@ def test_claude_max_cost_subtracts_legacy_total_at_exact_boundary(
 
     assert report.chunks == 2
     assert report.enqueued == 2
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize(
+    "state_value", ["0.040000000000000002", '"0.040000000000000002"']
+)
+def test_claude_max_cost_preserves_exact_legacy_state_arithmetic(
+    batch, tmp_path, resume, state_value
+):
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "state.json").write_text(
+        f'{{"batch_flush":{{"total_cost":{state_value}}}}}',
+        encoding="utf-8",
+    )
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 1)
+    ]
+    argv = [
+        "--source",
+        "claude",
+        "--max-cost",
+        "0.080000000000000001",
+        "--dry-run",
+    ]
+    if resume:
+        argv.append("--resume")
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions,
+            batch.parse_cli_args(argv),
+            memory_home=memory_home,
+            router=None,
+        )
+    )
+
+    assert report.chunks == 0
+    assert report.enqueued == 0
 
 
 @pytest.mark.parametrize("accumulated", [0.12, 0.13])
