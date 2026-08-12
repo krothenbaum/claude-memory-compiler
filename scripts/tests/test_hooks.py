@@ -27,6 +27,34 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "transcripts"
 FIXED_NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
+def _codex_help_option_block(help_text: str, option: str) -> str:
+    lines = help_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != option:
+            continue
+
+        option_indent = len(line) - len(line.lstrip())
+        block = [line]
+        for following in lines[index + 1 :]:
+            stripped = following.strip()
+            indent = len(following) - len(following.lstrip())
+            if stripped and indent <= option_indent:
+                break
+            block.append(following)
+        return "\n".join(block)
+
+    raise AssertionError(f"missing Codex help option: {option}")
+
+
+def _assert_codex_hook_trust_help(help_text: str) -> None:
+    block = _codex_help_option_block(
+        help_text,
+        "--dangerously-bypass-hook-trust",
+    )
+    assert "DANGEROUS" in block
+    assert "automation" in block.lower()
+
+
 def _fake_uv(bin_dir: Path) -> Path:
     """Install a worker-launch stand-in that records the queued agent."""
     bin_dir.mkdir()
@@ -1678,5 +1706,22 @@ def test_installed_codex_help_marks_hook_trust_bypass_as_dangerous():
         check=True,
     )
 
-    assert "--dangerously-bypass-hook-trust" in result.stdout
-    assert "DANGEROUS" in result.stdout
+    _assert_codex_hook_trust_help(result.stdout)
+
+
+def test_hook_trust_warning_must_be_adjacent_to_its_option():
+    help_text = """\
+Options:
+      --dangerously-bypass-approvals-and-sandbox
+          Skip confirmations. EXTREMELY DANGEROUS.
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without persisted trust.
+          Intended only for automation that already vets hook sources.
+
+  -C, --cd <DIR>
+          Set the working root.
+"""
+
+    with pytest.raises(AssertionError):
+        _assert_codex_hook_trust_help(help_text)
