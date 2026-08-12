@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.transcripts import parse_codex_transcript
+from scripts.hook_logging import configure_hook_logger
 
 
 MAX_TURNS = 30
@@ -45,24 +46,9 @@ def _runtime_root() -> Path:
 
 
 def _logger() -> logging.Logger:
-    logger = logging.getLogger("ai-memory-codex-session-end")
-    if logger.handlers:
-        return logger
-    try:
-        log_dir = _runtime_root() / "scripts" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler: logging.Handler = logging.FileHandler(
-            log_dir / "hooks.log", encoding="utf-8"
-        )
-    except OSError:
-        handler = logging.NullHandler()
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s [codex-session-end] %(message)s")
+    return configure_hook_logger(
+        "ai-memory-codex-session-end", "codex-session-end", _runtime_root()
     )
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
 
 
 def main(clock: Callable[[], float] = time.monotonic) -> None:

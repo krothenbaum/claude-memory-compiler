@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.capture import enqueue_hook_input
+from scripts.hook_logging import configure_hook_logger
 from scripts.transcripts import parse_claude_transcript, render_turns
 
 
@@ -214,24 +215,9 @@ def _runtime_root() -> Path:
 
 
 def _logger() -> logging.Logger:
-    logger = logging.getLogger("ai-memory-session-end")
-    if logger.handlers:
-        return logger
-    try:
-        log_dir = _runtime_root() / "scripts" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler: logging.Handler = logging.FileHandler(
-            log_dir / "hooks.log", encoding="utf-8"
-        )
-    except OSError:
-        handler = logging.NullHandler()
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s [session-end] %(message)s")
+    return configure_hook_logger(
+        "ai-memory-session-end", "session-end", _runtime_root()
     )
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
 
 
 def _read_hook_input() -> dict[str, object]:

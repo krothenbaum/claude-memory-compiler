@@ -112,15 +112,19 @@ def _fsync_directory(path: Path | str) -> None:
 
 
 def _validate_log_directory(info: os.stat_result, path: Path) -> None:
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise ValueError(f"log directory must be a non-symlink directory: {path}")
+    if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(
+            f"log directory must be a non-symlink, non-reparse directory: {path}"
+        )
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise ValueError(f"log directory has an unsafe owner: {path}")
 
 
 def _validate_log_file(info: os.stat_result, path: Path) -> None:
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ValueError(f"log path must be a regular non-symlink file: {path}")
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(
+            f"log path must be a regular non-symlink, non-reparse file: {path}"
+        )
     if info.st_nlink != 1:
         raise ValueError(f"log path must not be hard-linked: {path}")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
@@ -131,6 +135,40 @@ def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
+def _link_or_reparse(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse and attributes & reparse)
+
+
+def prepare_secure_log_directory(memory_root: Path | str) -> Path:
+    """Create and validate the runtime ``scripts/logs`` directory.
+
+    Existing project directories keep their modes. Newly created runtime
+    directories are private, and every component inside the configured memory
+    boundary must be owner-controlled and must not be a link/reparse point.
+    """
+    root = Path(os.path.abspath(Path(memory_root).expanduser()))
+    if not root.exists() and not root.is_symlink():
+        root.mkdir(mode=0o700)
+    _validate_log_directory(root.lstat(), root)
+
+    current = root
+    for name in ("scripts", "logs"):
+        candidate = current / name
+        if not candidate.exists() and not candidate.is_symlink():
+            candidate.mkdir(mode=0o700)
+        _validate_log_directory(candidate.lstat(), candidate)
+        current = candidate
+    try:
+        current.chmod(0o700)
+    except OSError:
+        pass
+    return current
+
+
 def _open_secure_log_fallback(path: Path):
     """Open an existing log when directory-relative no-follow opens are unavailable."""
     root = path.parent.parent
@@ -139,11 +177,18 @@ def _open_secure_log_fallback(path: Path):
     scripts_before = scripts.lstat()
     _validate_log_directory(root_before, root)
     _validate_log_directory(scripts_before, scripts)
-    if not path.exists() or path.is_symlink():
-        raise ValueError("secure log creation requires directory-relative no-follow opens")
-    file_before = path.lstat()
-    _validate_log_file(file_before, path)
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        file_before = path.lstat()
+    except FileNotFoundError:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        file_before = os.fstat(descriptor)
+    else:
+        _validate_log_file(file_before, path)
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
     try:
         opened = os.fstat(descriptor)
         _validate_log_file(opened, path)
@@ -157,7 +202,9 @@ def _open_secure_log_fallback(path: Path):
             scripts_before, scripts_after
         ):
             raise ValueError(f"log directory identity changed while opening: {scripts}")
-        if stat.S_IMODE(opened.st_mode) & ~0o600:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        elif stat.S_IMODE(opened.st_mode) & ~0o600:
             raise ValueError(f"log path has unsafe permissions: {path}")
         stream = os.fdopen(descriptor, "a", encoding="utf-8")
     except BaseException:

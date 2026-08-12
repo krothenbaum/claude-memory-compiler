@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import importlib.util
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -37,6 +38,18 @@ Options:
   -C, --cd <DIR>
           Tell the agent which working root to use.
 """
+
+HOOK_LOGGERS = [
+    ("session-end.py", "ai-memory-session-end", "session-end"),
+    ("pre-compact.py", "ai-memory-pre-compact", "pre-compact"),
+    ("codex-session-end.py", "ai-memory-codex-session-end", "codex-session-end"),
+]
+
+
+def _close_hook_handlers(logger: logging.Logger) -> None:
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
 
 def _tree_manifest(root: Path) -> dict[str, tuple[str, int, int, bytes | str | None]]:
@@ -1612,6 +1625,174 @@ def _load_hook(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("hook_name,logger_name,label", HOOK_LOGGERS)
+def test_hook_logger_creates_private_log_and_preserves_host_handlers(
+    tmp_path, monkeypatch, hook_name, logger_name, label
+):
+    hook = _load_hook(hook_name)
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    logger = logging.getLogger(logger_name)
+    _close_hook_handlers(logger)
+    host_handler = logging.NullHandler()
+    logger.addHandler(host_handler)
+    try:
+        first = hook._logger()
+        second = hook._logger()
+        first.info("private hook message")
+
+        path = memory_home / "scripts" / "logs" / "hooks.log"
+        assert first is second is logger
+        assert host_handler in logger.handlers
+        tagged = [
+            handler
+            for handler in logger.handlers
+            if getattr(handler, "_memory_hook_file", False)
+        ]
+        assert len(tagged) == 1
+        assert logger.propagate is False
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert path.stat().st_nlink == 1
+        if hasattr(os, "getuid"):
+            assert path.stat().st_uid == os.getuid()
+        assert f"[{label}] private hook message" in path.read_text(encoding="utf-8")
+    finally:
+        _close_hook_handlers(logger)
+
+
+@pytest.mark.parametrize("hook_name,logger_name,_label", HOOK_LOGGERS)
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "root-symlink",
+        "scripts-symlink",
+        "logs-symlink",
+        "file-symlink",
+        "file-hardlink",
+    ],
+)
+def test_hook_logger_rejects_linked_paths_without_external_mutation(
+    tmp_path, monkeypatch, hook_name, logger_name, _label, attack
+):
+    hook = _load_hook(hook_name)
+    memory_home = tmp_path / "memory"
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel.log"
+    sentinel.write_text("do not mutate", encoding="utf-8")
+    sentinel.chmod(0o600)
+    if attack == "root-symlink":
+        memory_home.symlink_to(external, target_is_directory=True)
+        scripts = memory_home / "scripts"
+    else:
+        memory_home.mkdir()
+        scripts = memory_home / "scripts"
+    if attack == "root-symlink":
+        pass
+    elif attack == "scripts-symlink":
+        scripts.symlink_to(external, target_is_directory=True)
+    else:
+        scripts.mkdir()
+        logs = scripts / "logs"
+        if attack == "logs-symlink":
+            logs.symlink_to(external, target_is_directory=True)
+        else:
+            logs.mkdir()
+            target = logs / "hooks.log"
+            if attack == "file-symlink":
+                target.symlink_to(sentinel)
+            else:
+                os.link(sentinel, target)
+    before = _tree_manifest(external)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    logger = logging.getLogger(logger_name)
+    _close_hook_handlers(logger)
+    try:
+        configured = hook._logger()
+        configured.error("must not escape")
+
+        assert _tree_manifest(external) == before
+        assert len(configured.handlers) == 1
+        assert isinstance(configured.handlers[0], logging.NullHandler)
+        assert getattr(configured.handlers[0], "_memory_hook_file", False)
+    finally:
+        _close_hook_handlers(logger)
+
+
+@pytest.mark.parametrize("hook_name,logger_name,_label", HOOK_LOGGERS)
+def test_hook_logger_cross_platform_fallback_creates_private_file(
+    tmp_path, monkeypatch, hook_name, logger_name, _label
+):
+    import scripts.utils as memory_utils
+
+    hook = _load_hook(hook_name)
+    memory_home = tmp_path / "memory"
+    memory_home.mkdir()
+    (memory_home / "scripts").mkdir()
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    logger = logging.getLogger(logger_name)
+    _close_hook_handlers(logger)
+    try:
+        hook._logger().warning("fallback message")
+
+        path = memory_home / "scripts" / "logs" / "hooks.log"
+        assert path.read_text(encoding="utf-8").count("fallback message") == 1
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert path.stat().st_nlink == 1
+    finally:
+        _close_hook_handlers(logger)
+
+
+def test_secure_hook_logging_detects_windows_reparse_attribute(monkeypatch):
+    import scripts.utils as memory_utils
+
+    monkeypatch.setattr(
+        memory_utils.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False
+    )
+    info = type(
+        "WindowsStat",
+        (),
+        {"st_mode": stat.S_IFDIR | 0o700, "st_file_attributes": 0x400},
+    )()
+
+    assert memory_utils._link_or_reparse(info)
+
+
+@pytest.mark.parametrize("hook_name,logger_name,_label", HOOK_LOGGERS)
+def test_hook_logger_replaces_only_its_handler_when_runtime_path_changes(
+    tmp_path, monkeypatch, hook_name, logger_name, _label
+):
+    hook = _load_hook(hook_name)
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    logger = logging.getLogger(logger_name)
+    _close_hook_handlers(logger)
+    host_handler = logging.NullHandler()
+    logger.addHandler(host_handler)
+    try:
+        monkeypatch.setenv("AI_MEMORY_HOME", str(first_root))
+        hook._logger().info("first path")
+        monkeypatch.setenv("AI_MEMORY_HOME", str(second_root))
+        hook._logger().info("second path")
+
+        first_text = (first_root / "scripts" / "logs" / "hooks.log").read_text()
+        second_text = (second_root / "scripts" / "logs" / "hooks.log").read_text()
+        assert "first path" in first_text
+        assert "second path" not in first_text
+        assert "second path" in second_text
+        assert host_handler in logger.handlers
+        assert sum(
+            bool(getattr(handler, "_memory_hook_file", False))
+            for handler in logger.handlers
+        ) == 1
+    finally:
+        _close_hook_handlers(logger)
 
 
 def _write_retrieval_files(memory_home: Path) -> None:
