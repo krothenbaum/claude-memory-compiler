@@ -269,8 +269,8 @@ _AUTH_MARKERS = (
     "log in",
 )
 _MAX_REASON_LENGTH = 500
+_CODEX_LOGIN_STATUS_PREFIX = "Logged in using "
 _CODEX_CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT"
-_CODEX_API_KEY_LOGIN_STATUS = "Logged in using an API key"
 
 
 def subscription_child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -421,10 +421,16 @@ class CodexProvider:
             for line in stream.splitlines()
             if line.strip()
         }
+        login_status_lines = {
+            line
+            for line in status_lines
+            if line.startswith(_CODEX_LOGIN_STATUS_PREFIX)
+            and len(line) > len(_CODEX_LOGIN_STATUS_PREFIX)
+        }
         if (
             status.returncode == 0
             and _CODEX_CHATGPT_LOGIN_STATUS in status_lines
-            and _CODEX_API_KEY_LOGIN_STATUS not in status_lines
+            and login_status_lines == {_CODEX_CHATGPT_LOGIN_STATUS}
         ):
             return None
         if status.returncode == 0:

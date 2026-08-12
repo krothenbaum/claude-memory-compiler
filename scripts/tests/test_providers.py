@@ -320,6 +320,53 @@ def test_codex_rejects_api_key_status_even_with_chatgpt_status(
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ("Logged in using ChatGPT\n", "Logged in using SSO\n"),
+        (" \tLogged in using SSO  \r\n", "  Logged in using ChatGPT \n"),
+    ],
+    ids=["conflict-in-stderr", "normalized-conflict-in-stdout"],
+)
+def test_codex_rejects_other_exact_login_mode_beside_chatgpt(
+    fake_runner, text_request, stdout, stderr
+):
+    runner = fake_runner(FakeCommandResult(stdout=stdout, stderr=stderr))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "auth_failed"
+    assert result.text == ""
+    assert len(runner.calls) == 1
+
+
+def test_codex_accepts_duplicate_exact_chatgpt_status_lines(
+    fake_runner, text_request
+):
+    runner = fake_runner(
+        FakeCommandResult(
+            stdout="Logged in using ChatGPT\n",
+            stderr="  Logged in using ChatGPT  \r\n",
+        ),
+        _write_codex_output("codex answer"),
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert result.text == "codex answer"
+
+
+def test_codex_login_status_matching_is_case_sensitive(fake_runner, text_request):
+    runner = fake_runner(FakeCommandResult(stdout="logged in using ChatGPT\n"))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "auth_failed"
+    assert result.text == ""
+    assert len(runner.calls) == 1
+
+
 def test_codex_rejects_nonzero_chatgpt_status_without_leaking_secret(
     fake_runner, text_request
 ):
