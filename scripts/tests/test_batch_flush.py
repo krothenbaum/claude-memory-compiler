@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import sqlite3
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +68,21 @@ def manifest(root: Path) -> dict[str, str]:
         return {}
     return {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def metadata_manifest(root: Path) -> dict[str, tuple[str, int, int, int]]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_mode,
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
@@ -185,6 +202,108 @@ def test_multi_chunk_resume_keys_are_distinct_and_stable(batch, tmp_path):
     assert len({chunk.source_hash for chunk in first}) == 3
     assert [chunk.source_hash for chunk in first] == [chunk.source_hash for chunk in second]
 
+    for index, chunk in enumerate(first):
+        live_path = tmp_path / f"live-slice-{index}.jsonl"
+        records = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": session.session_id,
+                    "cwd": session.cwd,
+                    "timestamp": session.timestamp,
+                },
+            }
+        ]
+        for turn in chunk.turns:
+            records.append(
+                {
+                    "timestamp": turn.timestamp,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": turn.role,
+                        "content": [
+                            {
+                                "type": (
+                                    "input_text"
+                                    if turn.role == "user"
+                                    else "output_text"
+                                ),
+                                "text": turn.text,
+                            }
+                        ],
+                    },
+                }
+            )
+        live_path.write_text(
+            "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+        )
+        live_slice = batch.parse_codex_transcript(
+            live_path, {"trigger": "session_end"}
+        )
+        assert chunk.source_hash == live_slice.source_hash
+
+
+@pytest.mark.parametrize("missing", ["id", "cwd", "timestamp"])
+def test_codex_discovery_requires_complete_session_meta(batch, tmp_path, missing):
+    root = tmp_path / "sessions"
+    valid = root / "2026" / "08" / "10" / "valid.jsonl"
+    write_codex(
+        valid,
+        session_id="complete",
+        cwd="/repo/complete",
+        timestamp="2026-08-10T10:00:00Z",
+    )
+    incomplete = root / "2026" / "08" / "10" / f"missing-{missing}.jsonl"
+    records = [json.loads(line) for line in valid.read_text().splitlines()]
+    del records[0]["payload"][missing]
+    incomplete.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    result = batch.discover_codex_sessions(root)
+
+    assert tuple(item.path for item in result.sessions) == (valid,)
+    assert result.malformed == (incomplete,)
+
+
+def test_codex_parsing_is_concurrency_bounded_and_ordered(
+    batch, tmp_path, monkeypatch
+):
+    root = tmp_path / "sessions"
+    for index in range(5):
+        write_codex(
+            root / "2026" / "08" / "10" / f"{index}.jsonl",
+            session_id=f"parse-{index}",
+            cwd="/repo/parse",
+            timestamp=f"2026-08-10T10:0{index}:00Z",
+        )
+    original = batch._parse_codex_candidate
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def tracked(root_path, path):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        try:
+            return original(root_path, path)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(batch, "_parse_codex_candidate", tracked)
+
+    result = batch.discover_codex_sessions(root, concurrency=2)
+
+    assert peak == 2
+    assert [item.path.name for item in result.sessions] == [
+        f"{i}.jsonl" for i in range(5)
+    ]
+
 
 @pytest.mark.parametrize("source", ["claude", "codex", "all"])
 def test_cli_accepts_sources_and_date_filters(batch, source):
@@ -283,21 +402,180 @@ def test_strict_dry_run_is_no_write_no_model_and_reports_plan(
     assert not (memory_home / "scripts" / "state.json").exists()
 
 
+@pytest.mark.parametrize("artifact", ["missing", "corrupt-db", "corrupt-state"])
+def test_resume_dry_run_read_only_lookup_tolerates_missing_and_corrupt_state(
+    batch, tmp_path, artifact
+):
+    memory_home = tmp_path / "memory"
+    (memory_home / "scripts").mkdir(parents=True)
+    if artifact == "corrupt-db":
+        (memory_home / "scripts" / "jobs.sqlite3").write_bytes(b"not sqlite")
+    if artifact == "corrupt-state":
+        (memory_home / "scripts" / "state.json").write_text("{broken", encoding="utf-8")
+    before = manifest(memory_home)
+    args = batch.parse_cli_args(["--source", "codex", "--resume", "--dry-run"])
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            make_discovered(batch, tmp_path, 1),
+            args,
+            memory_home=memory_home,
+            router=None,
+        )
+    )
+
+    assert report.chunks == 1
+    assert report.skipped == 0
+    assert report.enqueued == 1
+    assert manifest(memory_home) == before
+
+
+def test_resume_dry_run_skips_completed_queue_identity_without_mutation(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    sessions = make_discovered(batch, tmp_path, 1)
+    run_args = batch.parse_cli_args(["--source", "codex"])
+    asyncio.run(
+        batch.execute_historical_import(
+            sessions, run_args, memory_home=memory_home, router=TrackingRouter()
+        )
+    )
+    before = manifest(memory_home)
+    dry_args = batch.parse_cli_args(
+        ["--source", "codex", "--resume", "--dry-run"]
+    )
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, dry_args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert report.chunks == 0
+    assert report.enqueued == 0
+    assert report.skipped == 1
+    assert manifest(memory_home) == before
+
+
+def test_read_only_dedup_sees_succeeded_row_present_only_in_wal(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    session = make_discovered(batch, tmp_path, 1)[0].session
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        repository._connection.execute("PRAGMA wal_autocheckpoint = 0")
+        repository._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        queued = repository.enqueue_capture(session)
+        claimed = repository.claim_next("test-worker", batch.datetime.now(batch.timezone.utc), 30)
+        assert claimed is not None
+        repository.complete(queued.job_id, "test-worker")
+        wal_path = Path(f"{queue_path}-wal")
+        assert wal_path.stat().st_size > 0
+        base_only = sqlite3.connect(
+            f"file:{queue_path.resolve().as_posix()}?mode=ro&immutable=1", uri=True
+        )
+        try:
+            assert base_only.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        finally:
+            base_only.close()
+        before = metadata_manifest(memory_home)
+
+        identities = batch._read_queue_identities(queue_path)
+
+        assert identities[batch._identity(session)] == "succeeded"
+        assert metadata_manifest(memory_home) == before
+
+
+def test_read_only_dedup_fails_closed_when_queue_snapshot_never_stabilizes(
+    batch, tmp_path, monkeypatch
+):
+    memory_home = tmp_path / "memory"
+    session = make_discovered(batch, tmp_path, 1)[0].session
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        repository.enqueue_capture(session)
+    before = metadata_manifest(memory_home)
+    counter = iter(range(100))
+    monkeypatch.setattr(
+        batch,
+        "_snapshot_signature",
+        lambda _paths: ((True, next(counter)),),
+    )
+
+    with pytest.raises(batch.QueueSnapshotUnstable):
+        batch._read_queue_identities(queue_path)
+
+    assert metadata_manifest(memory_home) == before
+
+
+def test_resume_dry_run_honors_legacy_processed_session_state(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    sessions = make_discovered(batch, tmp_path, 1)
+    sessions = [
+        replace(sessions[0], session=replace(sessions[0].session, agent="claude"))
+    ]
+    (scripts / "state.json").write_text(
+        json.dumps(
+            {
+                "batch_flush": {
+                    "processed_sessions": {sessions[0].session.session_id: {"chunks": 1}}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = manifest(memory_home)
+    args = batch.parse_cli_args(["--source", "claude", "--resume", "--dry-run"])
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert report.chunks == 0
+    assert report.skipped == 1
+    assert manifest(memory_home) == before
+
+
+def test_dry_run_reports_existing_pending_queue_identity_as_deduplicated(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    sessions = make_discovered(batch, tmp_path, 1)
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        repository.enqueue_capture(sessions[0].session)
+    before = manifest(memory_home)
+    args = batch.parse_cli_args(["--source", "codex", "--dry-run"])
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert report.chunks == 1
+    assert report.enqueued == 0
+    assert report.skipped == 1
+    assert manifest(memory_home) == before
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [("claude", ("claude",)), ("codex", ("codex",)), ("all", ("claude", "codex"))],
 )
-def test_run_batch_discovers_only_requested_sources(batch, source, expected, monkeypatch, tmp_path):
+def test_run_batch_discovers_only_requested_sources(
+    batch, source, expected, monkeypatch, tmp_path
+):
     calls = []
     monkeypatch.setattr(
         batch,
         "discover_claude_sessions",
-        lambda _targets: calls.append("claude") or [],
+        lambda _targets, **_kwargs: calls.append("claude") or [],
     )
     monkeypatch.setattr(
         batch,
         "discover_codex_sessions",
-        lambda _root: calls.append("codex") or batch.CodexDiscovery(()),
+        lambda _root, **_kwargs: calls.append("codex") or batch.CodexDiscovery(()),
     )
     monkeypatch.setattr(batch, "resolve_single_target", lambda _args: object())
     monkeypatch.setattr(
@@ -342,6 +620,35 @@ class TrackingRouter:
         return RoutedResult.from_result(attempt, [attempt], None)
 
 
+class SentinelRouter:
+    def __init__(self, text: str):
+        self.text = text
+        self.calls = 0
+
+    async def generate_text(self, request):
+        self.calls += 1
+        attempt = ProviderResult(
+            provider="codex",
+            model="gpt-5.6-luna",
+            task=TaskKind.EXTRACT,
+            outcome="success",
+            text=self.text,
+        )
+        return RoutedResult.from_result(attempt, [attempt], None)
+
+
+class FailedRouter:
+    async def generate_text(self, request):
+        attempt = ProviderResult(
+            provider="claude",
+            model="claude-test",
+            task=TaskKind.EXTRACT,
+            outcome="error",
+            reason="synthetic failure",
+        )
+        return RoutedResult.from_result(attempt, [attempt], "codex:error:synthetic")
+
+
 def make_discovered(batch, tmp_path: Path, count: int):
     root = tmp_path / "sessions"
     for index in range(count):
@@ -374,6 +681,83 @@ def test_import_bounds_provider_concurrency_and_serializes_daily_writes(batch, t
     assert router.peak == 2
     daily = (memory_home / "daily" / "2026-08-10.md").read_text(encoding="utf-8")
     assert daily.count("**Agent:** Codex") == 5
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_flush_ok_completes_dedup_without_daily_write(batch, tmp_path, agent):
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    session = replace(discovered.session, agent=agent)
+    historical = replace(discovered, session=session)
+    router = SentinelRouter("  FLUSH_OK\n")
+    args = batch.parse_cli_args(["--source", agent, "--resume"])
+
+    first = asyncio.run(
+        batch.execute_historical_import(
+            [historical], args, memory_home=memory_home, router=router
+        )
+    )
+    second = asyncio.run(
+        batch.execute_historical_import(
+            [historical], args, memory_home=memory_home, router=router
+        )
+    )
+
+    assert first.succeeded == 1
+    assert second.skipped == 1
+    assert router.calls == 1
+    assert not (memory_home / "daily").exists()
+
+
+def test_dry_run_reports_models_from_environment(batch, tmp_path, monkeypatch, capsys):
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("AI_MEMORY_CODEX_LUNA_MODEL", "custom-luna")
+    monkeypatch.setenv("AI_MEMORY_CLAUDE_MODEL", "custom-claude")
+    args = batch.parse_cli_args(["--source", "codex", "--dry-run"])
+
+    asyncio.run(
+        batch.execute_historical_import(
+            make_discovered(batch, tmp_path, 1),
+            args,
+            memory_home=memory_home,
+            router=None,
+        )
+    )
+
+    assert (
+        "models: custom-luna (Claude fallback: custom-claude)"
+        in capsys.readouterr().out
+    )
+
+
+def test_failed_import_reports_dead_job_and_main_returns_nonzero(
+    batch, tmp_path, monkeypatch, capsys
+):
+    original_repository = batch.QueueRepository
+    monkeypatch.setattr(
+        batch,
+        "QueueRepository",
+        lambda path: original_repository(path, max_attempts=1),
+    )
+    args = batch.parse_cli_args(["--source", "codex"])
+    report = asyncio.run(
+        batch.execute_historical_import(
+            make_discovered(batch, tmp_path, 1),
+            args,
+            memory_home=tmp_path / "memory",
+            router=FailedRouter(),
+        )
+    )
+
+    assert report.failed == 0
+    assert report.dead == 1
+    assert "failed: 0" in capsys.readouterr().out
+    monkeypatch.setattr(
+        batch,
+        "run_batch",
+        lambda _args: asyncio.sleep(0, result=report),
+    )
+    assert batch.main(["--source", "codex", "--dry-run"]) == 1
 
 
 def test_resume_skips_completed_jobs_and_provider_fallback_does_not_change_key(
@@ -415,6 +799,16 @@ def test_resume_skips_completed_jobs_and_provider_fallback_does_not_change_key(
         )
     second_router = TrackingRouter()
 
+    dry_args = batch.parse_cli_args(
+        ["--source", "codex", "--resume", "--dry-run"]
+    )
+    before_dry_run = manifest(memory_home)
+    dry_report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, dry_args, memory_home=memory_home, router=None
+        )
+    )
+
     second = asyncio.run(
         batch.execute_historical_import(
             sessions, args, memory_home=memory_home, router=second_router
@@ -431,3 +825,5 @@ def test_resume_skips_completed_jobs_and_provider_fallback_does_not_change_key(
     assert second.succeeded == 0
     assert second_router.calls == 0
     assert daily_path.read_bytes() == daily_before
+    assert dry_report.skipped == 1
+    assert manifest(memory_home) == before_dry_run

@@ -1068,7 +1068,7 @@ def test_chunk_session_keeps_assistant_reply_with_oversize_user_turn():
     assert tuple(turn for chunk in chunks for turn in chunk.turns) == oversized.turns
 
 
-def test_chunk_session_hashes_repeated_slices_by_position(tmp_path):
+def test_chunk_session_deduplicates_identical_normalized_slices(tmp_path):
     transcript = tmp_path / "repeated.jsonl"
     records = []
     for _ in range(3):
@@ -1093,7 +1093,7 @@ def test_chunk_session_hashes_repeated_slices_by_position(tmp_path):
     assert len(chunks) == 3
     assert all(chunk.turns == chunks[0].turns for chunk in chunks)
     assert tuple(turn for chunk in chunks for turn in chunk.turns) == session.turns
-    assert len({chunk.source_hash for chunk in chunks}) == 3
+    assert len({chunk.source_hash for chunk in chunks}) == 1
     assert [chunk.source_hash for chunk in chunks] == [
         chunk.source_hash for chunk in repeated
     ]

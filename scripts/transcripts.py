@@ -674,26 +674,9 @@ def render_turns(session: NormalizedSession) -> str:
     return _render_turns(session.turns)
 
 
-def _chunk_hash(
-    parent_source_hash: str, ordinal: int, turn_start: int, turn_end: int
-) -> str:
-    canonical = {
-        "chunk_ordinal": ordinal,
-        "parent_source_hash": parent_source_hash,
-        "turn_end": turn_end,
-        "turn_start": turn_start,
-    }
-    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode()).hexdigest()
-
-
 def _session_with_turns(
     session: NormalizedSession,
     turns: Sequence[Turn],
-    *,
-    ordinal: int,
-    turn_start: int,
-    turn_end: int,
 ) -> NormalizedSession:
     normalized_turns = tuple(turns)
     return NormalizedSession(
@@ -705,11 +688,12 @@ def _session_with_turns(
         trigger=session.trigger,
         turns=normalized_turns,
         source_path=session.source_path,
-        source_hash=_chunk_hash(
-            session.source_hash,
-            ordinal,
-            turn_start,
-            turn_end,
+        source_hash=_canonical_hash(
+            agent=session.agent,
+            session_id=session.session_id,
+            project=session.project,
+            cwd=session.cwd,
+            turns=normalized_turns,
         ),
     )
 
@@ -731,33 +715,19 @@ def chunk_session(
         return [session]
 
     chunks: list[NormalizedSession] = []
+
+    def append_chunk(turns: Sequence[Turn]) -> None:
+        chunks.append(_session_with_turns(session, turns))
+
     current: list[Turn] = []
     current_chars = 0
-    chunk_start = 0
-    for turn_index, turn in enumerate(session.turns):
+    for turn in session.turns:
         if current and current_chars >= target_chars and turn.role == "user":
-            chunks.append(
-                _session_with_turns(
-                    session,
-                    current,
-                    ordinal=len(chunks),
-                    turn_start=chunk_start,
-                    turn_end=turn_index,
-                )
-            )
+            append_chunk(current)
             current = []
             current_chars = 0
-            chunk_start = turn_index
         current.append(turn)
         current_chars += len(_render_turn(turn))
     if current:
-        chunks.append(
-            _session_with_turns(
-                session,
-                current,
-                ordinal=len(chunks),
-                turn_start=chunk_start,
-                turn_end=len(session.turns),
-            )
-        )
+        append_chunk(current)
     return chunks

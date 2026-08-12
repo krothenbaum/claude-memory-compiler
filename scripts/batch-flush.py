@@ -22,9 +22,13 @@ import os
 import argparse
 import asyncio
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import shutil
+import sqlite3
 import sys
+import tempfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 import hashlib
@@ -46,9 +50,9 @@ from transcripts import (
     render_turns,
 )
 
-from config import TASK_MODELS, load_config
+from config import load_config
 from providers import ClaudeProvider, CodexProvider, ProviderRouter, TaskKind
-from queue import QueueRepository
+from scripts.queue import QueueRepository
 from utils import append_daily_entry
 from worker import MemoryWorker
 
@@ -113,7 +117,10 @@ def configure_logging(*, dry_run: bool) -> None:
     """Configure interactive logging without creating files during imports/dry runs."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    if not any(getattr(handler, "_memory_batch_console", False) for handler in root_logger.handlers):
+    if not any(
+        getattr(handler, "_memory_batch_console", False)
+        for handler in root_logger.handlers
+    ):
         console = logging.StreamHandler(sys.stderr)
         console.setLevel(logging.INFO)
         console.setFormatter(logging.Formatter("%(message)s"))
@@ -200,6 +207,8 @@ class ImportReport:
     enqueued: int = 0
     succeeded: int = 0
     skipped: int = 0
+    failed: int = 0
+    dead: int = 0
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -228,52 +237,70 @@ def _directory_date(root: Path, path: Path) -> str | None:
     return None
 
 
-def discover_codex_sessions(sessions_root: Path | str = CODEX_SESSIONS_DIR) -> CodexDiscovery:
-    """Recursively discover valid local Codex rollouts by normalized identity."""
+def _parse_codex_candidate(root: Path, path: Path) -> HistoricalSession | None:
+    try:
+        if not codex_transcript_is_well_formed(path):
+            return None
+        meta = read_codex_session_meta(path)
+        if meta is None or any(
+            not isinstance(meta.get(field), str) or not str(meta[field]).strip()
+            for field in ("id", "cwd", "timestamp")
+        ):
+            return None
+        timestamp = _parse_timestamp(str(meta["timestamp"]))
+        if timestamp is None:
+            return None
+        normalized = parse_codex_transcript(path, {"trigger": "historical"})
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not normalized.turns:
+        return None
+    return HistoricalSession(
+        session=normalized,
+        path=path,
+        date=timestamp.date().isoformat(),
+        directory_date=_directory_date(root, path),
+    )
+
+
+def discover_codex_sessions(
+    sessions_root: Path | str = CODEX_SESSIONS_DIR, *, concurrency: int = 1
+) -> CodexDiscovery:
+    """Recursively discover valid local Codex rollouts with bounded parsing."""
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
     root = Path(sessions_root).expanduser()
     if not root.is_dir():
         return CodexDiscovery(())
+
+    paths = sorted(root.rglob("*.jsonl"))
+    if concurrency == 1:
+        candidates = [_parse_codex_candidate(root, path) for path in paths]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            candidates = list(
+                executor.map(lambda path: _parse_codex_candidate(root, path), paths)
+            )
 
     sessions: list[HistoricalSession] = []
     malformed: list[Path] = []
     duplicates: list[Path] = []
     disagreements: list[Path] = []
     seen: set[tuple[str, str]] = set()
-    for path in sorted(root.rglob("*.jsonl")):
-        try:
-            if not codex_transcript_is_well_formed(path):
-                malformed.append(path)
-                continue
-            meta = read_codex_session_meta(path)
-            if meta is None:
-                malformed.append(path)
-                continue
-            normalized = parse_codex_transcript(path, {"trigger": "historical"})
-        except (OSError, UnicodeError, ValueError):
+    for path, discovered in zip(paths, candidates, strict=True):
+        if discovered is None:
             malformed.append(path)
             continue
-        if not normalized.turns or normalized.timestamp == "1970-01-01T00:00:00Z":
-            malformed.append(path)
-            continue
-        timestamp = _parse_timestamp(normalized.timestamp)
-        if timestamp is None:
-            malformed.append(path)
-            continue
-        identity = (normalized.session_id, normalized.source_hash)
+        identity = (discovered.session.session_id, discovered.session.source_hash)
         if identity in seen:
             duplicates.append(path)
             continue
         seen.add(identity)
-        encoded_date = _directory_date(root, path)
-        session_date = timestamp.date().isoformat()
-        discovered = HistoricalSession(
-            session=normalized,
-            path=path,
-            date=session_date,
-            directory_date=encoded_date,
-        )
         sessions.append(discovered)
-        if encoded_date is not None and encoded_date != session_date:
+        if (
+            discovered.directory_date is not None
+            and discovered.directory_date != discovered.date
+        ):
             disagreements.append(path)
 
     sessions.sort(key=lambda item: (item.session.timestamp, str(item.path)))
@@ -374,36 +401,58 @@ def scan_transcripts(transcripts_dir: Path) -> list[TranscriptInfo]:
     return results
 
 
-def discover_claude_sessions(targets: Sequence[Target]) -> list[HistoricalSession]:
-    """Normalize historical Claude transcripts while preserving project decoding."""
+def _parse_claude_candidate(
+    target: Target, info: TranscriptInfo
+) -> HistoricalSession | None:
+    if info.size < MIN_FILE_SIZE:
+        return None
+    try:
+        session = parse_claude_transcript(
+            info.path,
+            {
+                "session_id": info.session_id,
+                "cwd": target.project_cwd,
+                "project": target.project_key,
+                "timestamp": info.mtime.isoformat(),
+                "trigger": "historical",
+            },
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not session.turns:
+        return None
+    return HistoricalSession(session, info.path, info.date, info.date)
+
+
+def discover_claude_sessions(
+    targets: Sequence[Target], *, concurrency: int = 1
+) -> list[HistoricalSession]:
+    """Normalize historical Claude transcripts with bounded parsing."""
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+    candidates = [
+        (target, info)
+        for target in targets
+        for info in scan_transcripts(target.transcripts_dir)
+    ]
+    if concurrency == 1:
+        parsed = [_parse_claude_candidate(*candidate) for candidate in candidates]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            parsed = list(
+                executor.map(lambda item: _parse_claude_candidate(*item), candidates)
+            )
+
     discovered: list[HistoricalSession] = []
     seen: set[tuple[str, str]] = set()
-    for target in targets:
-        for info in scan_transcripts(target.transcripts_dir):
-            if info.size < MIN_FILE_SIZE:
-                continue
-            try:
-                session = parse_claude_transcript(
-                    info.path,
-                    {
-                        "session_id": info.session_id,
-                        "cwd": target.project_cwd,
-                        "project": target.project_key,
-                        "timestamp": info.mtime.isoformat(),
-                        "trigger": "historical",
-                    },
-                )
-            except (OSError, UnicodeError, ValueError):
-                continue
-            if not session.turns:
-                continue
-            identity = (session.session_id, session.source_hash)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            discovered.append(
-                HistoricalSession(session, info.path, info.date, info.date)
-            )
+    for historical in parsed:
+        if historical is None:
+            continue
+        identity = (historical.session.session_id, historical.session.source_hash)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        discovered.append(historical)
     return sorted(discovered, key=lambda item: (item.session.timestamp, str(item.path)))
 
 
@@ -434,7 +483,9 @@ def _plan_chunks(
 
 
 def _historical_writer(memory_home: Path):
-    def write(job, text: str) -> Path:
+    def write(job, text: str) -> Path | None:
+        if text.strip() == "FLUSH_OK":
+            return None
         payload = job.payload
         timestamp = _parse_timestamp(str(payload.get("timestamp", "")))
         return append_daily_entry(
@@ -464,25 +515,143 @@ class _BoundedRouter:
             return await self._router.generate_text(request)
 
 
-def _default_router() -> ProviderRouter:
-    config = load_config(os.environ)
+def _default_router(config=None) -> ProviderRouter:
+    config = config or load_config(os.environ)
     return ProviderRouter(
         CodexProvider(task_models=config.task_models),
         ClaudeProvider(model=config.claude_model),
     )
 
 
-def _print_import_report(report: ImportReport) -> None:
+def _config_for_home(memory_home: Path):
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(memory_home)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment.pop("AI_MEMORY_QUEUE_PATH", None)
+    return load_config(environment)
+
+
+def _identity(session: NormalizedSession) -> tuple[str, str, str, str]:
+    return ("capture", session.agent, session.session_id, session.source_hash)
+
+
+class QueueSnapshotUnstable(RuntimeError):
+    """The live queue changed while a read-only snapshot was being captured."""
+
+
+def _snapshot_signature(paths: Sequence[Path]) -> tuple[tuple[object, ...], ...]:
+    signature: list[tuple[object, ...]] = []
+    for path in paths:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            signature.append((False,))
+        else:
+            signature.append(
+                (
+                    True,
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
+            )
+    return tuple(signature)
+
+
+def _copy_stable_queue_snapshot(queue_path: Path, destination: Path) -> None:
+    source_paths = (queue_path, Path(f"{queue_path}-wal"))
+    destination_paths = (destination, Path(f"{destination}-wal"))
+    for _ in range(3):
+        before = _snapshot_signature(source_paths)
+        for target in destination_paths:
+            target.unlink(missing_ok=True)
+        for source, target in zip(source_paths, destination_paths, strict=True):
+            if source.is_file():
+                shutil.copyfile(source, target)
+        after = _snapshot_signature(source_paths)
+        if before == after:
+            return
+    raise QueueSnapshotUnstable("queue changed during read-only snapshot")
+
+
+def _read_queue_identities(queue_path: Path) -> dict[tuple[str, str, str, str], str]:
+    if not queue_path.is_file() or queue_path.is_symlink():
+        return {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="memory-queue-preview-") as directory:
+            snapshot = Path(directory) / "jobs.sqlite3"
+            _copy_stable_queue_snapshot(queue_path, snapshot)
+            connection = sqlite3.connect(snapshot)
+            try:
+                rows = connection.execute(
+                    "SELECT kind, source_agent, session_id, source_hash, status FROM jobs"
+                ).fetchall()
+            finally:
+                connection.close()
+    except (OSError, sqlite3.DatabaseError):
+        return {}
+    return {
+        (kind, agent, session_id, source_hash): status
+        for kind, agent, session_id, source_hash, status in rows
+    }
+
+
+def _read_legacy_processed_sessions(state_path: Path) -> set[str]:
+    if not state_path.is_file():
+        return set()
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        processed = state.get("batch_flush", {}).get("processed_sessions", {})
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        return set()
+    return set(processed) if isinstance(processed, dict) else set()
+
+
+def _dedup_plan(
+    planned: Sequence[NormalizedSession], memory_home: Path, *, resume: bool
+) -> tuple[list[NormalizedSession], int, int]:
+    queue_identities = _read_queue_identities(
+        memory_home / "scripts" / "jobs.sqlite3"
+    )
+    legacy = (
+        _read_legacy_processed_sessions(memory_home / "scripts" / "state.json")
+        if resume
+        else set()
+    )
+    retained: list[NormalizedSession] = []
+    skipped = 0
+    completed = 0
+    for session in planned:
+        status = queue_identities.get(_identity(session))
+        legacy_match = (
+            resume and session.agent == "claude" and session.session_id in legacy
+        )
+        if status is not None or legacy_match:
+            skipped += 1
+            if resume and (status == "succeeded" or legacy_match):
+                completed += 1
+                continue
+        retained.append(session)
+    return retained, skipped, completed
+
+
+def _print_import_report(report: ImportReport, config) -> None:
     print(f"sessions: {report.sessions}")
     print(f"chunks: {report.chunks}")
     print(f"projects: {', '.join(report.projects) if report.projects else '(none)'}")
     print(f"dates: {', '.join(report.dates) if report.dates else '(none)'}")
-    print(f"models: {TASK_MODELS[TaskKind.EXTRACT]} (Claude fallback: claude-sonnet-5)")
+    print(
+        f"models: {config.task_models[TaskKind.EXTRACT]} "
+        f"(Claude fallback: {config.claude_model})"
+    )
     print(f"estimated tokens: {report.estimated_tokens}")
-    if report.enqueued or report.succeeded or report.skipped:
-        print(f"enqueued: {report.enqueued}")
-        print(f"succeeded: {report.succeeded}")
-        print(f"skipped: {report.skipped}")
+    print(f"enqueued: {report.enqueued}")
+    print(f"succeeded: {report.succeeded}")
+    print(f"skipped: {report.skipped}")
+    print(f"failed: {report.failed}")
+    print(f"dead: {report.dead}")
 
 
 async def execute_historical_import(
@@ -493,31 +662,37 @@ async def execute_historical_import(
     router: object | None = None,
 ) -> ImportReport:
     """Plan, enqueue, and drain historical captures through the live queue contract."""
+    home = Path(memory_home).expanduser().resolve()
+    config = _config_for_home(home)
     selected = filter_historical_sessions(sessions, args)
-    planned = _plan_chunks(selected, args.max_cost)
+    all_planned = _plan_chunks(selected, args.max_cost)
+    planned, deduplicated, completed = _dedup_plan(
+        all_planned, home, resume=args.resume
+    )
     report = ImportReport(
         sessions=len(selected),
-        chunks=len(planned),
+        chunks=len(all_planned) - completed,
         projects=tuple(sorted({item.session.project for item in selected})),
         dates=tuple(sorted({item.date for item in selected})),
         estimated_tokens=sum(
             max(1, (len(render_turns(chunk)) + 3) // 4) for chunk in planned
         ),
+        enqueued=(len(planned) - deduplicated + completed) if args.dry_run else 0,
+        skipped=deduplicated,
     )
     if args.dry_run:
-        _print_import_report(report)
+        _print_import_report(report, config)
         return report
 
-    home = Path(memory_home).expanduser().resolve()
     queue_path = home / "scripts" / "jobs.sqlite3"
     repository = QueueRepository(queue_path)
     try:
         enqueued = [repository.enqueue_capture(chunk) for chunk in planned]
         created = sum(result.created for result in enqueued)
-        skipped = len(enqueued) - created
+        skipped = max(deduplicated, len(enqueued) - created)
         if planned:
             bounded_router = _BoundedRouter(
-                router or _default_router(), asyncio.Semaphore(args.concurrency)
+                router or _default_router(config), asyncio.Semaphore(args.concurrency)
             )
             workers = [
                 MemoryWorker(
@@ -530,17 +705,18 @@ async def execute_historical_import(
                 for index in range(args.concurrency)
             ]
             await asyncio.gather(*(worker.drain() for worker in workers))
-        succeeded = sum(
-            repository.get_job(result.job_id).status == "succeeded"
-            for result in enqueued
-            if result.created
-        )
+        statuses = [repository.get_job(result.job_id).status for result in enqueued]
         report = replace(
-            report, enqueued=created, succeeded=succeeded, skipped=skipped
+            report,
+            enqueued=created,
+            succeeded=statuses.count("succeeded"),
+            skipped=skipped,
+            failed=statuses.count("failed"),
+            dead=statuses.count("dead"),
         )
     finally:
         repository.close()
-    _print_import_report(report)
+    _print_import_report(report, config)
     return report
 
 
@@ -1037,7 +1213,7 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
             targets = discover_all_projects()
         else:
             targets = [resolve_single_target(args)]
-        sessions.extend(discover_claude_sessions(targets))
+        sessions.extend(discover_claude_sessions(targets, concurrency=args.concurrency))
 
     if args.source in {"codex", "all"}:
         codex_root = (
@@ -1045,7 +1221,7 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
             if args.codex_sessions_dir
             else Path.home() / ".codex" / "sessions"
         )
-        discovery = discover_codex_sessions(codex_root)
+        discovery = discover_codex_sessions(codex_root, concurrency=args.concurrency)
         sessions.extend(discovery.sessions)
         for path in discovery.malformed:
             logging.warning("Skipping malformed Codex transcript: %s", path)
@@ -1061,7 +1237,7 @@ async def run_batch(args: argparse.Namespace) -> ImportReport:
         memory_home=config.root_dir,
     )
 
-    if args.compile and not args.dry_run:
+    if args.compile and not args.dry_run and not report.failed and not report.dead:
         logging.info("")
         logging.info("=== Triggering Compilation ===")
         import subprocess
@@ -1148,13 +1324,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     previous_guard = os.environ.get("CLAUDE_INVOKED_BY")
     os.environ["CLAUDE_INVOKED_BY"] = previous_guard or "batch_flush"
     try:
-        asyncio.run(run_batch(args))
+        report = asyncio.run(run_batch(args))
     finally:
         if previous_guard is None:
             os.environ.pop("CLAUDE_INVOKED_BY", None)
         else:
             os.environ["CLAUDE_INVOKED_BY"] = previous_guard
-    return 0
+    return 1 if report.failed or report.dead else 0
 
 
 if __name__ == "__main__":
