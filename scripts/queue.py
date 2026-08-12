@@ -17,6 +17,7 @@ try:
     from .providers import ProviderResult
     from .transcripts import NormalizedSession, render_turns
     from .usage import (
+        UnsafeUsagePathError,
         UsageRecord,
         append_usage_record,
         logged_provider_attempt_ids,
@@ -25,7 +26,13 @@ try:
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from providers import ProviderResult
     from transcripts import NormalizedSession, render_turns
-    from usage import UsageRecord, append_usage_record, logged_provider_attempt_ids, recover_usage_log
+    from usage import (
+        UnsafeUsagePathError,
+        UsageRecord,
+        append_usage_record,
+        logged_provider_attempt_ids,
+        recover_usage_log,
+    )
 
 
 # The repository adds scripts/ to sys.path, so this required filename can shadow
@@ -184,7 +191,7 @@ class QueueRepository:
             raise ValueError("max_attempts must be positive")
         self.path = Path(os.path.abspath(Path(path).expanduser()))
         self.memory_home = (
-            Path(memory_home).expanduser().resolve()
+            Path(os.path.abspath(Path(memory_home).expanduser()))
             if memory_home is not None
             else (
                 self.path.parent.parent
@@ -587,6 +594,8 @@ class QueueRepository:
         try:
             recover_usage_log(self.memory_home)
             logged = logged_provider_attempt_ids(self.memory_home)
+        except UnsafeUsagePathError:
+            raise
         except (OSError, ValueError):
             logged = set()
         rows = self._connection.execute(

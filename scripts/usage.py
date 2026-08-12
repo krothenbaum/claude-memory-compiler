@@ -30,6 +30,51 @@ MAX_USAGE_BYTES = 8 * 1024 * 1024
 MAX_USAGE_LINE_BYTES = 64 * 1024
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
+_ATTEMPT_INDEX: dict[Path, tuple[tuple[int, int, int, int, int], set[tuple[str, int]]]] = {}
+
+
+class UnsafeUsagePathError(ValueError):
+    """The usage projection path escapes through an unsafe filesystem object."""
+
+
+def _link_or_reparse(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse and attributes & reparse)
+
+
+def _validate_usage_directory(path: Path, label: str) -> None:
+    info = path.lstat()
+    if _link_or_reparse(info):
+        raise UnsafeUsagePathError(f"usage {label} must not be a symlink or reparse point")
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnsafeUsagePathError(f"usage {label} must be a directory")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise UnsafeUsagePathError(f"usage {label} has an unsafe owner")
+
+
+def _prepare_usage_tree(memory_home: Path, *, create_logs: bool) -> Path | None:
+    if not memory_home.exists() and not memory_home.is_symlink():
+        if not create_logs:
+            return None
+        memory_home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _validate_usage_directory(memory_home, "memory root")
+    scripts = memory_home / "scripts"
+    if not scripts.exists() and not scripts.is_symlink():
+        if not create_logs:
+            return None
+        scripts.mkdir(mode=0o700, exist_ok=True)
+    _validate_usage_directory(scripts, "scripts directory")
+    logs = scripts / "logs"
+    if not logs.exists() and not logs.is_symlink():
+        if not create_logs:
+            return None
+        logs.mkdir(mode=0o700, exist_ok=True)
+    _validate_usage_directory(logs, "logs directory")
+    logs.chmod(0o700)
+    return logs
 
 
 def routed_invalid_output(result: RoutedResult, reason: object) -> RoutedResult:
@@ -161,26 +206,12 @@ class UsageRecord:
         return value
 
 
-def _prepare_private_directory(path: Path) -> None:
-    if path.exists() or path.is_symlink():
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"usage directory must not be a symlink: {path}")
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError(f"usage directory must be a directory: {path}")
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
-            raise ValueError(f"usage directory has an unsafe owner: {path}")
-    else:
-        path.mkdir(mode=0o700)
-    path.chmod(0o700)
-
-
 def _read_private_log(path: Path) -> bytes:
     if not path.exists() and not path.is_symlink():
         return b""
     info = path.lstat()
-    if stat.S_ISLNK(info.st_mode):
-        raise ValueError("usage log must not be a symlink")
+    if _link_or_reparse(info):
+        raise UnsafeUsagePathError("usage log must not be a symlink or reparse point")
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("usage log must be a regular file")
     if info.st_nlink != 1:
@@ -259,10 +290,69 @@ def _valid_usage_records(data: bytes) -> tuple[list[dict[str, object]], bytes]:
 
 def logged_provider_attempt_ids(memory_home: Path | str) -> set[tuple[str, int]]:
     """Read stable queue-attempt identities without taking the writer lock."""
-    home = Path(memory_home).expanduser().resolve()
-    data = _read_private_log(home / "scripts/logs/usage.jsonl")
-    records, _corrupt = _valid_usage_records(data)
-    return {key for value in records if (key := _attempt_key(value)) is not None}
+    home = Path(os.path.abspath(Path(memory_home).expanduser()))
+    logs = _prepare_usage_tree(home, create_logs=False)
+    if logs is None:
+        return set()
+    return _indexed_attempts(logs)
+
+
+def _usage_log_paths(logs: Path) -> tuple[Path, ...]:
+    archives = tuple(sorted(logs.glob("usage.archive-*.jsonl")))
+    active = logs / "usage.jsonl"
+    return (*archives, active) if active.exists() or active.is_symlink() else archives
+
+
+def _validate_usage_file(path: Path) -> os.stat_result:
+    info = path.lstat()
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeUsagePathError(
+            "usage log must be a regular non-symlink, non-reparse file"
+        )
+    if info.st_nlink != 1:
+        raise UnsafeUsagePathError("usage log must not be hard-linked")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise UnsafeUsagePathError("usage log has an unsafe owner")
+    return info
+
+
+def _log_signature(logs: Path) -> tuple[int, int, int, int, int]:
+    directory = logs.stat()
+    active = logs / "usage.jsonl"
+    if not active.exists() and not active.is_symlink():
+        return directory.st_ino, directory.st_mtime_ns, 0, 0, 0
+    info = _validate_usage_file(active)
+    return (
+        directory.st_ino,
+        directory.st_mtime_ns,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _indexed_attempts(logs: Path, *, recover_active: bool = False) -> set[tuple[str, int]]:
+    signature = _log_signature(logs)
+    cached = _ATTEMPT_INDEX.get(logs)
+    if cached is not None and cached[0] == signature:
+        return set(cached[1])
+    attempts: set[tuple[str, int]] = set()
+    for path in _usage_log_paths(logs):
+        _validate_usage_file(path)
+        records, corrupt = _valid_usage_records(_read_private_log(path))
+        if corrupt:
+            if path.name != "usage.jsonl":
+                raise ValueError("usage archive contains malformed JSONL")
+            if recover_active:
+                _recover_usage_unlocked(path, _read_private_log(path))
+                _ATTEMPT_INDEX.pop(logs, None)
+                return _indexed_attempts(logs)
+            continue
+        attempts.update(
+            key for value in records if (key := _attempt_key(value)) is not None
+        )
+    _ATTEMPT_INDEX[logs] = (signature, attempts)
+    return set(attempts)
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -316,30 +406,81 @@ def _recover_usage_unlocked(path: Path, original: bytes) -> bytes:
     return canonical
 
 
+def _validate_archive(path: Path, expected: bytes) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    info = path.lstat()
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeUsagePathError("usage archive must be a regular non-reparse file")
+    if info.st_nlink != 1:
+        raise UnsafeUsagePathError("usage archive must not be hard-linked")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise UnsafeUsagePathError("usage archive has an unsafe owner")
+    if _read_private_log(path) != expected:
+        raise ValueError("usage archive content does not match its digest")
+
+
+def _rotate_usage_log(path: Path, original: bytes) -> None:
+    if not original:
+        return
+    digest = hashlib.sha256(original).hexdigest()
+    archive = path.parent / f"usage.archive-{digest}.jsonl"
+    _validate_archive(archive, original)
+    if not archive.exists():
+        os.replace(path, archive)
+        archive.chmod(0o600)
+        _fsync_directory(path.parent)
+    else:
+        _write_private(path, b"")
+
+
+def _append_private(path: Path, serialized: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+            raise UnsafeUsagePathError("usage log must be a regular non-reparse file")
+        if info.st_nlink != 1:
+            raise UnsafeUsagePathError("usage log must not be hard-linked")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise UnsafeUsagePathError("usage log has an unsafe owner")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        os.write(descriptor, serialized)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _append_usage_record_unlocked(
     memory_home: Path,
     record: UsageRecord,
     *,
     env: Mapping[str, str],
 ) -> Path:
-    scripts = memory_home / "scripts"
-    if scripts.exists() or scripts.is_symlink():
-        info = scripts.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ValueError("scripts path must be a real directory")
-    else:
-        scripts.mkdir(parents=True, mode=0o700)
-    logs = scripts / "logs"
-    _prepare_private_directory(logs)
+    logs = _prepare_usage_tree(memory_home, create_logs=True)
+    assert logs is not None
     path = logs / "usage.jsonl"
-    original = _read_private_log(path)
-    original = _recover_usage_unlocked(path, original) if original else original
-    if _contains_attempt(original, record):
+    attempts = _indexed_attempts(logs, recover_active=True)
+    expected = (
+        (record.queue_id, record.provider_attempt_id)
+        if record.queue_id and record.provider_attempt_id is not None
+        else None
+    )
+    if expected is not None and expected in attempts:
         return path
     serialized = json.dumps(
         record.to_dict(env=env), sort_keys=True, separators=(",", ":")
     ).encode("utf-8") + b"\n"
-    _write_private(path, original + serialized)
+    current_size = path.stat().st_size if path.exists() else 0
+    if current_size and current_size + len(serialized) > MAX_USAGE_BYTES:
+        original = _read_private_log(path)
+        _rotate_usage_log(path, original)
+    _append_private(path, serialized)
+    if expected is not None:
+        attempts.add(expected)
+    _ATTEMPT_INDEX[logs] = (_log_signature(logs), attempts)
     return path
 
 
@@ -350,16 +491,21 @@ def append_usage_record(
     env: Mapping[str, str] | None = None,
 ) -> Path:
     """Append one compact record under the shared writer lock."""
-    home = Path(memory_home).expanduser().resolve()
+    home = Path(os.path.abspath(Path(memory_home).expanduser()))
     source_env = dict(os.environ if env is None else env)
+    _prepare_usage_tree(home, create_logs=True)
     with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
+        _prepare_usage_tree(home, create_logs=True)
         return _append_usage_record_unlocked(home, record, env=source_env)
 
 
 def recover_usage_log(memory_home: Path | str) -> Path:
     """Quarantine malformed records and retain every recoverable valid record."""
-    home = Path(memory_home).expanduser().resolve()
+    home = Path(os.path.abspath(Path(memory_home).expanduser()))
+    logs = _prepare_usage_tree(home, create_logs=False)
     path = home / "scripts/logs/usage.jsonl"
+    if logs is None:
+        return path
     if not path.exists() and not path.is_symlink():
         return path
     original = _read_private_log(path)
@@ -371,8 +517,10 @@ def recover_usage_log(memory_home: Path | str) -> Path:
     if not corrupt and canonical == original:
         return path
     with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
+        _prepare_usage_tree(home, create_logs=False)
         original = _read_private_log(path)
         _recover_usage_unlocked(path, original)
+        _ATTEMPT_INDEX.pop(logs, None)
     return path
 
 

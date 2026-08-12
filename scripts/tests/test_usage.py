@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,7 @@ from providers import ProviderResult, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
 from transcripts import NormalizedSession, Turn
 import usage
+import scripts.usage as queue_usage
 import utils
 import compile as compile_module
 import connections
@@ -296,6 +299,114 @@ def test_usage_log_rejects_symlink_without_touching_target(tmp_path):
     assert target.read_text(encoding="utf-8") == "safe\n"
 
 
+@pytest.mark.parametrize("unsafe_ancestor", ["root", "scripts", "logs"])
+def test_queue_open_rejects_symlinked_usage_ancestor_without_external_changes(
+    tmp_path, unsafe_ancestor
+):
+    queue_path = tmp_path / "custom/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=tmp_path / "initial"):
+        pass
+    external = tmp_path / "external"
+    for relative in ("usage.jsonl", "logs/usage.jsonl", "scripts/logs/usage.jsonl"):
+        target = external / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'{"truncated":')
+    def manifest() -> dict[Path, tuple[str, bytes | None]]:
+        return {
+            path.relative_to(external): (
+                "directory" if path.is_dir() else "file",
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in external.rglob("*")
+        }
+
+    before = manifest()
+    home = tmp_path / "unsafe-memory"
+    if unsafe_ancestor == "root":
+        home.symlink_to(external, target_is_directory=True)
+    elif unsafe_ancestor == "scripts":
+        home.mkdir()
+        (home / "scripts").symlink_to(external, target_is_directory=True)
+    else:
+        (home / "scripts").mkdir(parents=True)
+        (home / "scripts/logs").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="usage.*(symlink|reparse)"):
+        with QueueRepository(queue_path, memory_home=home):
+            pass
+
+    assert manifest() == before
+
+
+def test_usage_ancestor_rejects_windows_reparse_attribute(monkeypatch):
+    monkeypatch.setattr(
+        usage.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False
+    )
+    info = SimpleNamespace(
+        st_mode=stat.S_IFDIR | 0o700,
+        st_file_attributes=0x400,
+    )
+
+    assert usage._link_or_reparse(info)
+
+
+def test_valid_usage_append_does_not_rewrite_existing_log(tmp_path, monkeypatch):
+    usage.append_usage_record(
+        tmp_path,
+        usage.UsageRecord.from_attempt(
+            _attempt(), job_id=1, source_agent="system", timestamp=NOW
+        ),
+    )
+    monkeypatch.setattr(
+        usage,
+        "_write_private",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("valid append rewrote the usage log")
+        ),
+    )
+
+    usage.append_usage_record(
+        tmp_path,
+        usage.UsageRecord.from_attempt(
+            _attempt(), job_id=2, source_agent="system", timestamp=NOW
+        ),
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "scripts/logs/usage.jsonl").read_text().splitlines()
+    ]
+    assert [record["job_id"] for record in records] == [1, 2]
+
+
+def test_usage_rotation_continues_projection_and_reopen_is_idempotent(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    monkeypatch.setattr(queue_usage, "MAX_USAGE_BYTES", 700)
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job_id = repository.enqueue_capture(_session(home)).job_id
+        for _ in range(8):
+            repository.record_attempt(job_id, _attempt())
+
+    def projected() -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for path in sorted((home / "scripts/logs").glob("usage*.jsonl"))
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    assert sorted(record["provider_attempt_id"] for record in projected()) == list(
+        range(1, 9)
+    )
+    before = {path.name: path.read_bytes() for path in (home / "scripts/logs").iterdir()}
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+    after = {path.name: path.read_bytes() for path in (home / "scripts/logs").iterdir()}
+    assert after == before
+
+
 def test_queue_attempt_is_source_of_truth_and_emits_observability_record(tmp_path):
     queue_path = tmp_path / "scripts/jobs.sqlite3"
     with QueueRepository(queue_path, clock=lambda: NOW) as repository:
@@ -379,7 +490,7 @@ def test_routed_usage_records_fallback_without_changing_legacy_state(tmp_path):
     assert json.loads(state_path.read_text()) == {"total_cost": 1.25, "query_count": 3}
 
 
-def test_atomic_usage_append_preserves_previous_log_when_replace_fails(
+def test_usage_append_failure_preserves_previous_log(
     tmp_path, monkeypatch
 ):
     first = usage.UsageRecord.from_attempt(
@@ -387,7 +498,11 @@ def test_atomic_usage_append_preserves_previous_log_when_replace_fails(
     )
     path = usage.append_usage_record(tmp_path, first)
     before = path.read_bytes()
-    monkeypatch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(
+        usage,
+        "_append_private",
+        lambda *_args: (_ for _ in ()).throw(OSError("boom")),
+    )
 
     with pytest.raises(OSError, match="boom"):
         usage.append_usage_record(
