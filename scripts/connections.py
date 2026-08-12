@@ -310,6 +310,10 @@ async def synthesize_connections(
                 discard_stage(candidate)
         notify_terminal(f"connections pass failed: {exc}")
         return 0.0
+    finally:
+        for candidate in [*fallback_holder, stage]:
+            if candidate.root.exists():
+                discard_stage(candidate)
     notify_terminal("connections pass complete")
     return 0.0
 

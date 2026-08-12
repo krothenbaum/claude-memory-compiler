@@ -658,8 +658,14 @@ def _validate_task_contract(
         added_log_lines = _validate_log_append(baseline_log, build_log, task)
 
     if not article_changes:
-        if task in {"file_answer", "connections"}:
+        if task == "file_answer":
             raise StageValidationError(f"{task} requires an article")
+        if task == "connections":
+            if changed != ("knowledge/log.md",):
+                raise StageValidationError(
+                    "connections without an article requires only a valid audit log update"
+                )
+            return
         if task == "compile" and "knowledge/log.md" not in changed:
             raise StageValidationError("compile requires a valid build log update")
         return

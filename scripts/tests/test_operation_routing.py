@@ -15,6 +15,7 @@ import flush
 import lint
 import query
 from providers import ProviderResult, RoutedResult, TaskKind, TextRequest, WorkspaceRequest
+from staging import RetryableApplyError
 from utils import capture_file_baseline
 from worker import MemoryWorker
 
@@ -177,6 +178,44 @@ def test_read_only_query_uses_query_text_request(memory_home: Path):
     assert type(request) is TextRequest
     assert request.task is TaskKind.QUERY
     assert str(memory_home) not in request.prompt
+
+
+def test_query_state_cas_retries_without_losing_concurrent_update(memory_home: Path, monkeypatch):
+    router = RecordingTextRouter("answer")
+    real_apply = query.apply_host_bookkeeping
+    calls = 0
+
+    def racing_apply(home, bookkeeping):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            state_path = home / "scripts/state.json"
+            state_path.write_text(
+                '{"ingested": {}, "query_count": 7, "concurrent": "kept", "total_cost": 4.0}\n',
+                encoding="utf-8",
+            )
+        return real_apply(home, bookkeeping)
+
+    monkeypatch.setattr(query, "apply_host_bookkeeping", racing_apply)
+    assert asyncio.run(query.run_query("race?", router=router, memory_home=memory_home)) == "answer"
+    state = __import__("json").loads((memory_home / "scripts/state.json").read_text())
+    assert state["query_count"] == 8
+    assert state["concurrent"] == "kept"
+    assert state["total_cost"] == 4.0
+    assert calls == 2
+
+
+def test_query_state_cas_exhaustion_preserves_root(memory_home: Path, monkeypatch):
+    router = RecordingTextRouter("answer")
+    before = (memory_home / "scripts/state.json").read_bytes()
+    monkeypatch.setattr(
+        query,
+        "apply_host_bookkeeping",
+        lambda *_args: (_ for _ in ()).throw(RetryableApplyError("race")),
+    )
+    result = asyncio.run(query.run_query("race?", router=router, memory_home=memory_home))
+    assert result.startswith("Error querying knowledge base:")
+    assert (memory_home / "scripts/state.json").read_bytes() == before
 
 
 @pytest.mark.parametrize("file_back", [False, True])
@@ -613,3 +652,110 @@ def test_invalid_codex_specialized_write_uses_fresh_claude_stage(
         if relative in {Path("knowledge/index.md"), Path("knowledge/log.md"), Path("scripts/state.json")}:
             continue
         assert (memory_home / relative).read_bytes() == contents
+
+
+@pytest.mark.parametrize("operation", ["compile", "connections", "file_answer"])
+def test_invalid_claude_fallback_cleans_every_stage_and_can_rerun(
+    memory_home: Path, operation: str
+):
+    class Codex:
+        async def edit_workspace(self, request):
+            _write(request.cwd / "unexpected.txt", "codex invalid")
+            return ProviderResult("codex", "gpt-5.6-terra", request.task, "success")
+
+    class Claude:
+        async def edit_workspace(self, request):
+            return ProviderResult("claude", "claude-sonnet-5", request.task, "success")
+
+    def router_factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+        return ProviderRouter(Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory)
+
+    if operation == "connections":
+        for slug in ("a", "b"):
+            _write(memory_home / f"knowledge/concepts/{slug}.md", f"---\ntitle: {slug}\nproject: memory\nsources:\n  - daily/2026-08-11.md\ncreated: 2026-08-11\nupdated: 2026-08-11\n---\n# {slug}\n")
+
+    def run_once():
+        if operation == "compile":
+            return asyncio.run(compile_module.compile_daily_log(
+                memory_home / "daily/2026-08-11.md",
+                {"ingested": {}, "query_count": 0, "total_cost": 0.0},
+                capture_file_baseline(memory_home / "scripts/state.json"),
+                router_factory=router_factory,
+                memory_home=memory_home,
+            ))
+        if operation == "connections":
+            return asyncio.run(connections.synthesize_connections(
+                [connections.Candidate("a", "b", [], 1.0)],
+                router_factory=router_factory,
+                memory_home=memory_home,
+            ))
+        return asyncio.run(query.run_query(
+            "What changed?", file_back=True, router_factory=router_factory,
+            memory_home=memory_home,
+        ))
+
+    first = run_once()
+    assert list((memory_home / "scripts/staging").iterdir()) == []
+    second = run_once()
+    assert list((memory_home / "scripts/staging").iterdir()) == []
+    if operation == "file_answer":
+        assert str(first).startswith("Error querying knowledge base:")
+        assert str(second).startswith("Error querying knowledge base:")
+
+
+def test_compile_apply_conflict_cleans_stage_and_next_run_succeeds(memory_home: Path, monkeypatch):
+    router = EditingRouter()
+    real_apply = compile_module.apply_validated_stage
+    calls = 0
+
+    def conflict_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableApplyError("concurrent baseline")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(compile_module, "apply_validated_stage", conflict_once)
+    log_path = memory_home / "daily/2026-08-11.md"
+    before = {p.relative_to(memory_home): p.read_bytes() for p in memory_home.rglob("*") if p.is_file()}
+    assert asyncio.run(compile_module.compile_daily_log(
+        log_path, {"ingested": {}}, capture_file_baseline(memory_home / "scripts/state.json"),
+        router=router, memory_home=memory_home,
+    )) == 0.0
+    assert list((memory_home / "scripts/staging").iterdir()) == []
+    for relative, data in before.items():
+        assert (memory_home / relative).read_bytes() == data
+    router.requests.clear()
+    assert asyncio.run(compile_module.compile_daily_log(
+        log_path, {"ingested": {}}, capture_file_baseline(memory_home / "scripts/state.json"),
+        router=router, memory_home=memory_home,
+    )) == 0.0
+    assert "compile | 2026-08-11.md" in (memory_home / "knowledge/log.md").read_text()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_connections_all_rejected_applies_only_canonical_audit(
+    memory_home: Path, malformed: bool
+):
+    for slug in ("a", "b"):
+        _write(memory_home / f"knowledge/concepts/{slug}.md", f"---\ntitle: {slug}\nproject: memory\nsources:\n  - daily/2026-08-11.md\ncreated: 2026-08-11\nupdated: 2026-08-11\n---\n# {slug}\n")
+
+    class RejectingRouter:
+        async def edit_workspace(self, request, **_kwargs):
+            with (request.cwd / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n## malformed audit\n" if malformed else
+                    "\n## [2026-08-11T12:00:00+00:00] connections | swanson-pass\n"
+                    "- Candidates evaluated: 1\n- Connections created: none\n"
+                )
+            return _routed(TaskKind.CONNECTIONS)
+
+    before = (memory_home / "knowledge/log.md").read_bytes()
+    asyncio.run(connections.synthesize_connections(
+        [connections.Candidate("a", "b", [], 1.0)], router=RejectingRouter(),
+        memory_home=memory_home,
+    ))
+    after = (memory_home / "knowledge/log.md").read_bytes()
+    assert (after == before) is malformed
+    assert list((memory_home / "scripts/staging").iterdir()) == []

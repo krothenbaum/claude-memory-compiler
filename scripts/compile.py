@@ -20,6 +20,7 @@ from providers import (
 )
 from staging import (
     ApplyBookkeeping,
+    RetryableApplyError,
     StageValidationError,
     apply_host_bookkeeping,
     apply_validated_stage,
@@ -313,7 +314,16 @@ async def compile_daily_log(
         state=state,
         state_baseline=state_baseline,
     )
-    apply_validated_stage(validated, validated.before, bookkeeping)
+    try:
+        apply_validated_stage(validated, validated.before, bookkeeping)
+    except RetryableApplyError as exc:
+        logger.warning("compile apply deferred for %s: %s", log_path.name, exc)
+        notify_terminal(f"compile deferred — {log_path.name}: concurrent change")
+        return 0.0
+    finally:
+        for candidate in [*fallback_holder, stage]:
+            if candidate.root.exists():
+                discard_stage(candidate)
     notify_terminal(f"compile complete — {log_path.name}")
     return 0.0
 

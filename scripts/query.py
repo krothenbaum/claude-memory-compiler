@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from providers import (
 )
 from staging import (
     ApplyBookkeeping,
+    RetryableApplyError,
     StageValidationError,
     apply_validated_stage,
     apply_host_bookkeeping,
@@ -26,9 +28,44 @@ from staging import (
     discard_stage,
     validate_stage,
 )
-from utils import capture_file_baseline, load_state
+from utils import FileBaseline, read_text_with_baseline
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+_STATE_UPDATE_ATTEMPTS = 3
+
+
+def _state_with_baseline(home: Path) -> tuple[dict, FileBaseline]:
+    """Parse state from the same bytes represented by its CAS baseline."""
+    path = home / "scripts/state.json"
+    try:
+        content, baseline = read_text_with_baseline(path)
+    except FileNotFoundError:
+        return (
+            {"ingested": {}, "query_count": 0, "last_lint": None, "total_cost": 0.0},
+            FileBaseline(False, 0, None),
+        )
+    value = json.loads(content)
+    if not isinstance(value, dict):
+        raise ValueError("state.json must contain an object")
+    return value, baseline
+
+
+def _query_state_bookkeeping(home: Path) -> ApplyBookkeeping:
+    state, baseline = _state_with_baseline(home)
+    state["query_count"] = state.get("query_count", 0) + 1
+    return ApplyBookkeeping(state=state, state_baseline=baseline)
+
+
+def _apply_query_state(home: Path) -> None:
+    last_error: RetryableApplyError | None = None
+    for _attempt in range(_STATE_UPDATE_ATTEMPTS):
+        bookkeeping = _query_state_bookkeeping(home)
+        try:
+            apply_host_bookkeeping(home, bookkeeping)
+            return
+        except RetryableApplyError as exc:
+            last_error = exc
+    raise RetryableApplyError("query state update conflicted after bounded retries") from last_error
 
 
 def _wiki_content(home: Path) -> str:
@@ -118,10 +155,6 @@ async def _file_answer(
     router: object | None,
     router_factory: object | None,
 ) -> str:
-    state_path = home / "scripts/state.json"
-    state = _load_state(home)
-    state["query_count"] = state.get("query_count", 0) + 1
-    state_baseline = capture_file_baseline(state_path)
     stage = create_stage(
         home,
         f"file-answer-{abs(hash(question))}",
@@ -172,11 +205,7 @@ async def _file_answer(
             return f"Error querying knowledge base: {result.reason or result.outcome}"
         selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
         validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.FILE_ANSWER)
-        apply_validated_stage(
-            validated,
-            validated.before,
-            ApplyBookkeeping(state=state, state_baseline=state_baseline),
-        )
+        _apply_file_answer_with_state(validated, home)
         return result.text
     except StageValidationError as exc:
         # A successful Codex command with an invalid manifest is a failed Codex
@@ -202,18 +231,35 @@ async def _file_answer(
                 discard_stage(stage)
             return f"Error querying knowledge base: {retry.reason or retry.outcome}"
         fallback = fallback_holder[-1]
-        validated = validate_stage(fallback, allowed_paths=allowed, task=TaskKind.FILE_ANSWER)
-        apply_validated_stage(
-            validated,
-            validated.before,
-            ApplyBookkeeping(state=state, state_baseline=state_baseline),
-        )
-        return retry.text
+        try:
+            validated = validate_stage(
+                fallback, allowed_paths=allowed, task=TaskKind.FILE_ANSWER
+            )
+            _apply_file_answer_with_state(validated, home)
+            return retry.text
+        except (StageValidationError, RetryableApplyError) as fallback_error:
+            return f"Error querying knowledge base: {fallback_error}"
     except Exception as exc:
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():
                 discard_stage(candidate)
         return f"Error querying knowledge base: {exc}"
+    finally:
+        for candidate in [*fallback_holder, stage]:
+            if candidate.root.exists():
+                discard_stage(candidate)
+
+
+def _apply_file_answer_with_state(validated, home: Path) -> None:
+    last_error: RetryableApplyError | None = None
+    for _attempt in range(_STATE_UPDATE_ATTEMPTS):
+        bookkeeping = _query_state_bookkeeping(home)
+        try:
+            apply_validated_stage(validated, validated.before, bookkeeping)
+            return
+        except RetryableApplyError as exc:
+            last_error = exc
+    raise RetryableApplyError("file-answer state update conflicted after bounded retries") from last_error
 
 
 async def run_query(
@@ -250,26 +296,11 @@ async def run_query(
             answer = f"Error querying knowledge base: {exc}"
 
     if not file_back:
-        state_path = home / "scripts/state.json"
-        state = load_state() if home == ROOT_DIR else _load_state(home)
-        state["query_count"] = state.get("query_count", 0) + 1
-        apply_host_bookkeeping(
-            home,
-            ApplyBookkeeping(
-                state=state,
-                state_baseline=capture_file_baseline(state_path),
-            ),
-        )
+        try:
+            _apply_query_state(home)
+        except RetryableApplyError as exc:
+            return f"Error querying knowledge base: {exc}"
     return answer
-
-
-def _load_state(home: Path) -> dict:
-    path = home / "scripts/state.json"
-    try:
-        value = __import__("json").loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
 
 
 def main(argv: list[str] | None = None) -> int:
