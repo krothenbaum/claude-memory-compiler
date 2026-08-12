@@ -23,6 +23,7 @@ import argparse
 import asyncio
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import json
 import logging
 import shutil
@@ -31,7 +32,7 @@ import stat
 import sys
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import hashlib
@@ -68,6 +69,7 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+WINDOWS = os.name == "nt"
 
 
 def default_transcripts_dir(cwd: Path | None = None) -> Path:
@@ -694,6 +696,29 @@ def _legacy_cost_value(value: object) -> Decimal:
     return total
 
 
+def _read_legacy_reserved_cost(state_path: Path) -> Decimal:
+    try:
+        data = _read_state_bytes(state_path)
+        if data is None:
+            return Decimal(0)
+        state = json.loads(data.decode("utf-8"), parse_float=Decimal)
+        reservations = state.get("batch_flush", {}).get(
+            "historical_cost_reservations", {}
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, ValueError):
+        return Decimal(0)
+    if not isinstance(reservations, dict):
+        return Decimal(0)
+    return sum(
+        (
+            _legacy_cost_value(reservation.get("cost", 0))
+            for reservation in reservations.values()
+            if isinstance(reservation, dict)
+        ),
+        Decimal(0),
+    )
+
+
 def _legacy_accounting_identity(session: NormalizedSession) -> str:
     return hashlib.sha256("\0".join(_identity(session)).encode()).hexdigest()
 
@@ -739,16 +764,30 @@ def _atomic_write_state(state_path: Path, state: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, state_path)
-        directory = os.open(
-            state_path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_state_directory(state_path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_state_directory(directory_path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            directory_path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as exc:
+        unsupported = exc.errno in {
+            errno.EACCES,
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+        }
+        if not (WINDOWS and unsupported):
+            raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _reconcile_legacy_claude_cost(
@@ -756,10 +795,12 @@ def _reconcile_legacy_claude_cost(
     sessions: Sequence[NormalizedSession],
     memory_home: Path,
 ) -> None:
-    succeeded: dict[str, NormalizedSession] = {}
+    succeeded: set[str] = set()
+    has_claude = False
     for session in sessions:
         if session.agent != "claude":
             continue
+        has_claude = True
         status = repository._connection.execute(
             """
             SELECT status FROM jobs
@@ -769,10 +810,9 @@ def _reconcile_legacy_claude_cost(
             (session.agent, session.session_id, session.source_hash),
         ).fetchone()
         if status is not None and status[0] == "succeeded":
-            succeeded[_legacy_accounting_identity(session)] = session
-    if not succeeded:
+            succeeded.add(_legacy_accounting_identity(session))
+    if not has_claude:
         return
-
     state_path = memory_home / "scripts" / "state.json"
     with ExclusiveFileLock(memory_home / "scripts" / "memory-writer.lock"):
         state_data = _read_state_bytes(state_path)
@@ -799,16 +839,168 @@ def _reconcile_legacy_claude_cost(
         accounted = batch_state.get("accounted_historical_jobs")
         if not isinstance(accounted, dict):
             accounted = {}
+        reservations = batch_state.get("historical_cost_reservations")
+        if not isinstance(reservations, dict):
+            reservations = {}
+        retained_reservations: dict[str, dict[str, object]] = {}
+        for identity, reservation in reservations.items():
+            if not isinstance(reservation, dict):
+                continue
+            queue_identity = reservation.get("queue_identity")
+            if not isinstance(queue_identity, list) or len(queue_identity) != 4:
+                continue
+            row = repository._connection.execute(
+                """
+                SELECT status FROM jobs WHERE kind = ? AND source_agent = ?
+                  AND session_id = ? AND source_hash = ?
+                """,
+                tuple(queue_identity),
+            ).fetchone()
+            status = row[0] if row is not None else None
+            if status == "succeeded":
+                succeeded.add(identity)
+            elif status in {"pending", "leased"}:
+                retained_reservations[identity] = reservation
+            elif status is None:
+                expires = _parse_timestamp(str(reservation.get("expires_at", "")))
+                if (
+                    expires is not None
+                    and expires.astimezone(timezone.utc) > datetime.now(timezone.utc)
+                ):
+                    retained_reservations[identity] = reservation
         new_identities = sorted(set(succeeded) - set(accounted))
-        if not new_identities:
+        changed = retained_reservations != reservations or bool(new_identities)
+        if not changed:
             return
         estimate = Decimal(str(FLUSH_COST_ESTIMATE))
         for identity in new_identities:
             accounted[identity] = str(estimate)
         batch_state["accounted_historical_jobs"] = accounted
+        batch_state["historical_cost_reservations"] = retained_reservations
         batch_state["total_cost"] = str(current + estimate * len(new_identities))
         state["batch_flush"] = batch_state
         _atomic_write_state(state_path, state)
+
+
+def _reserve_claude_cost(
+    repository: QueueRepository,
+    sessions: Sequence[NormalizedSession],
+    memory_home: Path,
+    max_cost: Decimal,
+) -> list[NormalizedSession]:
+    state_path = memory_home / "scripts" / "state.json"
+    estimate = Decimal(str(FLUSH_COST_ESTIMATE))
+    with ExclusiveFileLock(memory_home / "scripts" / "memory-writer.lock"):
+        state_data = _read_state_bytes(state_path)
+        try:
+            state = json.loads(state_data.decode("utf-8")) if state_data else {}
+        except (UnicodeError, json.JSONDecodeError):
+            state = {}
+        try:
+            exact = (
+                json.loads(state_data.decode("utf-8"), parse_float=Decimal)
+                if state_data
+                else {}
+            )
+            total = _legacy_cost_value(
+                exact.get("batch_flush", {}).get("total_cost", 0)
+            )
+        except (UnicodeError, json.JSONDecodeError, AttributeError):
+            total = Decimal(0)
+        batch_state = state.get("batch_flush")
+        if not isinstance(batch_state, dict):
+            batch_state = {}
+        accounted = batch_state.get("accounted_historical_jobs")
+        if not isinstance(accounted, dict):
+            accounted = {}
+        reservations = batch_state.get("historical_cost_reservations")
+        if not isinstance(reservations, dict):
+            reservations = {}
+
+        retained_reservations: dict[str, dict[str, object]] = {}
+        claimable_reservations: set[str] = set()
+        now = datetime.now(timezone.utc)
+        for identity, reservation in reservations.items():
+            if not isinstance(reservation, dict):
+                continue
+            queue_identity = reservation.get("queue_identity")
+            if not isinstance(queue_identity, list) or len(queue_identity) != 4:
+                continue
+            row = repository._connection.execute(
+                """
+                SELECT status, lease_expires_at FROM jobs
+                WHERE kind = ? AND source_agent = ?
+                  AND session_id = ? AND source_hash = ?
+                """,
+                tuple(queue_identity),
+            ).fetchone()
+            status = row[0] if row is not None else None
+            lease_expires = (
+                _parse_timestamp(str(row[1]))
+                if row is not None and row[1] is not None
+                else None
+            )
+            if lease_expires is not None:
+                lease_expires = lease_expires.astimezone(timezone.utc)
+            if status == "succeeded":
+                if identity not in accounted:
+                    accounted[identity] = str(estimate)
+                    total += estimate
+            expires = _parse_timestamp(str(reservation.get("expires_at", "")))
+            if expires is not None:
+                expires = expires.astimezone(timezone.utc)
+            if status == "pending":
+                retained_reservations[identity] = reservation
+                if expires is None or expires <= now:
+                    claimable_reservations.add(identity)
+            elif status == "leased":
+                retained_reservations[identity] = reservation
+                if lease_expires is not None and lease_expires <= now:
+                    claimable_reservations.add(identity)
+            elif (
+                status is None
+                and expires is not None
+                and expires > now
+            ):
+                retained_reservations[identity] = reservation
+
+        unique: list[NormalizedSession] = []
+        reclaimable: list[NormalizedSession] = []
+        seen: set[str] = set()
+        for session in sessions:
+            identity = _legacy_accounting_identity(session)
+            if session.agent != "claude" or identity in seen:
+                continue
+            seen.add(identity)
+            if identity in accounted:
+                continue
+            if identity in retained_reservations:
+                if identity in claimable_reservations:
+                    reclaimable.append(session)
+                continue
+            unique.append(session)
+        reserved_cost = estimate * len(retained_reservations)
+        capacity = max(
+            0,
+            (Fraction(max_cost) - Fraction(total) - Fraction(reserved_cost))
+            // Fraction(estimate),
+        )
+        selected = reclaimable + unique[:capacity]
+        for session in selected:
+            identity = _legacy_accounting_identity(session)
+            retained_reservations[identity] = {
+                "cost": str(estimate),
+                "pid": os.getpid(),
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=30)).isoformat(),
+                "queue_identity": list(_identity(session)),
+            }
+        batch_state["accounted_historical_jobs"] = accounted
+        batch_state["historical_cost_reservations"] = retained_reservations
+        batch_state["total_cost"] = str(total)
+        state["batch_flush"] = batch_state
+        _atomic_write_state(state_path, state)
+    return selected
 
 
 def _dedup_plan(
@@ -847,7 +1039,7 @@ def _dedup_plan(
 
 def _print_import_report(report: ImportReport, config) -> None:
     print(f"sessions: {report.sessions}")
-    print(f"chunks: {report.chunks}")
+    print(f"planned chunks: {report.chunks}")
     print(f"projects: {', '.join(report.projects) if report.projects else '(none)'}")
     print(f"dates: {', '.join(report.dates) if report.dates else '(none)'}")
     print(
@@ -858,7 +1050,6 @@ def _print_import_report(report: ImportReport, config) -> None:
     print(f"preexisting: {report.preexisting}")
     print(f"newly enqueued: {report.newly_enqueued}")
     print(f"processed: {report.processed}")
-    print(f"enqueued: {report.enqueued}")
     print(f"succeeded: {report.succeeded}")
     print(f"skipped: {report.skipped}")
     print(f"failed: {report.failed}")
@@ -882,6 +1073,8 @@ async def execute_historical_import(
     accumulated = Decimal(0)
     if args.max_cost is not None:
         accumulated = _read_legacy_total_cost(state_path)
+        if args.dry_run:
+            accumulated += _read_legacy_reserved_cost(state_path)
     all_planned = _plan_chunks(selected, args.max_cost, accumulated)
     planned, deduplicated, would_create, preexisting = _dedup_plan(
         all_planned, queue_path, state_path, resume=args.resume
@@ -907,8 +1100,12 @@ async def execute_historical_import(
     try:
         _reconcile_legacy_claude_cost(repository, candidate_chunks, home)
         if args.max_cost is not None:
-            accumulated = _read_legacy_total_cost(state_path)
-            all_planned = _plan_chunks(selected, args.max_cost, accumulated)
+            _candidate, candidate_duplicates, _new, candidate_preexisting = _dedup_plan(
+                candidate_chunks, queue_path, state_path, resume=args.resume
+            )
+            all_planned = _reserve_claude_cost(
+                repository, candidate_chunks, home, args.max_cost
+            )
             planned, deduplicated, would_create, preexisting = _dedup_plan(
                 all_planned, queue_path, state_path, resume=args.resume
             )
@@ -919,8 +1116,10 @@ async def execute_historical_import(
                     max(1, (len(render_turns(chunk)) + 3) // 4)
                     for chunk in planned
                 ),
-                preexisting=max(report.preexisting, preexisting),
-                skipped=deduplicated,
+                preexisting=max(
+                    report.preexisting, candidate_preexisting, preexisting
+                ),
+                skipped=candidate_duplicates,
             )
         enqueued = [repository.enqueue_capture(chunk) for chunk in planned]
         created = sum(result.created for result in enqueued)

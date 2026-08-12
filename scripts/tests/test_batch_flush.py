@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sqlite3
 import stat
 import sys
@@ -1381,6 +1383,230 @@ def test_concurrent_claude_imports_do_not_lose_legacy_cost_updates(batch, tmp_pa
     assert len(state["accounted_historical_jobs"]) == 2
 
 
+def test_cross_process_claude_max_cost_reservation_prevents_overspend(
+    batch, tmp_path
+):
+    memory_home = tmp_path / "memory"
+    sessions = make_discovered(batch, tmp_path, 2)
+    gate = tmp_path / "go"
+    # Keep the adversary focused on budget arbitration, not first-open schema
+    # creation. Both importers still open and mutate the same live queue.
+    with QueueRepository(memory_home / "scripts" / "jobs.sqlite3"):
+        pass
+    worker = r'''
+import asyncio, importlib.util, json, sys, time
+from pathlib import Path
+from dataclasses import replace
+from scripts.providers import ProviderResult, RoutedResult, TaskKind
+
+batch_path, transcript_path, memory_home, gate = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("child_batch", batch_path)
+batch = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = batch
+spec.loader.exec_module(batch)
+session = batch.parse_codex_transcript(transcript_path, {"trigger": "historical"})
+session = replace(session, agent="claude")
+historical = batch.HistoricalSession(session, transcript_path, "2026-08-10")
+class Router:
+    async def generate_text(self, request):
+        await asyncio.sleep(0.2)
+        attempt = ProviderResult(provider="codex", model="fake", task=TaskKind.EXTRACT,
+                                 outcome="success", text="**Context:** captured")
+        return RoutedResult.from_result(attempt, [attempt], None)
+while not gate.exists():
+    time.sleep(0.005)
+report = asyncio.run(batch.execute_historical_import(
+    [historical], batch.parse_cli_args(["--source", "claude", "--resume", "--max-cost", "0.04"]),
+    memory_home=memory_home, router=Router()))
+print(json.dumps({"new": report.newly_enqueued, "succeeded": report.succeeded}))
+'''
+    batch_path = Path(batch.__file__)
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                worker,
+                str(batch_path),
+                str(item.path),
+                str(memory_home),
+                str(gate),
+            ],
+            cwd=batch_path.parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for item in sessions
+    ]
+    gate.touch()
+    outputs = [process.communicate(timeout=20) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0], outputs
+    with QueueRepository(memory_home / "scripts" / "jobs.sqlite3") as repository:
+        job_count = repository._connection.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone()[0]
+        succeeded = repository._connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'succeeded'"
+        ).fetchone()[0]
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+    assert job_count == 1
+    assert succeeded == 1
+    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+
+
+def test_abandoned_claude_cost_reservation_without_job_is_released(
+    batch, tmp_path
+):
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    abandoned = "a" * 64
+    (scripts / "state.json").write_text(
+        json.dumps(
+            {
+                "batch_flush": {
+                    "total_cost": "0",
+                    "historical_cost_reservations": {
+                        abandoned: {
+                            "cost": "0.04",
+                            "pid": 999_999_999,
+                            "created_at": "2000-01-01T00:00:00+00:00",
+                            "expires_at": "2000-01-01T00:30:00+00:00",
+                            "queue_identity": [
+                                "capture",
+                                "claude",
+                                "crashed-session",
+                                "b" * 64,
+                            ],
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    historical = replace(
+        discovered, session=replace(discovered.session, agent="claude")
+    )
+    router = TrackingRouter()
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            batch.parse_cli_args(
+                ["--source", "claude", "--resume", "--max-cost", "0.04"]
+            ),
+            memory_home=memory_home,
+            router=router,
+        )
+    )
+    state = json.loads((scripts / "state.json").read_text(encoding="utf-8"))[
+        "batch_flush"
+    ]
+
+    assert report.succeeded == 1
+    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert abandoned not in state.get("historical_cost_reservations", {})
+
+
+def test_resume_processes_stale_leased_job_left_by_crashed_cost_reservation(
+    batch, tmp_path
+):
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    session = replace(discovered.session, agent="claude")
+    historical = replace(discovered, session=session)
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path) as repository:
+        repository.enqueue_capture(session)
+        claimed = repository.claim_next(
+            "crashed-worker", batch.datetime.now(batch.timezone.utc), 30
+        )
+        assert claimed is not None
+        repository._connection.execute(
+            "UPDATE jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", claimed.id),
+        )
+    identity = batch._legacy_accounting_identity(session)
+    state_path = memory_home / "scripts" / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "batch_flush": {
+                    "total_cost": "0",
+                    "historical_cost_reservations": {
+                        identity: {
+                            "cost": "0.04",
+                            "pid": 999_999_999,
+                            "created_at": "2000-01-01T00:00:00+00:00",
+                            "expires_at": "2000-01-01T00:30:00+00:00",
+                            "queue_identity": list(batch._identity(session)),
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    router = TrackingRouter()
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical],
+            batch.parse_cli_args(
+                ["--source", "claude", "--resume", "--max-cost", "0.04"]
+            ),
+            memory_home=memory_home,
+            router=router,
+        )
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))["batch_flush"]
+
+    assert report.preexisting == 1
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert router.calls == 1
+    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert state.get("historical_cost_reservations", {}) == {}
+
+
+def test_failed_reserved_claude_job_releases_capacity(
+    batch, tmp_path, monkeypatch
+):
+    original_repository = batch.QueueRepository
+    monkeypatch.setattr(
+        batch,
+        "QueueRepository",
+        lambda path: original_repository(path, max_attempts=1),
+    )
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    historical = replace(
+        discovered, session=replace(discovered.session, agent="claude")
+    )
+    args = batch.parse_cli_args(
+        ["--source", "claude", "--resume", "--max-cost", "0.04"]
+    )
+
+    failed = asyncio.run(
+        batch.execute_historical_import(
+            [historical], args, memory_home=memory_home, router=FailedRouter()
+        )
+    )
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+
+    assert failed.dead == 1
+    assert Decimal(str(state["total_cost"])) == Decimal(0)
+    assert state.get("historical_cost_reservations", {}) == {}
+
+
 def test_legacy_cost_atomic_replace_failure_preserves_prior_state(
     batch, tmp_path, monkeypatch
 ):
@@ -1404,6 +1630,62 @@ def test_legacy_cost_atomic_replace_failure_preserves_prior_state(
 
     assert state_path.read_bytes() == original
     assert list(state_path.parent.glob(".state.json.*.tmp")) == []
+
+
+@pytest.mark.parametrize("operation", ["open", "fsync"])
+def test_atomic_state_write_tolerates_unsupported_windows_directory_fsync(
+    batch, tmp_path, monkeypatch, operation
+):
+    state_path = tmp_path / "scripts" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(batch, "WINDOWS", True, raising=False)
+    if operation == "open":
+        real_open = os.open
+
+        def unsupported_open(path, flags, *args, **kwargs):
+            if Path(path) == state_path.parent and flags & getattr(os, "O_DIRECTORY", 0):
+                raise OSError(errno.EINVAL, "unsupported")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", unsupported_open)
+    else:
+        real_fsync = os.fsync
+
+        def unsupported_fsync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EINVAL, "unsupported")
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", unsupported_fsync)
+
+    batch._atomic_write_state(
+        state_path, {"batch_flush": {"total_cost": "0.04"}}
+    )
+
+    assert json.loads(state_path.read_text())["batch_flush"]["total_cost"] == "0.04"
+
+
+def test_atomic_state_write_propagates_real_posix_directory_fsync_failure(
+    batch, tmp_path, monkeypatch
+):
+    state_path = tmp_path / "scripts" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(batch, "WINDOWS", False, raising=False)
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "storage failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="storage failure"):
+        batch._atomic_write_state(
+            state_path, {"batch_flush": {"total_cost": "0.04"}}
+        )
+
+    assert json.loads(state_path.read_text())["batch_flush"]["total_cost"] == "0.04"
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex"])
@@ -1452,6 +1734,34 @@ def test_dry_run_reports_models_from_environment(batch, tmp_path, monkeypatch, c
         "models: custom-luna (Claude fallback: custom-claude)"
         in capsys.readouterr().out
     )
+
+
+def test_report_output_distinguishes_plan_queue_and_outcomes(batch, tmp_path, capsys):
+    report = batch.ImportReport(
+        sessions=2,
+        chunks=3,
+        projects=("project",),
+        dates=("2026-08-10",),
+        estimated_tokens=100,
+        enqueued=2,
+        preexisting=1,
+        newly_enqueued=2,
+        processed=3,
+        succeeded=2,
+        failed=1,
+    )
+    config = batch._config_for_home(tmp_path / "memory")
+
+    batch._print_import_report(report, config)
+
+    output = capsys.readouterr().out
+    assert "planned chunks: 3" in output
+    assert "preexisting: 1" in output
+    assert "newly enqueued: 2" in output
+    assert "processed: 3" in output
+    assert "succeeded: 2" in output
+    assert "failed: 1" in output
+    assert "\nenqueued:" not in output
 
 
 def test_failed_import_reports_dead_job_and_main_returns_nonzero(
