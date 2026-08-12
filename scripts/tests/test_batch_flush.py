@@ -7,6 +7,7 @@ import errno
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -98,19 +99,34 @@ def manifest(root: Path) -> dict[str, str]:
     }
 
 
-def metadata_manifest(root: Path) -> dict[str, tuple[str, int, int, int]]:
+def metadata_manifest(root: Path) -> dict[str, tuple[object, ...]]:
     if not root.exists():
         return {}
-    return {
-        path.relative_to(root).as_posix(): (
-            hashlib.sha256(path.read_bytes()).hexdigest(),
-            path.stat().st_mode,
-            path.stat().st_size,
-            path.stat().st_mtime_ns,
-        )
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
+    result: dict[str, tuple[object, ...]] = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        info = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if stat.S_ISREG(info.st_mode):
+            result[relative] = (
+                "file",
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+            )
+        elif stat.S_ISDIR(info.st_mode):
+            result[relative] = (
+                "directory",
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        elif stat.S_ISLNK(info.st_mode):
+            result[relative] = ("symlink", os.readlink(path), info.st_mode)
+        else:
+            result[relative] = ("special", info.st_mode, info.st_size)
+    return result
 
 
 def copy_runtime_tree(tmp_path: Path) -> Path:
@@ -124,13 +140,56 @@ def copy_runtime_tree(tmp_path: Path) -> Path:
     return source_root
 
 
-def subprocess_environment(memory_home: Path) -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["AI_MEMORY_HOME"] = str(memory_home)
-    environment.pop("CLAUDE_MEMORY_HOME", None)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment.pop("PYTHONPATH", None)
+def subprocess_environment(memory_home: Path, environment_root: Path) -> dict[str, str]:
+    fake_home = environment_root / "home"
+    zdotdir = environment_root / "zdotdir"
+    fake_home.mkdir(parents=True)
+    zdotdir.mkdir(parents=True)
+    environment = {
+        "AI_MEMORY_HOME": str(memory_home),
+        "HOME": str(fake_home),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TERM": os.environ.get("TERM", "dumb"),
+        "ZDOTDIR": str(zdotdir),
+    }
     return environment
+
+
+def close_tagged_handlers(attribute: str) -> None:
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if getattr(handler, attribute, False):
+            root_logger.removeHandler(handler)
+            handler.close()
+
+
+def test_subprocess_environment_is_minimal_and_scrubs_provider_credentials(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "forbidden-api-key")
+    monkeypatch.setenv("AI_MEMORY_CODEX_TERRA_MODEL", "forbidden-model")
+    monkeypatch.setenv("CLAUDE_INVOKED_BY", "forbidden-internal-guard")
+    monkeypatch.setenv("LEGACY_PROVIDER_TOKEN", "forbidden-token")
+    memory_home = tmp_path / "memory"
+    environment_root = tmp_path / "environment"
+
+    environment = subprocess_environment(memory_home, environment_root)
+
+    assert set(environment) == {
+        "AI_MEMORY_HOME",
+        "HOME",
+        "LANG",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "TERM",
+        "ZDOTDIR",
+    }
+    assert environment["AI_MEMORY_HOME"] == str(memory_home)
+    assert environment["HOME"] == str(environment_root / "home")
+    assert environment["ZDOTDIR"] == str(environment_root / "zdotdir")
+    assert all("forbidden" not in value for value in environment.values())
 
 
 def test_recursive_codex_discovery_uses_session_metadata_and_reports_date_disagreement(
@@ -713,6 +772,10 @@ def forbidden_queue(*args, **kwargs):
 
 module._default_router = forbidden_provider
 module.QueueRepository = forbidden_queue
+module.MemoryWorker = forbidden_queue
+module.ClaudeProvider = forbidden_provider
+module.CodexProvider = forbidden_provider
+module.ProviderRouter = forbidden_provider
 raise SystemExit(module.main([
     "--source", "codex",
     "--codex-sessions-dir", sys.argv[2],
@@ -724,7 +787,7 @@ raise SystemExit(module.main([
     result = subprocess.run(
         [sys.executable, "-c", probe, str(source_root), str(sessions_root)],
         cwd=tmp_path,
-        env=subprocess_environment(memory_home),
+        env=subprocess_environment(memory_home, tmp_path / "environment"),
         capture_output=True,
         text=True,
         timeout=10,
@@ -759,13 +822,243 @@ assert log_path.exists()
     result = subprocess.run(
         [sys.executable, "-c", probe, str(source_root)],
         cwd=tmp_path,
-        env=subprocess_environment(memory_home),
+        env=subprocess_environment(memory_home, tmp_path / "environment"),
         capture_output=True,
         text=True,
         timeout=10,
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_batch_logging_switches_normal_dry_normal_without_duplicate_file_handlers(
+    batch, tmp_path, monkeypatch
+):
+    log_path = tmp_path / "runtime" / "scripts" / "batch.log"
+    log_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(batch, "LOG_FILE", log_path)
+    close_tagged_handlers("_memory_batch_file")
+    try:
+        batch.configure_logging(dry_run=False)
+        batch.configure_logging(dry_run=False)
+        logging.getLogger().info("normal-before-dry")
+        assert sum(
+            bool(getattr(handler, "_memory_batch_file", False))
+            for handler in logging.getLogger().handlers
+        ) == 1
+        before_dry = log_path.read_bytes()
+
+        batch.configure_logging(dry_run=True)
+        logging.getLogger().info("must-stay-console-only")
+        assert log_path.read_bytes() == before_dry
+        assert not any(
+            getattr(handler, "_memory_batch_file", False)
+            for handler in logging.getLogger().handlers
+        )
+
+        batch.configure_logging(dry_run=False)
+        batch.configure_logging(dry_run=False)
+        logging.getLogger().info("normal-after-dry")
+        assert sum(
+            bool(getattr(handler, "_memory_batch_file", False))
+            for handler in logging.getLogger().handlers
+        ) == 1
+        contents = log_path.read_text(encoding="utf-8")
+        assert contents.count("normal-before-dry") == 1
+        assert contents.count("normal-after-dry") == 1
+        assert "must-stay-console-only" not in contents
+    finally:
+        close_tagged_handlers("_memory_batch_file")
+
+
+def test_flush_logging_is_explicit_idempotent_and_replaces_stale_path(
+    tmp_path, monkeypatch
+):
+    import scripts.flush as flush_module
+
+    first = tmp_path / "first" / "scripts" / "flush.log"
+    second = tmp_path / "second" / "scripts" / "flush.log"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    root_logger = logging.getLogger()
+    host_handler = logging.NullHandler()
+    root_logger.addHandler(host_handler)
+    close_tagged_handlers("_memory_flush_file")
+    try:
+        monkeypatch.setattr(flush_module, "LOG_FILE", first)
+        flush_module.configure_logging()
+        flush_module.configure_logging()
+        assert host_handler in root_logger.handlers
+        assert sum(
+            bool(getattr(handler, "_memory_flush_file", False))
+            for handler in root_logger.handlers
+        ) == 1
+        root_logger.warning("first-flush-log")
+
+        monkeypatch.setattr(flush_module, "LOG_FILE", second)
+        flush_module.configure_logging()
+        root_logger.warning("second-flush-log")
+        tagged = [
+            handler
+            for handler in root_logger.handlers
+            if getattr(handler, "_memory_flush_file", False)
+        ]
+        assert len(tagged) == 1
+        assert Path(tagged[0]._memory_log_path) == second.resolve()
+        assert "first-flush-log" in first.read_text(encoding="utf-8")
+        assert "second-flush-log" not in first.read_text(encoding="utf-8")
+        assert "second-flush-log" in second.read_text(encoding="utf-8")
+    finally:
+        close_tagged_handlers("_memory_flush_file")
+        root_logger.removeHandler(host_handler)
+        host_handler.close()
+
+
+@pytest.mark.parametrize("logger_name", ["batch", "flush"])
+def test_loggers_create_owner_only_regular_logs(
+    batch, tmp_path, monkeypatch, logger_name
+):
+    import scripts.flush as flush_module
+
+    log_path = tmp_path / logger_name / "scripts" / f"{logger_name}.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("existing", encoding="utf-8")
+    log_path.chmod(0o644)
+    attribute = f"_memory_{logger_name}_file"
+    module = batch if logger_name == "batch" else flush_module
+    monkeypatch.setattr(module, "LOG_FILE", log_path)
+    close_tagged_handlers(attribute)
+    try:
+        if logger_name == "batch":
+            module.configure_logging(dry_run=False)
+        else:
+            module.configure_logging()
+        assert log_path.is_file()
+        info = log_path.lstat()
+        assert info.st_nlink == 1
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        if hasattr(os, "getuid"):
+            assert info.st_uid == os.getuid()
+    finally:
+        close_tagged_handlers(attribute)
+
+
+@pytest.mark.parametrize("logger_name", ["batch", "flush"])
+@pytest.mark.parametrize("existing_mode", [None, 0o600])
+def test_loggers_keep_owner_only_mode_without_fchmod(
+    batch, tmp_path, monkeypatch, logger_name, existing_mode
+):
+    import scripts.flush as flush_module
+
+    log_path = tmp_path / logger_name / "scripts" / f"{logger_name}.log"
+    log_path.parent.mkdir(parents=True)
+    if existing_mode is not None:
+        log_path.write_text("existing", encoding="utf-8")
+        log_path.chmod(existing_mode)
+    attribute = f"_memory_{logger_name}_file"
+    module = batch if logger_name == "batch" else flush_module
+    monkeypatch.setattr(module, "LOG_FILE", log_path)
+    monkeypatch.delattr(os, "fchmod")
+    close_tagged_handlers(attribute)
+    try:
+        if logger_name == "batch":
+            module.configure_logging(dry_run=False)
+        else:
+            module.configure_logging()
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+    finally:
+        close_tagged_handlers(attribute)
+
+
+@pytest.mark.parametrize("logger_name", ["batch", "flush"])
+def test_loggers_reject_broad_existing_mode_without_fchmod(
+    batch, tmp_path, monkeypatch, logger_name
+):
+    import scripts.flush as flush_module
+
+    log_path = tmp_path / logger_name / "scripts" / f"{logger_name}.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("existing", encoding="utf-8")
+    log_path.chmod(0o644)
+    before = log_path.read_bytes()
+    attribute = f"_memory_{logger_name}_file"
+    module = batch if logger_name == "batch" else flush_module
+    monkeypatch.setattr(module, "LOG_FILE", log_path)
+    monkeypatch.delattr(os, "fchmod")
+    close_tagged_handlers(attribute)
+    try:
+        with pytest.raises(ValueError, match="log path has unsafe permissions"):
+            if logger_name == "batch":
+                module.configure_logging(dry_run=False)
+            else:
+                module.configure_logging()
+        assert log_path.read_bytes() == before
+    finally:
+        close_tagged_handlers(attribute)
+
+
+@pytest.mark.parametrize("logger_name", ["batch", "flush"])
+@pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+def test_loggers_reject_linked_log_without_external_mutation(
+    batch, tmp_path, monkeypatch, logger_name, attack
+):
+    import scripts.flush as flush_module
+
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    external = external_root / "sentinel.log"
+    external.write_text("do not mutate", encoding="utf-8")
+    external.chmod(0o600)
+    log_path = tmp_path / logger_name / "scripts" / f"{logger_name}.log"
+    log_path.parent.mkdir(parents=True)
+    if attack == "symlink":
+        log_path.symlink_to(external)
+    else:
+        os.link(external, log_path)
+    before = metadata_manifest(external_root)
+    attribute = f"_memory_{logger_name}_file"
+    module = batch if logger_name == "batch" else flush_module
+    monkeypatch.setattr(module, "LOG_FILE", log_path)
+    close_tagged_handlers(attribute)
+    try:
+        with pytest.raises(ValueError, match="log.*(symlink|hard-linked)"):
+            if logger_name == "batch":
+                module.configure_logging(dry_run=False)
+            else:
+                module.configure_logging()
+        assert metadata_manifest(external_root) == before
+    finally:
+        close_tagged_handlers(attribute)
+
+
+@pytest.mark.parametrize("logger_name", ["batch", "flush"])
+def test_loggers_reject_symlinked_scripts_directory_without_external_mutation(
+    batch, tmp_path, monkeypatch, logger_name
+):
+    import scripts.flush as flush_module
+
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    sentinel = external_root / "sentinel.txt"
+    sentinel.write_text("do not mutate", encoding="utf-8")
+    root = tmp_path / logger_name
+    root.mkdir()
+    (root / "scripts").symlink_to(external_root, target_is_directory=True)
+    log_path = root / "scripts" / f"{logger_name}.log"
+    before = metadata_manifest(external_root)
+    attribute = f"_memory_{logger_name}_file"
+    module = batch if logger_name == "batch" else flush_module
+    monkeypatch.setattr(module, "LOG_FILE", log_path)
+    close_tagged_handlers(attribute)
+    try:
+        with pytest.raises(ValueError, match="log directory.*symlink"):
+            if logger_name == "batch":
+                module.configure_logging(dry_run=False)
+            else:
+                module.configure_logging()
+        assert metadata_manifest(external_root) == before
+    finally:
+        close_tagged_handlers(attribute)
 
 
 @pytest.mark.parametrize("artifact", ["missing", "corrupt-db", "corrupt-state"])

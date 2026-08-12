@@ -127,6 +127,63 @@ MIN_FILE_SIZE = 5_000           # Skip files < 5KB
 CHUNK_TARGET_CHARS = 25_000     # Target chunk size for LLM extraction
 FLUSH_COST_ESTIMATE = 0.04      # Estimated cost per flush call
 
+
+class _SecureLogHandler(logging.StreamHandler):
+    def flush(self) -> None:
+        if self.stream is None or self.stream.closed:
+            return
+        super().flush()
+        os.fsync(self.stream.fileno())
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            if self.stream is not None and not self.stream.closed:
+                self.stream.close()
+            super().close()
+
+
+def _secure_log_handler(path: Path) -> logging.Handler:
+    path = Path(os.path.abspath(path))
+    for directory in (path.parent.parent, path.parent):
+        info = directory.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"log directory must not be a symlink: {directory}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"log directory must be a directory: {directory}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"log directory has an unsafe owner: {directory}")
+    if path.is_symlink():
+        raise ValueError(f"log path must not be a symlink: {path}")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"log path must be a regular file: {path}")
+        if info.st_nlink != 1:
+            raise ValueError(f"log path must not be hard-linked: {path}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"log path has an unsafe owner: {path}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        elif stat.S_IMODE(info.st_mode) & ~0o600:
+            raise ValueError(f"log path has unsafe permissions: {path}")
+        stream = os.fdopen(descriptor, "a", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _SecureLogHandler(stream)
+
+
+def _remove_handlers(logger: logging.Logger, attribute: str) -> None:
+    for handler in list(logger.handlers):
+        if getattr(handler, attribute, False):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def configure_logging(*, dry_run: bool) -> None:
     """Configure interactive logging without creating files during imports/dry runs."""
     root_logger = logging.getLogger()
@@ -140,11 +197,19 @@ def configure_logging(*, dry_run: bool) -> None:
         console.setFormatter(logging.Formatter("%(message)s"))
         console._memory_batch_console = True  # type: ignore[attr-defined]
         root_logger.addHandler(console)
-    if dry_run or any(
-        getattr(handler, "_memory_batch_file", False) for handler in root_logger.handlers
-    ):
+    tagged = [
+        handler
+        for handler in root_logger.handlers
+        if getattr(handler, "_memory_batch_file", False)
+    ]
+    target = Path(os.path.abspath(LOG_FILE))
+    if dry_run:
+        _remove_handlers(root_logger, "_memory_batch_file")
         return
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
+        return
+    _remove_handlers(root_logger, "_memory_batch_file")
+    file_handler = _secure_log_handler(target)
     file_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s [batch] %(message)s",
@@ -152,6 +217,7 @@ def configure_logging(*, dry_run: bool) -> None:
         )
     )
     file_handler._memory_batch_file = True  # type: ignore[attr-defined]
+    file_handler._memory_log_path = str(target)  # type: ignore[attr-defined]
     root_logger.addHandler(file_handler)
 
 

@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import sys
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,17 +39,94 @@ from providers import (  # noqa: E402
     TextRequest,
 )
 
+class _SecureLogHandler(logging.StreamHandler):
+    def flush(self) -> None:
+        if self.stream is None or self.stream.closed:
+            return
+        super().flush()
+        os.fsync(self.stream.fileno())
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            if self.stream is not None and not self.stream.closed:
+                self.stream.close()
+            super().close()
+
+
+def _secure_log_handler(path: Path) -> logging.Handler:
+    path = Path(os.path.abspath(path))
+    for directory in (path.parent.parent, path.parent):
+        info = directory.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"log directory must not be a symlink: {directory}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"log directory must be a directory: {directory}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"log directory has an unsafe owner: {directory}")
+    if path.is_symlink():
+        raise ValueError(f"log path must not be a symlink: {path}")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"log path must be a regular file: {path}")
+        if info.st_nlink != 1:
+            raise ValueError(f"log path must not be hard-linked: {path}")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError(f"log path has an unsafe owner: {path}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        elif stat.S_IMODE(info.st_mode) & ~0o600:
+            raise ValueError(f"log path has unsafe permissions: {path}")
+        stream = os.fdopen(descriptor, "a", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _SecureLogHandler(stream)
+
+
+def _remove_tagged_handlers(logger: logging.Logger, attribute: str) -> None:
+    for handler in list(logger.handlers):
+        if getattr(handler, attribute, False):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def configure_logging() -> None:
-    """Configure file logging only when the flush CLI actually runs."""
-    # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
-    # file handle bug on Windows), so this is the flush process's observability
-    # channel. Keeping setup out of module import makes prompt reuse read-only.
-    logging.basicConfig(
-        filename=str(LOG_FILE),
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    """Configure flush observability only when the CLI actually runs."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    if not any(
+        getattr(handler, "_memory_flush_console", False)
+        for handler in root_logger.handlers
+    ):
+        console = logging.StreamHandler(sys.stderr)
+        console.setLevel(logging.INFO)
+        console.setFormatter(logging.Formatter("%(message)s"))
+        console._memory_flush_console = True  # type: ignore[attr-defined]
+        root_logger.addHandler(console)
+    target = Path(os.path.abspath(LOG_FILE))
+    tagged = [
+        handler
+        for handler in root_logger.handlers
+        if getattr(handler, "_memory_flush_file", False)
+    ]
+    if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
+        return
+    _remove_tagged_handlers(root_logger, "_memory_flush_file")
+    file_handler = _secure_log_handler(target)
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
+    file_handler._memory_flush_file = True  # type: ignore[attr-defined]
+    file_handler._memory_log_path = str(target)  # type: ignore[attr-defined]
+    root_logger.addHandler(file_handler)
 
 
 def load_flush_state() -> dict:
