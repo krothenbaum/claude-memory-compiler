@@ -1079,6 +1079,246 @@ def test_huge_semantic_suffix_stops_after_safe_final_thirty(tmp_path):
     assert _only_job_source_path(memory_home).stat().st_size < 100_000
 
 
+@pytest.mark.parametrize(
+    ("agent", "kind", "hook_name"),
+    [
+        ("claude", "finding", "session-end.py"),
+        ("codex", "decision", "codex-session-end.py"),
+        ("codex", "finding", "codex-session-end.py"),
+    ],
+)
+def test_long_history_retains_latest_resolved_tool_turn(
+    tmp_path, agent, kind, hook_name
+):
+    source = tmp_path / f"{agent}-{kind}-long-history.jsonl"
+    records = []
+    for index in range(5_000):
+        if agent == "claude":
+            records.append(
+                {"message": {"role": "user", "content": f"OLDER_{index:04d}"}}
+            )
+        else:
+            records.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": f"OLDER_{index:04d}"}
+                        ],
+                    },
+                }
+            )
+    if agent == "claude":
+        records.extend(
+            [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "LATEST_MIXED_TEXT"},
+                            {
+                                "type": "tool_use",
+                                "id": "latest-call",
+                                "name": "Agent",
+                                "input": {},
+                            },
+                        ],
+                    }
+                },
+                {
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "latest-call",
+                                "content": "LATEST_FINDING",
+                            }
+                        ],
+                    }
+                },
+            ]
+        )
+        payload = {
+            "session_id": "long-history",
+            "transcript_path": str(source),
+            "cwd": "/projects/long-history",
+        }
+    else:
+        tool_name = "request_user_input" if kind == "decision" else "wait_agent"
+        output = (
+            {"answers": {"choice": "LATEST_DECISION"}}
+            if kind == "decision"
+            else {"status": "completed", "result": "LATEST_FINDING"}
+        )
+        records.extend(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": tool_name,
+                        "call_id": "latest-call",
+                        "arguments": "{}",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "latest-call",
+                        "output": json.dumps(output),
+                    },
+                },
+            ]
+        )
+        payload = {"transcript_path": str(source)}
+    source.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        hook_name, payload, memory_home, fake_bin=fake_bin
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    rendered = _only_job_payload(memory_home)["rendered_context"]
+    assert "LATEST_FINDING" in rendered or "LATEST_DECISION" in rendered
+    if agent == "claude":
+        assert "LATEST_MIXED_TEXT" in rendered
+    assert _only_job_source_path(memory_home).stat().st_size < 100_000
+
+
+@pytest.mark.parametrize(
+    ("agent", "hook_name"),
+    [("claude", "session-end.py"), ("codex", "codex-session-end.py")],
+)
+def test_long_history_older_duplicate_id_suppresses_latest_result(
+    tmp_path, agent, hook_name
+):
+    source = tmp_path / f"{agent}-old-duplicate.jsonl"
+    if agent == "claude":
+        older_call = {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "reused-call",
+                        "name": "Read",
+                        "input": {},
+                    }
+                ],
+            }
+        }
+        latest_call = {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "reused-call",
+                        "name": "Agent",
+                        "input": {},
+                    }
+                ],
+            }
+        }
+        latest_result = {
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "reused-call",
+                        "content": "DUPLICATE_PRIVATE_RESULT",
+                    }
+                ],
+            }
+        }
+        users = [
+            {"message": {"role": "user", "content": f"SAFE_{index:04d}"}}
+            for index in range(5_000)
+        ]
+        payload = {
+            "session_id": "old-duplicate",
+            "transcript_path": str(source),
+            "cwd": "/projects/old-duplicate",
+        }
+    else:
+        older_call = {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "reused-call",
+                "arguments": "{}",
+            },
+        }
+        latest_call = {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "wait_agent",
+                "call_id": "reused-call",
+                "arguments": "{}",
+            },
+        }
+        latest_result = {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "reused-call",
+                "output": json.dumps(
+                    {"status": "completed", "result": "DUPLICATE_PRIVATE_RESULT"}
+                ),
+            },
+        }
+        users = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"SAFE_{index:04d}"}],
+                },
+            }
+            for index in range(5_000)
+        ]
+        payload = {"transcript_path": str(source)}
+    source.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in [older_call, *users, latest_call, latest_result]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        hook_name, payload, memory_home, fake_bin=fake_bin
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    rendered = _only_job_payload(memory_home)["rendered_context"]
+    assert "SAFE_4999" in rendered
+    assert "DUPLICATE_PRIVATE_RESULT" not in rendered
+    assert "DUPLICATE_PRIVATE_RESULT" not in _only_job_source_path(
+        memory_home
+    ).read_text(encoding="utf-8")
+
+
 def test_process_deadline_kills_blocking_enqueue_with_margin(tmp_path):
     hook = _load_hook("session-end.py")
     owned = tmp_path / "owned-partial.jsonl"

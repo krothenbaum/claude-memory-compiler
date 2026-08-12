@@ -309,6 +309,67 @@ def _retain_failed_snapshot(
     _publish_snapshot(temporary, destination)
 
 
+def _detached_process_options() -> dict[str, object]:
+    options: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if platform.system() == "Windows":
+        options["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        options["start_new_session"] = True
+    return options
+
+
+def _start_detached_worker_wake(root: Path) -> None:
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--wake-worker", str(root)],
+        **_detached_process_options(),
+    )
+
+
+def _start_independent_callable_wake(
+    launcher: Callable[[Path], None], root: Path
+) -> bool:
+    """Start an injected wake outside this process when POSIX fork is available."""
+    fork = getattr(os, "fork", None)
+    if fork is None:
+        return False
+    try:
+        child = fork()
+    except OSError:
+        return False
+    if child == 0:  # pragma: no cover - exercised through subprocess marker test.
+        try:
+            os.setsid()
+            grandchild = fork()
+            if grandchild:
+                os._exit(0)
+            descriptor = os.open(os.devnull, os.O_RDWR)
+            try:
+                for standard_descriptor in (0, 1, 2):
+                    os.dup2(descriptor, standard_descriptor)
+            finally:
+                if descriptor > 2:
+                    os.close(descriptor)
+            try:
+                launcher(root)
+            except Exception:
+                pass
+        finally:
+            os._exit(0)
+    try:
+        os.waitpid(child, 0)
+    except OSError:
+        pass
+    return True
+
+
 def _wake_after_commit(
     launcher: Callable[[Path], None],
     root: Path,
@@ -317,11 +378,21 @@ def _wake_after_commit(
     monotonic: Callable[[], float],
 ) -> None:
     """Best-effort worker wake that can never roll back a committed capture."""
+    if launcher is launch_worker:
+        try:
+            _start_detached_worker_wake(root)
+        except Exception:
+            pass
+        return
     if deadline is None:
         try:
             launcher(root)
         except Exception:
             pass
+        return
+
+    remaining = deadline - monotonic()
+    if remaining <= 0 and _start_independent_callable_wake(launcher, root):
         return
 
     def wake() -> None:
@@ -332,7 +403,9 @@ def _wake_after_commit(
 
     thread = threading.Thread(target=wake, daemon=True)
     thread.start()
-    thread.join(timeout=max(0.0, deadline - monotonic()))
+    thread.join(timeout=max(0.0, remaining))
+    if thread.is_alive():
+        _start_independent_callable_wake(launcher, root)
 
 
 def capture_transcript(
@@ -533,3 +606,7 @@ def enqueue_hook_input(
         env=source_env,
         **kwargs,
     )
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--wake-worker":
+    launch_worker(sys.argv[2])

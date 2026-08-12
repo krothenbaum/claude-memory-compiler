@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import sys
 import threading
 import time
 
@@ -204,7 +205,7 @@ def test_deadline_after_committed_enqueue_retains_job_and_attempts_wake(tmp_path
     write_claude_transcript(source)
     home = tmp_path / "memory"
     current = [0.0]
-    launched = []
+    wake_marker = tmp_path / "wake-marker"
 
     class CommittingQueue:
         def enqueue_capture(self, normalized):
@@ -222,7 +223,7 @@ def test_deadline_after_committed_enqueue_retains_job_and_attempts_wake(tmp_path
         metadata={"trigger": "session_end"},
         memory_home=home,
         queue=CommittingQueue(),
-        launcher=lambda root: launched.append(root),
+        launcher=lambda _root: wake_marker.write_text("woke", encoding="utf-8"),
         env={},
         deadline=1.0,
         monotonic=lambda: current[0],
@@ -231,7 +232,10 @@ def test_deadline_after_committed_enqueue_retains_job_and_attempts_wake(tmp_path
 
     assert result.created is True
     assert Path(result.job.source_path).exists()
-    assert launched == [home]
+    deadline = time.monotonic() + 1
+    while not wake_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert wake_marker.read_text(encoding="utf-8") == "woke"
 
 
 def test_launcher_failure_after_commit_preserves_referenced_snapshot_and_dedup(
@@ -282,8 +286,7 @@ def test_postcommit_deadline_attempts_wake_without_blocking_or_losing_job(tmp_pa
     write_claude_transcript(source)
     home = tmp_path / "memory"
     current = [0.0]
-    wake_started = threading.Event()
-    release_wake = threading.Event()
+    wake_marker = tmp_path / "blocked-wake-marker"
 
     class CommittingQueue:
         def enqueue_capture(self, normalized):
@@ -296,8 +299,8 @@ def test_postcommit_deadline_attempts_wake_without_blocking_or_losing_job(tmp_pa
             return type("Committed", (), {"created": True, "job": job})()
 
     def blocked_wake(_root):
-        wake_started.set()
-        release_wake.wait(5)
+        time.sleep(0.25)
+        wake_marker.write_text("woke", encoding="utf-8")
 
     started = time.monotonic()
     result = capture_transcript(
@@ -313,12 +316,92 @@ def test_postcommit_deadline_attempts_wake_without_blocking_or_losing_job(tmp_pa
         capture_token="postcommitwake",
     )
     elapsed = time.monotonic() - started
-    release_wake.set()
 
     assert result.created is True
-    assert wake_started.wait(0.2)
     assert elapsed < 0.2
     assert Path(result.job.source_path).exists()
+    deadline = time.monotonic() + 1
+    while not wake_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert wake_marker.read_text(encoding="utf-8") == "woke"
+
+
+def test_expired_deadline_wake_outlives_capture_process(tmp_path):
+    marker = tmp_path / "wake-marker"
+    code = (
+        "import pathlib, sys, time\n"
+        f"sys.path.insert(0, {str(Path(capture_module.__file__).parent)!r})\n"
+        "from capture import _wake_after_commit\n"
+        "marker = pathlib.Path(sys.argv[1])\n"
+        "def delayed(_root):\n"
+        "    time.sleep(0.25)\n"
+        "    marker.write_text('woke', encoding='utf-8')\n"
+        "_wake_after_commit(delayed, marker, deadline=0.0, monotonic=lambda: 1.0)\n"
+    )
+    started = time.monotonic()
+
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(marker)],
+        text=True,
+        capture_output=True,
+        timeout=1,
+        check=False,
+    )
+    process_elapsed = time.monotonic() - started
+    _wait_deadline = time.monotonic() + 1
+    while not marker.exists() and time.monotonic() < _wait_deadline:
+        time.sleep(0.01)
+
+    assert result.returncode == 0, result.stderr
+    assert process_elapsed < 0.2
+    assert marker.read_text(encoding="utf-8") == "woke"
+
+
+def test_default_wake_starts_cross_platform_detached_helper(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(capture_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        capture_module.subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    capture_module._start_detached_worker_wake(tmp_path)
+
+    command, options = calls[0]
+    assert command == [
+        sys.executable,
+        str(Path(capture_module.__file__).resolve()),
+        "--wake-worker",
+        str(tmp_path),
+    ]
+    assert options["stdin"] is subprocess.DEVNULL
+    assert options["stdout"] is subprocess.DEVNULL
+    assert options["stderr"] is subprocess.DEVNULL
+    assert options["close_fds"] is True
+    assert "creationflags" in options
+    assert "start_new_session" not in options
+
+
+def test_expired_wake_fork_failure_does_not_escape_commit(monkeypatch, tmp_path):
+    launched = []
+    monkeypatch.setattr(
+        capture_module.os,
+        "fork",
+        lambda: (_ for _ in ()).throw(OSError("fork unavailable")),
+    )
+
+    capture_module._wake_after_commit(
+        lambda root: launched.append(root),
+        tmp_path,
+        deadline=0.0,
+        monotonic=lambda: 1.0,
+    )
+
+    deadline = time.monotonic() + 0.2
+    while not launched and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert launched == [tmp_path]
 
 
 def test_queue_close_failure_after_commit_keeps_snapshot_and_attempts_wake(

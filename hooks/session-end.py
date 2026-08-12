@@ -39,6 +39,7 @@ MAX_LIVE_JSONL_RECORD_BYTES = 500_000
 SEMANTIC_SCAN_CHUNK_BYTES = 500_000
 MAX_SEMANTIC_CANDIDATE_RECORDS = 4_096
 MAX_SEMANTIC_CANDIDATE_BYTES = 16_000_000
+MAX_FALLBACK_SELF_CONTAINED_TURNS = MAX_TURNS * 2
 RECORD_OFFSET_SCALE = 1_000_000
 HOOK_WORK_BUDGET_SECONDS = 2.25
 MIN_CAPTURE_REMAINING_SECONDS = 0.75
@@ -491,6 +492,46 @@ def _is_self_contained_turn(
     )
 
 
+def _dependency_ids(
+    record: dict[str, object], source_agent: Literal["claude", "codex"]
+) -> tuple[set[str], set[str]]:
+    """Return call IDs and result IDs without retaining their payload bodies."""
+    if source_agent == "codex":
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return set(), set()
+        call_id = payload.get("call_id") or payload.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            return set(), set()
+        if payload.get("type") in {"function_call", "custom_tool_call"}:
+            return {call_id}, set()
+        if payload.get("type") in {
+            "function_call_output",
+            "custom_tool_call_output",
+        }:
+            return set(), {call_id}
+        return set(), set()
+
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else record.get(
+        "content"
+    )
+    if not isinstance(content, list):
+        return set(), set()
+    call_ids: set[str] = set()
+    result_ids: set[str] = set()
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+            call_ids.add(block["id"])
+        elif block.get("type") == "tool_result" and isinstance(
+            block.get("tool_use_id"), str
+        ):
+            result_ids.add(block["tool_use_id"])
+    return call_ids, result_ids
+
+
 def _json_output(value: object) -> object:
     if not isinstance(value, str):
         return value
@@ -891,6 +932,8 @@ def bounded_transcript_slice(
         semantic_records: list[tuple[int, dict[str, object]]] = []
         candidate_bytes = 0
         selection_complete = False
+        self_contained_kept = 0
+        dependency_call_ids: set[str] = set()
         for start, chunk in _validated_chunks_backward(
             source, size, deadline=deadline, clock=clock
         ):
@@ -905,8 +948,27 @@ def bounded_transcript_slice(
                 )
                 record = json.loads(line)
                 if _could_contain_semantic_record(record, source_agent):
+                    self_contained = _is_self_contained_turn(record, source_agent)
+                    call_ids, result_ids = _dependency_ids(record, source_agent)
+                    relevant_dependency = bool(
+                        result_ids
+                        or call_ids.intersection(dependency_call_ids)
+                    )
+                    if result_ids:
+                        dependency_call_ids.update(result_ids)
+                    if (
+                        self_contained
+                        and self_contained_kept
+                        >= MAX_FALLBACK_SELF_CONTAINED_TURNS
+                        and not relevant_dependency
+                    ):
+                        continue
+                    if not self_contained and not relevant_dependency:
+                        continue
                     semantic_records.append((offset, record))
                     candidate_bytes += len(line) + 1
+                    if self_contained:
+                        self_contained_kept += 1
                     if (
                         len(semantic_records) > MAX_SEMANTIC_CANDIDATE_RECORDS
                         or candidate_bytes > MAX_SEMANTIC_CANDIDATE_BYTES
@@ -914,9 +976,15 @@ def bounded_transcript_slice(
                         raise LiveTranscriptRejected(
                             "semantic candidate state exceeds live safety bound"
                         )
-                    if len(semantic_records) >= MAX_TURNS and all(
-                        _is_self_contained_turn(candidate, source_agent)
-                        for _candidate_offset, candidate in semantic_records[:MAX_TURNS]
+                    if (
+                        not dependency_call_ids
+                        and len(semantic_records) >= MAX_TURNS
+                        and all(
+                            _is_self_contained_turn(candidate, source_agent)
+                            for _candidate_offset, candidate in semantic_records[
+                                :MAX_TURNS
+                            ]
+                        )
                     ):
                         selection_complete = True
                         break
