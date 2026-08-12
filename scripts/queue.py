@@ -16,9 +16,11 @@ from typing import Callable, Literal, Mapping
 try:
     from .providers import ProviderResult
     from .transcripts import NormalizedSession, render_turns
+    from .usage import UsageRecord, append_usage_record, logged_provider_attempt_ids
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from providers import ProviderResult
     from transcripts import NormalizedSession, render_turns
+    from usage import UsageRecord, append_usage_record, logged_provider_attempt_ids
 
 
 # The repository adds scripts/ to sys.path, so this required filename can shadow
@@ -193,6 +195,7 @@ class QueueRepository:
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._migrate()
             self._secure_database_files()
+            self._sync_usage_records()
         except BaseException:
             self._connection.close()
             raise
@@ -438,7 +441,7 @@ class QueueRepository:
     def record_attempt(self, job_id: int, result: ProviderResult) -> None:
         ended = self._now()
         started = ended - timedelta(milliseconds=max(0, result.elapsed_ms))
-        self._connection.execute(
+        cursor = self._connection.execute(
             """
             INSERT INTO provider_attempts (
                 job_id, provider, model, task, started_at, ended_at, outcome,
@@ -463,6 +466,87 @@ class QueueRepository:
                 max(0, result.elapsed_ms),
             ),
         )
+        self._append_attempt_usage(cursor.lastrowid)
+
+    def _usage_row(self, attempt_id: int) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT a.*, j.source_agent
+            FROM provider_attempts AS a
+            JOIN jobs AS j ON j.id = a.job_id
+            WHERE a.id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(attempt_id)
+        return row
+
+    def _fallback_reason_for(self, row: sqlite3.Row) -> str | None:
+        if row["provider"] != "claude":
+            return None
+        prior = self._connection.execute(
+            """
+            SELECT outcome, reason FROM provider_attempts
+            WHERE job_id = ? AND id < ? AND provider = 'codex'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (row["job_id"], row["id"]),
+        ).fetchone()
+        if prior is None:
+            return None
+        reason = prior["reason"] or prior["outcome"]
+        return f"codex:{prior['outcome']}:{reason}"
+
+    def _append_attempt_usage(self, attempt_id: int) -> None:
+        """Best-effort JSONL projection after the authoritative DB commit."""
+        row = self._usage_row(attempt_id)
+        try:
+            memory_home = (
+                self.path.parent.parent
+                if self.path.parent.name == "scripts"
+                else self.path.parent
+            )
+            append_usage_record(
+                memory_home,
+                UsageRecord(
+                    provider=row["provider"],
+                    model=row["model"],
+                    task=row["task"],
+                    source_agent=row["source_agent"],
+                    outcome=row["outcome"],
+                    input_tokens=row["input_tokens"],
+                    output_tokens=row["output_tokens"],
+                    elapsed_ms=row["elapsed_ms"],
+                    timestamp=row["ended_at"],
+                    job_id=row["job_id"],
+                    fallback_reason=self._fallback_reason_for(row),
+                    reason=row["reason"],
+                    provider_attempt_id=row["id"],
+                ),
+                env=self._redaction_env,
+            )
+        except (OSError, ValueError):
+            # Observability is recoverable; it must not roll back source-of-truth
+            # provider_attempts. The next repository open retries the projection.
+            return
+
+    def _sync_usage_records(self) -> None:
+        memory_home = (
+            self.path.parent.parent
+            if self.path.parent.name == "scripts"
+            else self.path.parent
+        )
+        try:
+            logged = logged_provider_attempt_ids(memory_home)
+        except (OSError, ValueError):
+            logged = set()
+        rows = self._connection.execute(
+            "SELECT id FROM provider_attempts ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            if row["id"] not in logged:
+                self._append_attempt_usage(row["id"])
 
     def complete(self, job_id: int, owner: str) -> None:
         now = _stored_time(self._now())

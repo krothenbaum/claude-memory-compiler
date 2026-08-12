@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,16 +22,28 @@ try:
 except ImportError:  # pragma: no cover - POSIX branch.
     msvcrt = None
 
-from config import (
-    CONCEPTS_DIR,
-    CONNECTIONS_DIR,
-    DAILY_DIR,
-    INDEX_FILE,
-    KNOWLEDGE_DIR,
-    LOG_FILE,
-    QA_DIR,
-    STATE_FILE,
-)
+if __package__:
+    from .config import (
+        CONCEPTS_DIR,
+        CONNECTIONS_DIR,
+        DAILY_DIR,
+        INDEX_FILE,
+        KNOWLEDGE_DIR,
+        LOG_FILE,
+        QA_DIR,
+        STATE_FILE,
+    )
+else:
+    from config import (
+        CONCEPTS_DIR,
+        CONNECTIONS_DIR,
+        DAILY_DIR,
+        INDEX_FILE,
+        KNOWLEDGE_DIR,
+        LOG_FILE,
+        QA_DIR,
+        STATE_FILE,
+    )
 
 
 @dataclass(frozen=True)
@@ -410,8 +423,49 @@ def load_state_with_baseline() -> tuple[dict, FileBaseline]:
 
 
 def save_state(state: dict) -> None:
-    """Save state to state.json."""
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    """Atomically save state under the shared writer lock."""
+    target = Path(os.path.abspath(STATE_FILE.expanduser()))
+    if target.is_symlink():
+        raise ValueError("state path must not be a symlink")
+    root = target.parents[1]
+    with ExclusiveFileLock(root / "scripts" / "memory-writer.lock"):
+        save_state_unlocked(state, target)
+
+
+def save_state_unlocked(state: dict, path: Path | str | None = None) -> None:
+    """Atomically save state when the caller already owns the writer lock."""
+    target = Path(path) if path is not None else STATE_FILE
+    parent = target.parent
+    if parent.exists() or parent.is_symlink():
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("state directory must be a real directory")
+    else:
+        parent.mkdir(parents=True, mode=0o700)
+    if target.is_symlink():
+        raise ValueError("state path must not be a symlink")
+    if target.exists():
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("state path must be a private regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValueError("state path has an unsafe owner")
+    serialized = json.dumps(state, indent=2).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o600)
+        _fsync_directory(parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # ── File hashing ──────────────────────────────────────────────────────

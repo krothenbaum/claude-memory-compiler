@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import asyncio
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+import pytest
+
+from providers import ProviderResult, RoutedResult, TaskKind
+from scripts.queue import QueueRepository
+from transcripts import NormalizedSession, Turn
+import usage
+import utils
+import compile as compile_module
+import lint
+import query
+
+
+NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def _attempt(
+    provider: str = "codex",
+    outcome: str = "success",
+    *,
+    reason: str | None = None,
+    task: TaskKind = TaskKind.EXTRACT,
+) -> ProviderResult:
+    return ProviderResult(
+        provider=provider,
+        model="gpt-5.6-luna" if provider == "codex" else "claude-sonnet-5",
+        task=task,
+        outcome=outcome,
+        input_tokens=123,
+        output_tokens=45,
+        elapsed_ms=678,
+        reason=reason,
+    )
+
+
+def _session(home: Path) -> NormalizedSession:
+    return NormalizedSession(
+        agent="claude",
+        session_id="session-1",
+        project="memory",
+        cwd=str(home),
+        timestamp=NOW.isoformat(),
+        trigger="historical",
+        turns=(Turn("user", "Keep this"), Turn("assistant", "Saved")),
+        source_path=str(home / "session.jsonl"),
+        source_hash="hash-1",
+    )
+
+
+def _memory_home(tmp_path: Path) -> Path:
+    home = tmp_path / "memory"
+    for relative, content in {
+        "AGENTS.md": "# Schema\n",
+        "daily/2026-08-11.md": "# Daily\n\nA durable decision.\n",
+        "knowledge/index.md": "# Knowledge Base Index\n",
+        "knowledge/log.md": "# Build Log\n",
+        "scripts/state.json": '{"ingested":{},"query_count":0,"total_cost":1.25}',
+    }.items():
+        path = home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return home
+
+
+def _batch_module():
+    path = Path(__file__).resolve().parents[1] / "batch-flush.py"
+    spec = importlib.util.spec_from_file_location("task10_batch_flush", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _RoutedText:
+    def __init__(self, routed: RoutedResult):
+        self.routed = routed
+
+    async def generate_text(self, _request):
+        return self.routed
+
+
+class _RoutedWorkspace:
+    def __init__(self, routed: RoutedResult):
+        self.routed = routed
+
+    async def edit_workspace(self, _request, **_kwargs):
+        return self.routed
+
+
+def test_legacy_state_round_trip_preserves_unknown_fields_and_costs(tmp_path, monkeypatch):
+    state_path = tmp_path / "scripts/state.json"
+    state_path.parent.mkdir(parents=True)
+    original = {
+        "ingested": {
+            "2026-04-01.md": {
+                "hash": "abc",
+                "compiled_at": "2026-04-01T12:00:00-05:00",
+                "cost_usd": 0.52,
+            }
+        },
+        "query_count": 3,
+        "total_cost": 1.25,
+        "future_field": {"preserve": True},
+    }
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(utils, "STATE_FILE", state_path)
+
+    loaded = utils.load_state()
+    utils.save_state(loaded)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original
+
+
+def test_malformed_legacy_state_is_rejected_without_overwrite(tmp_path, monkeypatch):
+    state_path = tmp_path / "scripts/state.json"
+    state_path.parent.mkdir(parents=True)
+    original = b'{"ingested": '
+    state_path.write_bytes(original)
+    monkeypatch.setattr(utils, "STATE_FILE", state_path)
+
+    with pytest.raises(json.JSONDecodeError):
+        utils.load_state()
+
+    assert state_path.read_bytes() == original
+
+
+def test_save_state_rejects_symlink_without_locking_or_writing_outside_root(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "memory"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"safe":true}', encoding="utf-8")
+    state_path = scripts / "state.json"
+    state_path.symlink_to(outside)
+    monkeypatch.setattr(utils, "STATE_FILE", state_path)
+
+    with pytest.raises(ValueError, match="symlink"):
+        utils.save_state({"total_cost": 99})
+
+    assert outside.read_text(encoding="utf-8") == '{"safe":true}'
+    assert not (home / "scripts/memory-writer.lock").exists()
+
+
+def test_usage_record_contains_provider_outcome_tokens_and_optional_legacy_cost():
+    record = usage.UsageRecord.from_attempt(
+        _attempt("claude"),
+        job_id=17,
+        source_agent="claude",
+        timestamp=NOW,
+        fallback_reason="codex:capacity:subscription limit",
+        legacy_cost_usd=0.04,
+    )
+
+    assert record.to_dict() == {
+        "job_id": 17,
+        "task": "extract",
+        "source_agent": "claude",
+        "provider": "claude",
+        "model": "claude-sonnet-5",
+        "outcome": "success",
+        "fallback_reason": "codex:capacity:subscription limit",
+        "input_tokens": 123,
+        "output_tokens": 45,
+        "elapsed_ms": 678,
+        "timestamp": "2026-08-11T12:00:00+00:00",
+        "cost_usd": 0.04,
+    }
+
+
+def test_codex_usage_never_fabricates_a_dollar_cost():
+    record = usage.UsageRecord.from_attempt(
+        _attempt("codex"),
+        job_id=None,
+        source_agent="system",
+        timestamp=NOW,
+        legacy_cost_usd=99.0,
+    )
+
+    assert "cost_usd" not in record.to_dict()
+
+
+def test_usage_jsonl_is_compact_redacted_bounded_and_owner_only(tmp_path):
+    secret = "sk-secret-value"
+    noisy_reason = f"failed with {secret} " + "x" * 4_000
+    record = usage.UsageRecord.from_attempt(
+        _attempt("claude", "error", reason=noisy_reason),
+        job_id=4,
+        source_agent="codex",
+        timestamp=NOW,
+        fallback_reason=f"codex:error:{secret}",
+    )
+
+    path = usage.append_usage_record(
+        tmp_path,
+        record,
+        env={"OPENAI_API_KEY": secret},
+    )
+
+    raw = path.read_text(encoding="utf-8")
+    assert raw.endswith("\n") and "\n " not in raw
+    assert secret not in raw
+    value = json.loads(raw)
+    assert "[REDACTED]" in value["reason"]
+    assert len(value["reason"]) <= usage.MAX_ERROR_CHARS
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o077 == 0
+
+
+def test_concurrent_usage_appends_keep_every_json_line(tmp_path):
+    def append(index: int) -> None:
+        usage.append_usage_record(
+            tmp_path,
+            usage.UsageRecord.from_attempt(
+                _attempt(),
+                job_id=index,
+                source_agent="codex",
+                timestamp=NOW,
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(append, range(40)))
+
+    lines = (tmp_path / "scripts/logs/usage.jsonl").read_text().splitlines()
+    assert len(lines) == 40
+    assert {json.loads(line)["job_id"] for line in lines} == set(range(40))
+
+
+def test_usage_log_rejects_symlink_without_touching_target(tmp_path):
+    logs = tmp_path / "scripts/logs"
+    logs.mkdir(parents=True)
+    target = tmp_path / "outside.jsonl"
+    target.write_text("safe\n", encoding="utf-8")
+    (logs / "usage.jsonl").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        usage.append_usage_record(
+            tmp_path,
+            usage.UsageRecord.from_attempt(
+                _attempt(), source_agent="system", timestamp=NOW
+            ),
+        )
+
+    assert target.read_text(encoding="utf-8") == "safe\n"
+
+
+def test_queue_attempt_is_source_of_truth_and_emits_observability_record(tmp_path):
+    queue_path = tmp_path / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, clock=lambda: NOW) as repository:
+        job_id = repository.enqueue_capture(_session(tmp_path)).job_id
+        repository.record_attempt(
+            job_id,
+            _attempt("codex", "capacity", reason="subscription limit"),
+        )
+        repository.record_attempt(job_id, _attempt("claude"))
+
+        attempts = repository.attempts_for(job_id)
+
+    assert [attempt.provider for attempt in attempts] == ["codex", "claude"]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "scripts/logs/usage.jsonl").read_text().splitlines()
+    ]
+    assert [record["provider"] for record in records] == ["codex", "claude"]
+    assert records[0]["source_agent"] == "claude"
+    assert records[1]["fallback_reason"] == "codex:capacity:subscription limit"
+
+
+def test_usage_log_failure_does_not_erase_provider_attempt_source_of_truth(
+    tmp_path, monkeypatch
+):
+    queue_path = tmp_path / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, clock=lambda: NOW) as repository:
+        job_id = repository.enqueue_capture(_session(tmp_path)).job_id
+        monkeypatch.setattr(
+            "scripts.queue.append_usage_record",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        repository.record_attempt(job_id, _attempt())
+
+        assert len(repository.attempts_for(job_id)) == 1
+
+
+def test_queue_reopen_recovers_missing_usage_once_without_duplicates(tmp_path, monkeypatch):
+    queue_path = tmp_path / "scripts/jobs.sqlite3"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "scripts.queue.append_usage_record",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with QueueRepository(queue_path, clock=lambda: NOW) as repository:
+            job_id = repository.enqueue_capture(_session(tmp_path)).job_id
+            repository.record_attempt(job_id, _attempt())
+    assert not (tmp_path / "scripts/logs/usage.jsonl").exists()
+
+    with QueueRepository(queue_path, clock=lambda: NOW):
+        pass
+    with QueueRepository(queue_path, clock=lambda: NOW):
+        pass
+
+    lines = (tmp_path / "scripts/logs/usage.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["provider_attempt_id"] == 1
+
+
+def test_routed_usage_records_fallback_without_changing_legacy_state(tmp_path):
+    state_path = tmp_path / "scripts/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text('{"total_cost":1.25,"query_count":3}', encoding="utf-8")
+    codex = _attempt("codex", "timeout", reason="slow")
+    claude = _attempt("claude")
+    routed = RoutedResult.from_result(
+        claude,
+        (codex, claude),
+        "codex:timeout:slow",
+    )
+
+    usage.record_routed_usage(tmp_path, routed, source_agent="system", timestamp=NOW)
+
+    values = [
+        json.loads(line)
+        for line in (tmp_path / "scripts/logs/usage.jsonl").read_text().splitlines()
+    ]
+    assert len(values) == 2
+    assert values[-1]["fallback_reason"] == "codex:timeout:slow"
+    assert json.loads(state_path.read_text()) == {"total_cost": 1.25, "query_count": 3}
+
+
+def test_atomic_usage_append_preserves_previous_log_when_replace_fails(
+    tmp_path, monkeypatch
+):
+    first = usage.UsageRecord.from_attempt(
+        _attempt(), job_id=1, source_agent="system", timestamp=NOW
+    )
+    path = usage.append_usage_record(tmp_path, first)
+    before = path.read_bytes()
+    monkeypatch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("boom")))
+
+    with pytest.raises(OSError, match="boom"):
+        usage.append_usage_record(
+            tmp_path,
+            usage.UsageRecord.from_attempt(
+                _attempt(), job_id=2, source_agent="system", timestamp=NOW
+            ),
+        )
+
+    assert path.read_bytes() == before
+    assert list(path.parent.glob(".usage.jsonl.*.tmp")) == []
+
+
+def test_read_only_query_records_both_attempts_without_changing_total_cost(tmp_path):
+    home = _memory_home(tmp_path)
+    codex = _attempt("codex", "capacity", reason="limit", task=TaskKind.QUERY)
+    claude = _attempt("claude", task=TaskKind.QUERY)
+    routed = RoutedResult.from_result(claude, (codex, claude), "codex:capacity:limit")
+
+    answer = asyncio.run(
+        query.run_query("What changed?", router=_RoutedText(routed), memory_home=home)
+    )
+
+    assert answer == ""
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [record["provider"] for record in records] == ["codex", "claude"]
+    assert records[-1]["fallback_reason"] == "codex:capacity:limit"
+    assert json.loads((home / "scripts/state.json").read_text())["total_cost"] == 1.25
+
+
+def test_semantic_lint_records_usage_but_structural_functions_do_not(tmp_path):
+    home = _memory_home(tmp_path)
+    attempt = _attempt(task=TaskKind.SEMANTIC_LINT)
+    routed = RoutedResult.from_result(attempt, (attempt,), None)
+
+    assert asyncio.run(lint.check_contradictions(router=_RoutedText(routed), memory_home=home)) == []
+    path = home / "scripts/logs/usage.jsonl"
+    assert json.loads(path.read_text().splitlines()[0])["task"] == "semantic_lint"
+    before = path.read_bytes()
+    lint.check_broken_links()
+    assert path.read_bytes() == before
+
+
+def test_batch_extraction_records_source_agent_usage(tmp_path):
+    home = _memory_home(tmp_path)
+    batch = _batch_module()
+    routed = RoutedResult.from_result(_attempt(), (_attempt(),), None)
+
+    asyncio.run(
+        batch.flush_chunk(
+            "User: durable",
+            "Session date: 2026-08-11",
+            "memory",
+            str(home),
+            router=_RoutedText(routed),
+            memory_home=home,
+            source_agent="codex",
+        )
+    )
+
+    record = json.loads((home / "scripts/logs/usage.jsonl").read_text().splitlines()[0])
+    assert record["source_agent"] == "codex"
+
+
+def test_failed_compile_records_attempts_without_fabricating_cost(tmp_path):
+    home = _memory_home(tmp_path)
+    state, baseline = query._state_with_baseline(home)
+    codex = ProviderResult(
+        "codex", "gpt-5.6-terra", TaskKind.COMPILE, "capacity", reason="limit"
+    )
+    claude = ProviderResult(
+        "claude", "claude-sonnet-5", TaskKind.COMPILE, "timeout", reason="slow"
+    )
+    routed = RoutedResult.from_result(claude, (codex, claude), "codex:capacity:limit")
+
+    result = asyncio.run(
+        compile_module.compile_daily_log(
+            home / "daily/2026-08-11.md",
+            state,
+            baseline,
+            router=_RoutedWorkspace(routed),
+            memory_home=home,
+        )
+    )
+
+    assert result == 0.0
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [record["outcome"] for record in records] == ["capacity", "timeout"]
+    assert all("cost_usd" not in record for record in records)
+
+
+def test_compile_bookkeeping_preserves_legacy_ingested_extension_fields(tmp_path):
+    home = _memory_home(tmp_path)
+    daily = home / "daily/2026-08-11.md"
+    daily.write_text(
+        "# Daily\n\nA durable decision.\n\n"
+        "<!-- @compiled-through:2026-08-11T00:00:00+00:00 -->\n",
+        encoding="utf-8",
+    )
+    state = {
+        "ingested": {
+            daily.name: {
+                "hash": "old",
+                "compiled_at": "2026-04-01T12:00:00-05:00",
+                "cost_usd": 0.52,
+                "legacy_extension": "keep",
+            }
+        },
+        "total_cost": 1.25,
+    }
+    (home / "scripts/state.json").write_text(json.dumps(state), encoding="utf-8")
+    loaded, baseline = query._state_with_baseline(home)
+
+    assert asyncio.run(
+        compile_module.compile_daily_log(daily, loaded, baseline, memory_home=home)
+    ) == 0.0
+
+    saved = json.loads((home / "scripts/state.json").read_text())
+    assert saved["ingested"][daily.name]["legacy_extension"] == "keep"
+    assert saved["ingested"][daily.name]["cost_usd"] == 0.52
+    assert saved["total_cost"] == 1.25

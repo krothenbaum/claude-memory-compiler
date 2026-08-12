@@ -30,6 +30,7 @@ from utils import (
     save_state,
     wiki_article_exists,
 )
+from usage import record_routed_usage
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -210,6 +211,10 @@ async def check_contradictions(
     )
     try:
         result = await provider_router.generate_text(request)
+        try:
+            record_routed_usage(home, result, source_agent="system")
+        except (OSError, ValueError):
+            pass
     except Exception as exc:
         result = None
         reason = str(exc)

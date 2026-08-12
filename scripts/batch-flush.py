@@ -1354,6 +1354,7 @@ async def flush_chunk(
     *,
     router: object | None = None,
     memory_home: Path | str | None = None,
+    source_agent: str = "claude",
 ) -> str:
     """Extract one historical chunk through the shared provider router."""
     home = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT
@@ -1372,6 +1373,12 @@ async def flush_chunk(
     except Exception as exc:
         logging.exception("Provider router error")
         return f"FLUSH_ERROR: {type(exc).__name__}: {exc}"
+    try:
+        from usage import record_routed_usage
+
+        record_routed_usage(home, result, source_agent=source_agent)
+    except (OSError, ValueError):
+        logging.warning("Could not append provider usage record")
     if result.outcome != "success":
         return f"FLUSH_ERROR: {result.reason or result.outcome}"
     return result.text

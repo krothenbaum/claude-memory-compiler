@@ -112,15 +112,17 @@ def main() -> None:
         needs_marker = not COMPILED_MARKER_RE.search(content)
         prior = ingested.get(log_path.name, {})
         ingested[log_path.name] = {
+            **prior,
             "hash": (
                 "pending-transaction"
                 if needs_marker
                 else (log_baseline.sha256[:16] if log_baseline.sha256 else "")
             ),
             "compiled_at": prior.get("compiled_at", now),
-            "cost_usd": prior.get("cost_usd", 0.0),
             "reconciled_at": now,
         }
+        if "cost_usd" not in ingested[log_path.name]:
+            ingested[log_path.name]["cost_usd"] = 0.0
         if needs_marker:
             commit_compiled_bookkeeping(
                 log_path, state, now, state_baseline, log_baseline

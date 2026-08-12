@@ -40,6 +40,7 @@ from utils import (
     notify_terminal,
     read_text_with_baseline,
 )
+from usage import record_routed_usage
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_FILE = Path(__file__).resolve().parent / "compile.log"
@@ -189,9 +190,9 @@ async def compile_daily_log(
         if prior_hash == current_hash:
             compiled_at = now_iso()
             ingested[log_path.name] = {
+                **ingested[log_path.name],
                 "hash": "pending-transaction",
                 "compiled_at": compiled_at,
-                "cost_usd": ingested[log_path.name].get("cost_usd", 0.0),
             }
             commit_compiled_bookkeeping(
                 log_path, state, compiled_at, state_baseline, log_baseline
@@ -199,11 +200,14 @@ async def compile_daily_log(
             return 0.0
     if not new_content:
         compiled_at = now_iso()
+        prior = ingested.get(log_path.name, {})
         ingested[log_path.name] = {
+            **prior,
             "hash": "pending-transaction",
             "compiled_at": compiled_at,
-            "cost_usd": ingested.get(log_path.name, {}).get("cost_usd", 0.0),
         }
+        if "cost_usd" not in ingested[log_path.name]:
+            ingested[log_path.name]["cost_usd"] = 0.0
         commit_compiled_bookkeeping(
             log_path, state, compiled_at, state_baseline, log_baseline
         )
@@ -271,9 +275,22 @@ async def compile_daily_log(
         allowed_paths=allowed,
     )
     notify_terminal(f"compile started — {log_path.name}")
+    usage_recorded = False
+
+    def record_usage(result) -> None:
+        nonlocal usage_recorded
+        if usage_recorded or result is None:
+            return
+        try:
+            record_routed_usage(home, result, source_agent="system")
+        except (OSError, ValueError) as exc:
+            logger.warning("could not append compile usage: %s", exc)
+        usage_recorded = True
+
     try:
         result = await provider_router.edit_workspace(request)
         if result.outcome != "success":
+            record_usage(result)
             for candidate in [*fallback_holder, stage]:
                 if candidate.root.exists():
                     discard_stage(candidate)
@@ -283,6 +300,7 @@ async def compile_daily_log(
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
         except StageValidationError as validation_error:
             if result.provider != "codex" or (router is not None and router_factory is None):
+                record_usage(result)
                 discard_stage(selected)
                 return 0.0
             failed = ProviderResult(
@@ -291,13 +309,16 @@ async def compile_daily_log(
             )
             result = await provider_router.edit_workspace(request, codex_attempt=failed)
             if result.outcome != "success" or not fallback_holder:
+                record_usage(result)
                 for candidate in [*fallback_holder, stage]:
                     if candidate.root.exists():
                         discard_stage(candidate)
                 return 0.0
             selected = fallback_holder[-1]
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
+        record_usage(result)
     except Exception as exc:
+        record_usage(locals().get("result"))
         logger.exception("compile provider failed for %s", log_path.name)
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():
@@ -305,11 +326,14 @@ async def compile_daily_log(
         notify_terminal(f"compile failed — {log_path.name}: {exc}")
         return 0.0
 
-    state.setdefault("ingested", {})[log_path.name] = {
+    prior = state.setdefault("ingested", {}).get(log_path.name, {})
+    state["ingested"][log_path.name] = {
+        **prior,
         "hash": "pending-transaction",
         "compiled_at": timestamp,
-        "cost_usd": 0.0,
     }
+    if "cost_usd" not in state["ingested"][log_path.name]:
+        state["ingested"][log_path.name]["cost_usd"] = 0.0
     bookkeeping = ApplyBookkeeping(
         compiled_marker_path=log_path.resolve().relative_to(home).as_posix(),
         compiled_marker_baseline=log_baseline,

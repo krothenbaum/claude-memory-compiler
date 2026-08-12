@@ -29,6 +29,7 @@ from staging import (
     validate_stage,
 )
 from utils import FileBaseline, read_text_with_baseline
+from usage import record_routed_usage
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _STATE_UPDATE_ATTEMPTS = 3
@@ -245,6 +246,11 @@ async def _file_answer(
                 discard_stage(candidate)
         return f"Error querying knowledge base: {exc}"
     finally:
+        if result is not None:
+            try:
+                record_routed_usage(home, result, source_agent="system")
+            except (OSError, ValueError):
+                pass
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():
                 discard_stage(candidate)
@@ -287,6 +293,10 @@ async def run_query(
         )
         try:
             result = await (router or _text_router(config)).generate_text(request)
+            try:
+                record_routed_usage(home, result, source_agent="system")
+            except (OSError, ValueError):
+                pass
             answer = (
                 result.text
                 if result.outcome == "success"
