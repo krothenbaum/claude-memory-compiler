@@ -9,7 +9,6 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -25,6 +24,56 @@ ROOT = Path(__file__).resolve().parents[2]
 HOOKS = ROOT / "hooks"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "transcripts"
 FIXED_NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+CODEX_0146_HELP = """\
+Options:
+      --dangerously-bypass-approvals-and-sandbox
+          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
+          DANGEROUS. Intended solely for externally sandboxed environments.
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources.
+
+  -C, --cd <DIR>
+          Tell the agent which working root to use.
+"""
+
+
+def _tree_manifest(root: Path) -> dict[str, tuple[str, int, int, bytes | str | None]]:
+    manifest: dict[str, tuple[str, int, int, bytes | str | None]] = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+            content: bytes | str | None = path.read_bytes()
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+            content = None
+        elif stat.S_ISLNK(metadata.st_mode):
+            kind = "symlink"
+            content = os.readlink(path)
+        else:
+            kind = "special"
+            content = None
+        manifest[str(path.relative_to(root))] = (
+            kind,
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_mtime_ns,
+            content,
+        )
+    return manifest
+
+
+def _run_global_setup(home: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "ZDOTDIR": str(home), "SHELL": "/bin/zsh"})
+    return subprocess.run(
+        ["bash", str(ROOT / "bin" / "setup-global.sh")],
+        text=True,
+        capture_output=True,
+        check=True,
+        env=env,
+    )
 
 
 def _codex_help_option_block(help_text: str, option: str) -> str:
@@ -53,6 +102,17 @@ def _assert_codex_hook_trust_help(help_text: str) -> None:
     )
     assert "DANGEROUS" in block
     assert "automation" in block.lower()
+
+
+def test_tree_manifest_detects_metadata_only_changes(tmp_path):
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    sentinel.chmod(0o640)
+    before = _tree_manifest(tmp_path)
+
+    sentinel.chmod(0o600)
+
+    assert _tree_manifest(tmp_path) != before
 
 
 def _fake_uv(bin_dir: Path) -> Path:
@@ -1652,28 +1712,45 @@ def test_hook_examples_preserve_ten_second_capture_timeouts_and_are_opt_in():
     assert not (ROOT / ".codex" / "hooks.json").exists()
 
 
-def test_global_setup_only_prints_safe_merge_instructions():
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin" / "setup-global.sh")],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
+def test_global_setup_only_prints_safe_merge_instructions(tmp_path):
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    codex = home / ".codex"
+    claude.mkdir(parents=True)
+    codex.mkdir()
+    sentinels = {
+        claude / "settings.json": (b'{"claude":"sentinel"}\n', 0o600),
+        codex / "hooks.json": (b'{"codex":"sentinel"}\n', 0o640),
+        claude / "unrelated.bin": (b"\x00claude-unrelated\xff", 0o400),
+        codex / "unrelated.txt": (b"codex-unrelated\n", 0o444),
+    }
+    for path, (content, mode) in sentinels.items():
+        path.write_bytes(content)
+        path.chmod(mode)
+    before = _tree_manifest(home)
 
-    assert "AI_MEMORY_HOME" in result.stdout
-    assert "~/.claude/settings.json" in result.stdout
-    assert "~/.codex/hooks.json" in result.stdout
-    assert "codex-cli 0.146.1 or newer" in result.stdout
-    assert result.stdout.count("do not replace") == 2
+    first = _run_global_setup(home)
+    after_first = _tree_manifest(home)
+    second = _run_global_setup(home)
+    after_second = _tree_manifest(home)
+
+    assert after_first == before
+    assert after_second == before
+    assert first.stdout == second.stdout
+    assert f"in {home}/.zshrc" in first.stdout
+    assert "AI_MEMORY_HOME" in first.stdout
+    assert "~/.claude/settings.json" in first.stdout
+    assert "~/.codex/hooks.json" in first.stdout
+    assert "codex-cli 0.146.1 or newer" in first.stdout
+    assert first.stdout.count("do not replace") == 2
 
 
-def test_codex_hook_setup_requires_interactive_trust_review():
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin" / "setup-global.sh")],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
+def test_codex_hook_setup_requires_interactive_trust_review(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    before = _tree_manifest(home)
+    result = _run_global_setup(home)
+    assert _tree_manifest(home) == before
     documents = {
         "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
         "AGENTS.md": (ROOT / "AGENTS.md").read_text(encoding="utf-8"),
@@ -1693,20 +1770,8 @@ def test_codex_hook_setup_requires_interactive_trust_review():
     assert "Never persist" in documents["AGENTS.md"]
 
 
-def test_installed_codex_help_marks_hook_trust_bypass_as_dangerous():
-    codex = shutil.which("codex")
-    if codex is None:
-        pytest.skip("Codex CLI is not installed")
-
-    result = subprocess.run(
-        [codex, "--help"],
-        text=True,
-        capture_output=True,
-        timeout=5,
-        check=True,
-    )
-
-    _assert_codex_hook_trust_help(result.stdout)
+def test_codex_0146_help_marks_hook_trust_bypass_as_dangerous():
+    _assert_codex_hook_trust_help(CODEX_0146_HELP)
 
 
 def test_hook_trust_warning_must_be_adjacent_to_its_option():
