@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.capture import enqueue_hook_input
 from scripts.transcripts import parse_codex_transcript
 
 
@@ -106,6 +105,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         with helpers.bounded_transcript_slice(
             transcript_path,
             previewer,
+            source_agent="codex",
             deadline=deadline,
             clock=clock,
         ) as selected:
@@ -118,13 +118,15 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             )
             capture_input = dict(value)
             capture_input["transcript_path"] = str(live_slice)
-            outcome = enqueue_hook_input(
+            outcome = helpers.enqueue_capture_with_deadline(
                 capture_input,
                 source_agent="codex",
                 trigger="session_end",
                 limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+                deadline=deadline,
+                clock=clock,
             )
-        logger.info("capture %s for session %s", outcome.status, outcome.job_id)
+        logger.info("capture %s for session %s", outcome.get("status"), outcome.get("job_id"))
     except Exception as error:
         logger.error("capture failed: %s", error)
 

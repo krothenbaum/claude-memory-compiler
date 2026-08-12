@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -34,6 +35,18 @@ _snapshot_retry_wait = time.sleep
 
 class UnsafeSpoolError(ValueError):
     """Raised when a queue-owned snapshot path fails local safety checks."""
+
+
+class CaptureDeadlineExceeded(TimeoutError):
+    """Raised before queue commit when a bounded live capture runs out of time."""
+
+
+def _check_deadline(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    if deadline is not None and monotonic() >= deadline:
+        raise CaptureDeadlineExceeded("capture deadline exhausted")
 
 
 @dataclass(frozen=True)
@@ -148,30 +161,61 @@ def _safe_spool_directory(root: Path) -> Path:
     return spool_dir
 
 
-def _private_spool_copy(source: Path, spool_dir: Path) -> Path:
+def _private_spool_copy(
+    source: Path,
+    spool_dir: Path,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    capture_token: str | None = None,
+) -> Path:
+    prefix = f"capture-{capture_token}-" if capture_token else "capture-"
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix="capture-", suffix=".jsonl", dir=spool_dir
+        prefix=prefix, suffix=".jsonl", dir=spool_dir
     )
-    os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        shutil.copyfile(source, temporary)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        _check_deadline(deadline, monotonic)
+        with source.open("rb") as input_stream, os.fdopen(
+            descriptor, "wb"
+        ) as output_stream:
+            while True:
+                _check_deadline(deadline, monotonic)
+                block = input_stream.read(1024 * 1024)
+                if not block:
+                    break
+                output_stream.write(block)
+            output_stream.flush()
+        _fsync_file(temporary)
+        _check_deadline(deadline, monotonic)
         try:
             temporary.chmod(0o600)
         except OSError:
             pass
-        _fsync_file(temporary)
         return temporary
     except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
         temporary.unlink(missing_ok=True)
         raise
 
 
-def _snapshot_digest(path: Path) -> str:
+def _snapshot_digest(
+    path: Path,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            _check_deadline(deadline, monotonic)
             digest.update(block)
+    _check_deadline(deadline, monotonic)
     return digest.hexdigest()
 
 
@@ -251,9 +295,16 @@ def _publish_snapshot(temporary: Path, destination: Path) -> None:
     _fsync_directory(spool_dir)
 
 
-def _retain_failed_snapshot(temporary: Path, source_agent: str) -> None:
+def _retain_failed_snapshot(
+    temporary: Path,
+    source_agent: str,
+    capture_token: str | None = None,
+) -> None:
     digest = _snapshot_digest(temporary)
-    destination = temporary.with_name(f"failed-{source_agent}-{digest}.jsonl")
+    owner = f"-{capture_token}" if capture_token else ""
+    destination = temporary.with_name(
+        f"failed-{source_agent}{owner}-{digest}.jsonl"
+    )
     _publish_snapshot(temporary, destination)
 
 
@@ -268,6 +319,9 @@ def capture_transcript(
     clock: Callable[[], datetime] | None = None,
     limits: object = None,
     env: Mapping[str, str] | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    capture_token: str | None = None,
 ) -> CaptureOutcome:
     """Snapshot, normalize, enqueue, and wake a worker without invoking a model."""
     source_env = os.environ if env is None else env
@@ -276,6 +330,13 @@ def capture_transcript(
         return guarded
     if source_agent not in {"claude", "codex"}:
         raise ValueError("source_agent must be claude or codex")
+    if capture_token is not None and (
+        not capture_token
+        or len(capture_token) > 64
+        or any(not (character.isalnum() or character in "-_") for character in capture_token)
+    ):
+        raise ValueError("capture_token must contain only letters, digits, '-' or '_'")
+    _check_deadline(deadline, monotonic)
     source = Path(transcript_path).expanduser().resolve(strict=True)
     if not source.is_file():
         raise ValueError("transcript_path must name a regular file")
@@ -284,21 +345,44 @@ def capture_transcript(
         root = load_config(source_env).root_dir
     else:
         root = Path(os.path.abspath(Path(memory_home).expanduser()))
+    _check_deadline(deadline, monotonic)
     spool_dir = _safe_spool_directory(root)
-    temporary = _private_spool_copy(source, spool_dir)
-    snapshot_digest = _snapshot_digest(temporary)
-    snapshot_size = temporary.stat().st_size
-    parser = parse_claude_transcript if source_agent == "claude" else parse_codex_transcript
+    temporary = _private_spool_copy(
+        source,
+        spool_dir,
+        deadline=deadline,
+        monotonic=monotonic,
+        capture_token=capture_token,
+    )
+    committed_result: EnqueueResult | None = None
     try:
-        normalized = parser(temporary, metadata, limits=limits)
-        final_snapshot = temporary.with_name(
-            f"{source_agent}-{normalized.source_hash}.jsonl"
+        snapshot_digest = _snapshot_digest(
+            temporary, deadline=deadline, monotonic=monotonic
         )
-        _publish_snapshot(temporary, final_snapshot)
+        snapshot_size = temporary.stat().st_size
+        parser = (
+            parse_claude_transcript
+            if source_agent == "claude"
+            else parse_codex_transcript
+        )
+        _check_deadline(deadline, monotonic)
+        normalized = parser(temporary, metadata, limits=limits)
+        _check_deadline(deadline, monotonic)
+        if deadline is None:
+            final_snapshot = temporary.with_name(
+                f"{source_agent}-{normalized.source_hash}.jsonl"
+            )
+            _publish_snapshot(temporary, final_snapshot)
+        else:
+            # Deadline captures retain a unique ownership-tagged snapshot.
+            # This lets a timed-out parent clean only its own uncommitted file.
+            final_snapshot = temporary
+            _fsync_directory(spool_dir)
         normalized = replace(normalized, source_path=str(final_snapshot))
 
         owns_queue = queue is None
         if queue is None:
+            _check_deadline(deadline, monotonic)
             queue_config = load_config(
                 {
                     **source_env,
@@ -306,31 +390,71 @@ def capture_transcript(
                     "CLAUDE_MEMORY_HOME": str(root),
                 }
             )
-            repository = QueueRepository(
-                queue_config.queue_path,
-                busy_timeout_ms=CAPTURE_DB_BUSY_TIMEOUT_MS,
+            busy_timeout_ms = CAPTURE_DB_BUSY_TIMEOUT_MS
+            if deadline is not None:
+                remaining_seconds = deadline - monotonic()
+                if remaining_seconds <= 0:
+                    raise CaptureDeadlineExceeded("capture deadline exhausted")
+                remaining_ms = int(remaining_seconds * 1_000)
+                busy_timeout_ms = max(
+                    1, min(CAPTURE_DB_BUSY_TIMEOUT_MS, remaining_ms)
+                )
+            repository_options = {
+                "busy_timeout_ms": busy_timeout_ms,
                 **({"clock": clock} if clock is not None else {}),
-            )
+            }
+            for attempt in range(25):
+                try:
+                    repository = QueueRepository(
+                        queue_config.queue_path, **repository_options
+                    )
+                    break
+                except (FileExistsError, sqlite3.OperationalError) as error:
+                    transient = isinstance(error, FileExistsError) or any(
+                        marker in str(error).lower()
+                        for marker in ("locked", "busy")
+                    )
+                    if not transient or attempt == 24:
+                        raise
+                    _check_deadline(deadline, monotonic)
+                    time.sleep(0.01)
+            else:  # pragma: no cover - the bounded loop always breaks or raises.
+                raise RuntimeError("queue open retry loop exhausted")
         else:
             repository = queue
         try:
-            _validate_existing_snapshot(
-                final_snapshot,
-                spool_dir=spool_dir,
-                expected_digest=snapshot_digest,
-                expected_size=snapshot_size,
-            )
+            _check_deadline(deadline, monotonic)
+            if deadline is None:
+                _validate_existing_snapshot(
+                    final_snapshot,
+                    spool_dir=spool_dir,
+                    expected_digest=snapshot_digest,
+                    expected_size=snapshot_size,
+                )
             result = repository.enqueue_capture(normalized)
+            committed_result = result
         finally:
             if owns_queue:
                 repository.close()
+        if deadline is not None and not result.created:
+            final_snapshot.unlink(missing_ok=True)
+        if deadline is not None and monotonic() >= deadline:
+            return CaptureOutcome.from_enqueue(result)
         launcher(root)
         return CaptureOutcome.from_enqueue(result)
+    except CaptureDeadlineExceeded:
+        if committed_result is None and temporary.exists():
+            temporary.unlink(missing_ok=True)
+            try:
+                _fsync_directory(spool_dir)
+            except OSError:
+                pass
+        raise
     except BaseException:
         # A private snapshot is the recovery boundary even when parsing fails.
         if temporary.exists():
             try:
-                _retain_failed_snapshot(temporary, source_agent)
+                _retain_failed_snapshot(temporary, source_agent, capture_token)
             except Exception:
                 # Keep the already-private random temporary file when publishing fails.
                 pass

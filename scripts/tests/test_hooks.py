@@ -366,6 +366,33 @@ def test_oversized_final_jsonl_record_fails_closed_without_partial_job(tmp_path)
     assert list(hook_tmp.iterdir()) == []
 
 
+def test_oversized_record_before_valid_signal_fails_closed_without_deadline_spin(
+    tmp_path,
+):
+    source = tmp_path / "oversized-before-signal.jsonl"
+    source.write_text(
+        json.dumps({"type": "progress", "data": "x" * 1_100_000})
+        + "\n"
+        + json.dumps(
+            {"message": {"role": "user", "content": "MUST_NOT_ENQUEUE"}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {"transcript_path": str(source)},
+        memory_home,
+    )
+
+    assert result.returncode == 0
+    assert elapsed < 1.0
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "spool").exists()
+
+
 def _write_signal_before_routine_tail(
     path: Path,
     *,
@@ -622,6 +649,300 @@ def test_very_large_semantic_tail_completes_with_host_timeout_margin(tmp_path):
     ]
     assert _only_job_source_path(memory_home).stat().st_size <= 16_100_000
     assert list(hook_tmp.iterdir()) == []
+
+
+def test_backward_semantic_scan_finds_signal_beyond_raw_tail_cap(tmp_path):
+    source = tmp_path / "claude-beyond-cap.jsonl"
+    padding = "b" * 60_000
+    routine = json.dumps({"type": "progress", "data": padding}) + "\n"
+    with source.open("w", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "sessionId": "beyond-cap-session",
+                    "cwd": "/projects/beyond-cap",
+                }
+            )
+            + "\n"
+        )
+        for _ in range(30):
+            stream.write(routine)
+        stream.write(
+            json.dumps(
+                {
+                    "message": {
+                        "role": "user",
+                        "content": "SIGNAL_BEYOND_SIXTEEN_MB",
+                    }
+                }
+            )
+            + "\n"
+        )
+        for _ in range(300):
+            stream.write(routine)
+    assert source.stat().st_size > 19_000_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "beyond-cap-session",
+            "transcript_path": str(source),
+            "cwd": "/projects/beyond-cap",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    assert "SIGNAL_BEYOND_SIXTEEN_MB" in _only_job_payload(memory_home)[
+        "rendered_context"
+    ]
+    assert _only_job_source_path(memory_home).stat().st_size < 4_100_000
+    assert list(hook_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("agent", "hook_name"),
+    [("claude", "session-end.py"), ("codex", "codex-session-end.py")],
+)
+def test_semantic_compaction_pairs_calls_across_chunks_and_suppresses_reused_ids(
+    tmp_path, agent, hook_name
+):
+    source = tmp_path / f"{agent}-cross-chunk.jsonl"
+    routine_text = "p" * 60_000
+    if agent == "claude":
+        routine = {"type": "progress", "data": routine_text}
+
+        def call(name, call_id, tool_input=None):
+            return {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": tool_input or {},
+                        }
+                    ],
+                }
+            }
+
+        def output(call_id, content):
+            return {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": content,
+                        }
+                    ],
+                }
+            }
+
+        records = [
+            call("Read", "reused"),
+            *([routine] * 10),
+            call("Agent", "reused"),
+            *([routine] * 10),
+            output("reused", "REUSED_PRIVATE_OUTPUT"),
+            call(
+                "AskUserQuestion",
+                "ask",
+                {
+                    "questions": [
+                        {"question": "Choose?", "options": [{"label": "A"}]}
+                    ]
+                },
+            ),
+            *([routine] * 10),
+            output("ask", "CROSS_CHUNK_DECISION"),
+            call("Task", "task"),
+            *([routine] * 10),
+            output("task", "CROSS_CHUNK_FINDING"),
+        ]
+        payload = {
+            "session_id": "cross-chunk-claude",
+            "transcript_path": str(source),
+            "cwd": "/projects/cross-chunk",
+        }
+    else:
+        routine = {
+            "type": "event_msg",
+            "payload": {"type": "agent_reasoning", "text": routine_text},
+        }
+
+        def call(name, call_id):
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": "{}",
+                },
+            }
+
+        def output(call_id, content):
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(content),
+                },
+            }
+
+        records = [
+            call("shell", "reused"),
+            *([routine] * 10),
+            call("request_user_input", "reused"),
+            *([routine] * 10),
+            output("reused", {"answers": {"secret": "REUSED_PRIVATE_OUTPUT"}}),
+            call("request_user_input", "ask"),
+            *([routine] * 10),
+            output("ask", {"answers": {"choice": "CROSS_CHUNK_DECISION"}}),
+            call("wait_agent", "wait"),
+            *([routine] * 10),
+            output(
+                "wait",
+                {"status": "completed", "result": "CROSS_CHUNK_FINDING"},
+            ),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "agent_message",
+                    "author": "/root/child",
+                    "recipient": "/root",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Message Type: FINAL_ANSWER\n"
+                                "Task name: /root\n"
+                                "Sender: /root/child\n"
+                                "Payload:\nCROSS_CHUNK_AGENT_MESSAGE"
+                            ),
+                        },
+                        {"type": "input_text", "text": "AGENT_MESSAGE_PRIVATE"},
+                    ],
+                },
+            },
+        ]
+        payload = {"transcript_path": str(source)}
+    source.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        hook_name,
+        payload,
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    rendered = _only_job_payload(memory_home)["rendered_context"]
+    assert "CROSS_CHUNK_DECISION" in rendered
+    assert "CROSS_CHUNK_FINDING" in rendered
+    assert "REUSED_PRIVATE_OUTPUT" not in rendered
+    snapshot_text = _only_job_source_path(memory_home).read_text(encoding="utf-8")
+    assert "REUSED_PRIVATE_OUTPUT" not in snapshot_text
+    assert "AGENT_MESSAGE_PRIVATE" not in snapshot_text
+    assert list(hook_tmp.iterdir()) == []
+
+
+def test_process_deadline_kills_blocking_enqueue_with_margin(tmp_path):
+    hook = _load_hook("session-end.py")
+    owned = tmp_path / "owned-partial.jsonl"
+    owned.write_text("partial", encoding="utf-8")
+    started = time.monotonic()
+
+    with pytest.raises(hook.HookDeadlineExceeded):
+        hook.run_process_until_deadline(
+            [sys.executable, "-c", "import time; time.sleep(3.1)"],
+            input_text="",
+            deadline=time.monotonic() + 2.25,
+            clock=time.monotonic,
+            on_timeout=lambda: owned.unlink(missing_ok=True),
+        )
+
+    assert time.monotonic() - started < 2.75
+    assert not owned.exists()
+
+
+def test_timeout_cleanup_checks_owner_token_and_queue_reference(tmp_path):
+    hook = _load_hook("session-end.py")
+    root = tmp_path / "memory"
+    spool = root / "scripts" / "spool"
+    spool.mkdir(parents=True)
+    removable = spool / "capture-timeoutowner-one.jsonl"
+    failed = spool / "failed-claude-timeoutowner-two.jsonl"
+    unrelated = spool / "capture-otherowner-three.jsonl"
+    for path in (removable, failed, unrelated):
+        path.write_text("{}\n", encoding="utf-8")
+        path.chmod(0o600)
+
+    hook.cleanup_uncommitted_capture("timeoutowner", root=root)
+
+    assert not removable.exists()
+    assert not failed.exists()
+    assert unrelated.exists()
+
+    referenced = spool / "capture-timeoutowner-referenced.jsonl"
+    referenced.write_text("{}\n", encoding="utf-8")
+    referenced.chmod(0o600)
+    database = root / "scripts" / "jobs.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE jobs (source_path TEXT NOT NULL)")
+        connection.execute("INSERT INTO jobs VALUES (?)", (str(referenced),))
+
+    hook.cleanup_uncommitted_capture("timeoutowner", root=root)
+
+    assert referenced.exists()
+
+
+def test_private_slice_works_when_windows_has_no_fchmod(tmp_path, monkeypatch):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "windows.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "WINDOWS_SIGNAL"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delattr(hook.os, "fchmod")
+
+    with hook.bounded_transcript_slice(
+        source,
+        lambda path: hook.parse_claude_transcript(
+            path, {"trigger": "session_end"}, limits={"max_turns": 30}
+        ),
+        source_agent="claude",
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) as selected:
+        private_slice, preview = selected
+        assert private_slice.exists()
+        assert preview.turns[0].text == "WINDOWS_SIGNAL"
+
+    assert not private_slice.exists()
 
 
 def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(

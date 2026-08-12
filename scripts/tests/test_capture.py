@@ -18,7 +18,12 @@ import time
 import pytest
 
 import capture as capture_module
-from capture import capture_transcript, enqueue_hook_input, launch_worker
+from capture import (
+    CaptureDeadlineExceeded,
+    capture_transcript,
+    enqueue_hook_input,
+    launch_worker,
+)
 from providers import ProviderResult, ProviderRouter, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
 from worker import MemoryWorker, SingletonDrainLock
@@ -97,6 +102,184 @@ def test_hook_capture_guard_precedes_payload_resolution(tmp_path):
     assert result.status == "skipped"
     assert result.job is None
     assert not (tmp_path / "must-not-exist").exists()
+
+
+def test_deadline_during_private_copy_removes_owned_partial_snapshot(tmp_path):
+    source = tmp_path / "large.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "x" * 2_000_000}})
+        + "\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "memory"
+    ticks = iter([0.0, 0.5, 1.1])
+
+    with pytest.raises(CaptureDeadlineExceeded):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: (_ for _ in ()).throw(
+                AssertionError("must not launch")
+            ),
+            env={},
+            deadline=1.0,
+            monotonic=lambda: next(ticks),
+        )
+
+    assert not (home / "scripts" / "jobs.sqlite3").exists()
+    assert list((home / "scripts" / "spool").glob("*.jsonl")) == []
+
+
+def test_deadline_during_hash_removes_owned_snapshot(tmp_path, monkeypatch):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+
+    def completed_copy(_source, spool_dir, **_kwargs):
+        snapshot = spool_dir / "capture-hashowner-partial.jsonl"
+        snapshot.write_bytes(source.read_bytes())
+        snapshot.chmod(0o600)
+        return snapshot
+
+    monkeypatch.setattr(capture_module, "_private_spool_copy", completed_copy)
+    ticks = iter([0.0, 0.0, 1.1])
+
+    with pytest.raises(CaptureDeadlineExceeded):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: (_ for _ in ()).throw(
+                AssertionError("must not launch")
+            ),
+            env={},
+            deadline=1.0,
+            monotonic=lambda: next(ticks),
+            capture_token="hashowner",
+        )
+
+    assert list((home / "scripts" / "spool").glob("*.jsonl")) == []
+
+
+def test_deadline_before_queue_open_leaves_no_database_or_snapshot(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    current = [0.0]
+    real_load_config = capture_module.load_config
+
+    def delayed_config(env):
+        config = real_load_config(env)
+        current[0] = 2.0
+        return config
+
+    monkeypatch.setattr(capture_module, "load_config", delayed_config)
+
+    with pytest.raises(CaptureDeadlineExceeded):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: (_ for _ in ()).throw(
+                AssertionError("must not launch")
+            ),
+            env={},
+            deadline=1.0,
+            monotonic=lambda: current[0],
+            capture_token="prequeue",
+        )
+
+    assert not (home / "scripts" / "jobs.sqlite3").exists()
+    assert list((home / "scripts" / "spool").glob("*.jsonl")) == []
+
+
+def test_deadline_after_committed_enqueue_retains_job_and_skips_launch(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    current = [0.0]
+    launched = []
+
+    class CommittingQueue:
+        def enqueue_capture(self, normalized):
+            current[0] = 2.0
+            job = type(
+                "CommittedJob",
+                (),
+                {"id": 41, "source_path": normalized.source_path},
+            )()
+            return type("Committed", (), {"created": True, "job": job})()
+
+    result = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        queue=CommittingQueue(),
+        launcher=lambda root: launched.append(root),
+        env={},
+        deadline=1.0,
+        monotonic=lambda: current[0],
+        capture_token="postcommit",
+    )
+
+    assert result.created is True
+    assert Path(result.job.source_path).exists()
+    assert launched == []
+
+
+def test_deadline_capture_tokens_isolate_concurrent_equivalent_snapshots(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+
+    def run(token):
+        return capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _: None,
+            env={},
+            deadline=time.monotonic() + 5,
+            monotonic=time.monotonic,
+            capture_token=token,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(run, ("ownerone", "ownertwo")))
+
+    assert sorted([first.created, second.created]) == [False, True]
+    assert first.job_id == second.job_id
+    snapshots = list((home / "scripts" / "spool").glob("*.jsonl"))
+    assert snapshots == [Path(first.job.source_path)]
+    assert sum(token in snapshots[0].name for token in ("ownerone", "ownertwo")) == 1
+
+
+def test_deadline_capture_tolerates_windows_without_fchmod(tmp_path, monkeypatch):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    monkeypatch.delattr(capture_module.os, "fchmod", raising=False)
+
+    result = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=tmp_path / "memory",
+        launcher=lambda _: None,
+        env={},
+        deadline=time.monotonic() + 5,
+        monotonic=time.monotonic,
+        capture_token="windows",
+    )
+
+    assert result.created is True
 
 
 def test_codex_hook_capture_falls_back_to_transcript_session_metadata(tmp_path):
