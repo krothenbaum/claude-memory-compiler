@@ -10,14 +10,31 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import re
-import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
-from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, now_iso
+from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, load_config, now_iso
+from providers import (
+    ClaudeProvider,
+    CodexProvider,
+    ProviderResult,
+    ProviderRouter,
+    TaskKind,
+    WorkspaceRequest,
+)
+from staging import (
+    ApplyBookkeeping,
+    StageValidationError,
+    apply_validated_stage,
+    create_fallback_stage,
+    create_stage,
+    discard_stage,
+    validate_stage,
+)
 from utils import notify_terminal, read_wiki_index
 
 CONCEPT_LINK_RE = re.compile(r"\[\[concepts/([a-z0-9-]+)\]\]")
@@ -152,7 +169,43 @@ def _format_candidates(cands: list[Candidate]) -> str:
     return "\n".join(lines)
 
 
-async def synthesize_connections(cands: list[Candidate]) -> float:
+def build_connections_prompt(
+    cands: list[Candidate], schema: str, wiki_index: str, timestamp: str
+) -> str:
+    """Build the provider-neutral, stage-relative connection prompt."""
+    return f"""You are a connection synthesizer for a personal knowledge base.
+Evaluate the candidates conservatively and create a connection article only for
+a specific, non-obvious, reusable insight.
+
+## Schema
+
+{schema}
+
+## Current index
+
+{wiki_index}
+
+## Candidates
+
+{_format_candidates(cands)}
+
+For each candidate, read the staged concept articles. For accepted candidates:
+- create an article below knowledge/connections/ using the schema;
+- add its row to knowledge/index.md;
+- cite it in one append-only build-log entry headed
+  `## [{timestamp}] connections | swanson-pass`.
+
+The log entry is required even if every candidate is rejected. Never edit concept
+articles, AGENTS.md, daily sources, or scripts/state.json. All paths are relative
+to this disposable staged workspace."""
+
+
+async def synthesize_connections(
+    cands: list[Candidate],
+    *,
+    router: object | None = None,
+    memory_home: Path | str | None = None,
+) -> float:
     """Ask the LLM to confirm and write only genuine connections.
 
     Returns the API cost. The model is instructed to be conservative: write a
@@ -161,124 +214,92 @@ async def synthesize_connections(cands: list[Candidate]) -> float:
 
     The caller is responsible for bounding `cands` (main passes cands[:top]).
     """
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
     if not cands:
         print("No candidates to synthesize.")
         return 0.0
 
-    schema = AGENTS_FILE.read_text(encoding="utf-8")
-    wiki_index = read_wiki_index()
+    home = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT_DIR
+    schema = (home / "AGENTS.md").read_text(encoding="utf-8")
+    wiki_index = (home / "knowledge/index.md").read_text(encoding="utf-8")
     timestamp = now_iso()
+    prompt = build_connections_prompt(cands, schema, wiki_index, timestamp)
+    relevant_slugs = sorted(
+        {slug for cand in cands for slug in (cand.a, cand.c, *cand.bridges)}
+    )
+    relevant_paths = tuple(
+        f"knowledge/concepts/{slug}.md"
+        for slug in relevant_slugs
+        if (home / f"knowledge/concepts/{slug}.md").exists()
+    )
+    stage = create_stage(
+        home, "connections", "codex", relevant_articles=relevant_paths
+    )
+    allowed = (
+        "knowledge/connections/*.md",
+        "knowledge/index.md",
+        "knowledge/log.md",
+    )
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(home)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    fallback_holder = []
 
-    prompt = f"""You are a connection synthesizer for a personal knowledge base.
-Your job is to evaluate candidate relationships between EXISTING concept articles
-and write connection articles ONLY for the genuine, non-obvious ones.
+    def fallback_factory(request: WorkspaceRequest) -> WorkspaceRequest:
+        fallback = create_fallback_stage(stage, attempt_id="claude")
+        fallback_holder.append(fallback)
+        return WorkspaceRequest(
+            request.task, request.prompt, fallback.root, request.timeout_seconds,
+            request.output_schema, request.allowed_paths,
+        )
 
-## Schema (AGENTS.md)
-
-{schema}
-
-## Current Wiki Index
-
-{wiki_index}
-
-## Candidate Pairs (Swanson 2-hop bridges, hub-filtered)
-
-Each pair below was found because the two concepts are not directly linked but
-share specific intermediate concepts (bridges). A shared bridge is a HINT, not
-proof. Many candidates are mere co-occurrence (concepts that appeared in the same
-line of work but share no transferable idea).
-
-{_format_candidates(cands)}
-
-## Your Task
-
-For EACH candidate pair:
-1. `Read` both concept articles (and a bridge if helpful) to understand them.
-2. Decide: is there a SPECIFIC, NON-OBVIOUS, REUSABLE insight that links them?
-   - YES: write a connection article in `knowledge/connections/` using the exact
-     Connection Article format from the schema (frontmatter with `title`,
-     `connects:` listing both `concepts/<slug>`, `project:` as a YAML block list
-     (e.g. `project:` on its own line then `  - <project-slug>` lines), `sources:`,
-     `created`/`updated` set to {timestamp[:10]}; body sections: The Connection,
-     Key Insight, Evidence, Related Concepts with [[wikilinks]]).
-   - NO: do not write anything; record a one-line rejection reason instead.
-
-Be conservative. When in doubt, REJECT. A co-occurrence within one project or
-initiative is NOT a connection. Only write when the relationship would teach a
-reader something they could not get from either article alone.
-
-### Mandatory bookkeeping before you stop:
-- For every connection article you create, add a row to `knowledge/index.md`
-  (Article | Project | Summary | Compiled From | Updated).
-- Append ONE entry to `knowledge/log.md`:
-  ```
-  ## [{timestamp}] connections | swanson-pass
-  - Candidates evaluated: <n>
-  - Connections created: [[connections/x]], [[connections/y]] (or: none)
-  - Rejected (co-occurrence / too weak): <pair> - <reason>; <pair> - <reason>
-  ```
-  This log entry is REQUIRED even if you create zero connections.
-
-### File paths:
-- Write connection articles to: {CONNECTIONS_DIR}
-- Update index at: {KNOWLEDGE_DIR / 'index.md'}
-- Append log at: {KNOWLEDGE_DIR / 'log.md'}
-"""
-
-    def _on_stderr(line: str) -> None:
-        logger.debug("[cli stderr] %s", line.rstrip())
-
-    log_md_path = KNOWLEDGE_DIR / "log.md"
-    log_md_before = log_md_path.stat().st_size if log_md_path.exists() else 0
-
-    cost = 0.0
+    provider_router = router or ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+        fallback_workspace_factory=fallback_factory,
+    )
+    request = WorkspaceRequest(
+        TaskKind.CONNECTIONS,
+        prompt,
+        stage.root,
+        config.job_timeout_seconds,
+        allowed_paths=allowed,
+    )
     notify_terminal(f"connections pass started ({len(cands)} candidates)")
     logger.info("Begin connections pass (%d candidates)", len(cands))
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT_DIR),
-                system_prompt={"type": "preset", "preset": "claude_code"},
-                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep"],
-                permission_mode="bypassPermissions",
-                max_turns=80,  # higher than compile.py (60): a pass evaluates many pairs, each needing 2+ Reads
-                stderr=_on_stderr,
-                extra_args={"debug-to-stderr": None},
-                setting_sources=[],
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        pass  # model writes files directly
-            elif isinstance(message, ResultMessage):
-                cost = message.total_cost_usd or 0.0
-                print(f"  Cost: ${cost:.4f}")
-                logger.info("connections pass cost=$%.4f", cost)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"  Error in connections pass: {e}")
-        logger.error("Exception in connections pass: %s\n%s", e, tb)
-        notify_terminal(f"connections pass failed: {e}")
+        result = await provider_router.edit_workspace(request)
+        if result.outcome != "success":
+            discard_stage(fallback_holder[-1] if fallback_holder else stage)
+            return 0.0
+        selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
+        try:
+            validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.CONNECTIONS)
+        except StageValidationError as validation_error:
+            if result.provider != "codex" or router is not None:
+                discard_stage(selected)
+                return 0.0
+            failed = ProviderResult(
+                "codex", result.model, TaskKind.CONNECTIONS, "invalid_output",
+                reason=str(validation_error),
+            )
+            result = await provider_router.edit_workspace(request, codex_attempt=failed)
+            if result.outcome != "success" or not fallback_holder:
+                if stage.root.exists():
+                    discard_stage(stage)
+                return 0.0
+            selected = fallback_holder[-1]
+            validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.CONNECTIONS)
+        apply_validated_stage(validated, validated.before, ApplyBookkeeping())
+    except Exception as exc:
+        logger.exception("connections provider failed")
+        for candidate in [*fallback_holder, stage]:
+            if candidate.root.exists():
+                discard_stage(candidate)
+        notify_terminal(f"connections pass failed: {exc}")
         return 0.0
-
-    log_md_after = log_md_path.stat().st_size if log_md_path.exists() else 0
-    if log_md_after <= log_md_before:
-        print("  Warning: knowledge/log.md did not grow; the gate may have skipped its required audit entry.")
-        logger.warning("connections pass did not append to log.md (size %d -> %d)", log_md_before, log_md_after)
-        notify_terminal("connections pass: WARNING log.md not updated (audit entry missing)")
-
-    notify_terminal(f"connections pass complete (${cost:.4f})")
-    return cost
+    notify_terminal("connections pass complete")
+    return 0.0
 
 
 def main() -> None:

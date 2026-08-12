@@ -33,6 +33,7 @@ from scripts.providers import (
 from scripts.queue import Job, QueueRepository
 from scripts.staging import recover_incomplete_apply
 from scripts.utils import ExclusiveFileLock, append_daily_entry
+from scripts.flush import build_flush_prompt
 
 
 def _utc_now() -> datetime:
@@ -203,7 +204,9 @@ class MemoryWorker:
         try:
             request = TextRequest(
                 task=TaskKind.EXTRACT,
-                prompt=job.payload.get("rendered_context", ""),
+                prompt=build_flush_prompt(
+                    job.payload.get("rendered_context", ""), job.project, job.cwd
+                ),
                 cwd=Path(job.cwd or ROOT),
                 timeout_seconds=self.provider_timeout_seconds,
             )

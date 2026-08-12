@@ -11,9 +11,7 @@ Usage:
 
 from __future__ import annotations
 
-# Recursion prevention: set this BEFORE any imports that might trigger Claude
 import os
-os.environ["CLAUDE_INVOKED_BY"] = "memory_flush"
 
 import asyncio
 import json
@@ -31,6 +29,14 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 from utils import append_daily_entry, notify_terminal, _resolve_tty_path  # noqa: E402
+from config import load_config  # noqa: E402
+from providers import (  # noqa: E402
+    ClaudeProvider,
+    CodexProvider,
+    ProviderRouter,
+    TaskKind,
+    TextRequest,
+)
 
 # Set up file-based logging so we can verify the background process ran.
 # The parent process sends stdout/stderr to DEVNULL (to avoid the inherited
@@ -76,21 +82,13 @@ def append_to_daily_log(
     )
 
 
-async def run_flush(context: str, project_key: str = "unknown", cwd: str = "") -> str:
-    """Use Claude Agent SDK to extract important knowledge from conversation context."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
+def build_flush_prompt(context: str, project_key: str = "unknown", cwd: str = "") -> str:
+    """Build the provider-neutral live extraction prompt."""
     project_block = f"**Project:** {project_key}"
     if cwd:
         project_block += f"\n**CWD:** {cwd}"
 
-    prompt = f"""Review the conversation context below and extract everything worth preserving
+    return f"""Review the conversation context below and extract everything worth preserving
 in the daily log. Do NOT use any tools, return plain text only.
 
 This conversation took place in the following project:
@@ -135,34 +133,47 @@ design or architecture decisions, or resolved a bug, is never FLUSH_OK.
 
 {context}"""
 
-    response = ""
 
+def _default_router(memory_home: Path):
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(memory_home)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    return ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+    ), config
+
+
+async def run_flush(
+    context: str,
+    project_key: str = "unknown",
+    cwd: str = "",
+    *,
+    router: object | None = None,
+    memory_home: Path | str | None = None,
+) -> str:
+    """Extract important knowledge through the subscription provider router."""
+    home = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT
+    if router is None:
+        router, config = _default_router(home)
+        timeout = config.job_timeout_seconds
+    else:
+        timeout = load_config({"AI_MEMORY_HOME": str(home)}).job_timeout_seconds
+    request = TextRequest(
+        task=TaskKind.EXTRACT,
+        prompt=build_flush_prompt(context, project_key, cwd),
+        cwd=home,
+        timeout_seconds=timeout,
+    )
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT),
-                allowed_tools=[],
-                max_turns=2,
-                # Pin the model: the bundled SDK CLI lags interactive Claude
-                # Code, so a global settings.json model (e.g. "fable") it
-                # doesn't support would otherwise break every flush.
-                model="claude-sonnet-5",
-                setting_sources=[],
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
-            elif isinstance(message, ResultMessage):
-                pass
-    except Exception as e:
-        import traceback
-        logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
-        response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
-
-    return response
+        result = await router.generate_text(request)
+    except Exception as exc:
+        logging.exception("Provider router error")
+        return f"FLUSH_ERROR: {type(exc).__name__}: {exc}"
+    if result.outcome != "success":
+        return f"FLUSH_ERROR: {result.reason or result.outcome}"
+    return result.text
 
 
 COMPILE_AFTER_HOUR = 16  # 4 PM local time
@@ -173,7 +184,7 @@ def count_claude_instances() -> int:
     binary that flush.py itself spawns via the Agent SDK.
 
     Concurrent flush.py runs each launch
-    `.venv/.../claude_agent_sdk/_bundled/claude` as a child during the LLM
+    a private bundled `claude` binary as a child during the LLM
     call. `pgrep -x claude` cannot distinguish that from a real Claude Code
     session — and on macOS `pgrep -a` does not emit the full command line —
     so we shell out to `ps` and inspect each process's argv for the bundled
@@ -206,7 +217,7 @@ def count_claude_instances() -> int:
         args = parts[2] if len(parts) > 2 else ""
         if comm.rsplit("/", 1)[-1] != "claude":
             continue
-        if "claude_agent_sdk/_bundled" in args:
+        if "/_bundled/claude" in args:
             continue
         count += 1
     return count
@@ -292,6 +303,8 @@ def maybe_trigger_compilation() -> None:
 
 
 def main():
+    os.environ.setdefault("CLAUDE_INVOKED_BY", "memory_flush")
+    os.environ.setdefault("AI_MEMORY_INTERNAL_JOB", "1")
     if len(sys.argv) < 3:
         logging.error(
             "Usage: %s <context_file.md> <session_id> [project_key] [cwd]",

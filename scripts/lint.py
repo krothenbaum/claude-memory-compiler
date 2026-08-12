@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import KNOWLEDGE_DIR, REPORTS_DIR, load_config, now_iso, today_iso
+from providers import ClaudeProvider, CodexProvider, ProviderRouter, TaskKind, TextRequest
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -145,19 +147,9 @@ def check_sparse_articles() -> list[dict]:
     return issues
 
 
-async def check_contradictions() -> list[dict]:
-    """Use LLM to detect contradictions across articles."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
-    wiki_content = read_all_wiki_content()
-
-    prompt = f"""Review this knowledge base for contradictions, inconsistencies, or
+def build_contradiction_prompt(wiki_content: str) -> str:
+    """Build the bounded semantic lint prompt."""
+    return f"""Review this knowledge base for contradictions, inconsistencies, or
 conflicting claims across articles.
 
 ## Knowledge Base
@@ -179,22 +171,49 @@ If no issues found, output exactly: NO_ISSUES
 
 Do NOT output anything else - no preamble, no explanation, just the formatted lines."""
 
-    response = ""
+
+async def check_contradictions(
+    *, router: object | None = None, memory_home: Path | str | None = None
+) -> list[dict]:
+    """Use the shared provider router to detect contradictions across articles."""
+    home = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT_DIR
+    if home == ROOT_DIR:
+        wiki_content = read_all_wiki_content()
+    else:
+        parts = []
+        index = home / "knowledge/index.md"
+        if index.exists():
+            parts.append(index.read_text(encoding="utf-8"))
+        for directory in ("concepts", "connections", "qa"):
+            parts.extend(
+                path.read_text(encoding="utf-8")
+                for path in sorted((home / "knowledge" / directory).glob("*.md"))
+            )
+        wiki_content = "\n\n".join(parts)
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(home)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    provider_router = router or ProviderRouter(
+        CodexProvider(task_models=config.task_models),
+        ClaudeProvider(model=config.claude_model),
+    )
+    request = TextRequest(
+        task=TaskKind.SEMANTIC_LINT,
+        prompt=build_contradiction_prompt(wiki_content),
+        cwd=home,
+        timeout_seconds=config.job_timeout_seconds,
+    )
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT_DIR),
-                allowed_tools=[],
-                max_turns=2,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
-    except Exception as e:
-        return [{"severity": "error", "check": "contradiction", "file": "(system)", "detail": f"LLM check failed: {e}"}]
+        result = await provider_router.generate_text(request)
+    except Exception as exc:
+        result = None
+        reason = str(exc)
+    else:
+        reason = result.reason or result.outcome
+    if result is None or result.outcome != "success":
+        return [{"severity": "error", "check": "contradiction", "file": "(system)", "detail": f"LLM check failed: {reason}"}]
+    response = result.text
 
     issues = []
     if "NO_ISSUES" not in response:
@@ -247,14 +266,14 @@ def generate_report(all_issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Lint the knowledge base")
     parser.add_argument(
         "--structural-only",
         action="store_true",
         help="Skip LLM-based checks (contradictions) - faster and free",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("Running knowledge base lint checks...")
     all_issues: list[dict] = []

@@ -58,7 +58,13 @@ from transcripts import (
 )
 
 from config import load_config
-from providers import ClaudeProvider, CodexProvider, ProviderRouter, TaskKind
+from providers import (
+    ClaudeProvider,
+    CodexProvider,
+    ProviderRouter,
+    TaskKind,
+    TextRequest,
+)
 from scripts.queue import QueueRepository
 from utils import ExclusiveFileLock, append_daily_entry
 from worker import MemoryWorker
@@ -1286,26 +1292,18 @@ def chunk_conversation(turns: list[Turn], target_chars: int = CHUNK_TARGET_CHARS
 
 # ── LLM flush ────────────────────────────────────────────────────────────
 
-async def flush_chunk(
+def build_chunk_prompt(
     chunk_text: str,
     session_meta: str,
     project_key: str,
     project_cwd: str,
 ) -> str:
-    """Call Claude Agent SDK to extract knowledge from one chunk."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
+    """Build the provider-neutral historical extraction prompt."""
     project_block = f"**Project:** {project_key}"
     if project_cwd:
         project_block += f"\n**CWD:** {project_cwd}"
 
-    prompt = f"""Review the conversation context below and respond with a concise summary
+    return f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
 Do NOT use any tools — just return plain text.
 
@@ -1347,29 +1345,36 @@ respond with exactly: FLUSH_OK
 
 {chunk_text}"""
 
-    response = ""
 
+async def flush_chunk(
+    chunk_text: str,
+    session_meta: str,
+    project_key: str,
+    project_cwd: str,
+    *,
+    router: object | None = None,
+    memory_home: Path | str | None = None,
+) -> str:
+    """Extract one historical chunk through the shared provider router."""
+    home = Path(memory_home).expanduser().resolve() if memory_home is not None else ROOT
+    config = _config_for_home(home)
+    provider_router = router or _default_router(config)
+    request = TextRequest(
+        task=TaskKind.EXTRACT,
+        prompt=build_chunk_prompt(
+            chunk_text, session_meta, project_key, project_cwd
+        ),
+        cwd=home,
+        timeout_seconds=config.job_timeout_seconds,
+    )
     try:
-        async for message in query(
-            prompt=prompt,
-            options=ClaudeAgentOptions(
-                cwd=str(ROOT),
-                allowed_tools=[],
-                max_turns=2,
-            ),
-        ):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response += block.text
-            elif isinstance(message, ResultMessage):
-                pass
-    except Exception as e:
-        import traceback
-        logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
-        response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
-
-    return response
+        result = await provider_router.generate_text(request)
+    except Exception as exc:
+        logging.exception("Provider router error")
+        return f"FLUSH_ERROR: {type(exc).__name__}: {exc}"
+    if result.outcome != "success":
+        return f"FLUSH_ERROR: {result.reason or result.outcome}"
+    return result.text
 
 
 # ── Daily log writing ────────────────────────────────────────────────────
@@ -1378,6 +1383,7 @@ def write_daily_logs(
     extractions: list[Extraction],
     project_key: str,
     project_cwd: str,
+    source_agent: str = "claude",
 ) -> list[Path]:
     """Group extractions by date and write to daily log files.
 
@@ -1388,7 +1394,8 @@ def write_daily_logs(
     for ext in extractions:
         grouped.setdefault(ext.date, []).append(ext)
 
-    metadata_lines = [f"**Project:** {project_key}"]
+    agent_label = "Codex" if source_agent == "codex" else "Claude Code"
+    metadata_lines = [f"**Agent:** {agent_label}", f"**Project:** {project_key}"]
     if project_cwd:
         metadata_lines.append(f"**CWD:** {project_cwd}")
     metadata_block = "\n".join(metadata_lines)
