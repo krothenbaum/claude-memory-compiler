@@ -28,6 +28,7 @@ class FakeCommandResult:
     returncode: int = 0
     stdout: str = ""
     stderr: str = ""
+    output_truncated: bool = False
 
 
 class FakeRunner:
@@ -735,6 +736,108 @@ def test_command_runner_caps_and_drains_subprocess_output(tmp_path):
 
     assert result.returncode == 0
     assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 1024
+    assert result.output_truncated is True
+
+
+def _run_capped_python_output(tmp_path, code, *, max_output_bytes=64 * 1024):
+    import providers
+
+    return _run(
+        providers.AsyncCommandRunner(platform_name="Linux")(
+            [sys.executable, "-c", code],
+            cwd=tmp_path,
+            env={},
+            stdin="",
+            timeout_seconds=5,
+            start_new_session=True,
+            terminate_process_group_on_timeout=True,
+            max_output_bytes=max_output_bytes,
+        )
+    )
+
+
+def test_codex_rejects_truncated_status_hiding_api_key_suffix(
+    fake_runner, text_request, tmp_path
+):
+    status = _run_capped_python_output(
+        tmp_path,
+        (
+            "import sys; "
+            "sys.stdout.buffer.write(b'Logged in using ChatGPT\\n' + "
+            "b'x' * 70000 + b'\\nLogged in using an API key\\n')"
+        ),
+    )
+    assert status.output_truncated is True
+    assert "Logged in using ChatGPT" in status.stdout
+    assert "Logged in using an API key" not in status.stdout
+    runner = fake_runner(status)
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "error"
+    assert result.reason == "login status output too large"
+    assert "Logged in using" not in result.reason
+    assert len(runner.calls) == 1
+
+
+def test_codex_rejects_truncated_benign_status_output(
+    fake_runner, text_request, tmp_path
+):
+    sentinel = "sk-proj-truncated-status-secret"
+    status = _run_capped_python_output(
+        tmp_path,
+        (
+            "import sys; "
+            f"sys.stderr.buffer.write(b'benign warning {sentinel} ' + b'y' * 70000)"
+        ),
+    )
+    assert status.output_truncated is True
+    runner = fake_runner(status)
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "error"
+    assert result.reason == "login status output too large"
+    assert sentinel not in result.reason
+    assert len(runner.calls) == 1
+
+
+def test_codex_accepts_exactly_capped_nontruncated_chatgpt_status(
+    fake_runner, text_request, tmp_path
+):
+    status = _run_capped_python_output(
+        tmp_path,
+        (
+            "import sys; "
+            "prefix = b'Logged in using ChatGPT\\n'; "
+            "sys.stdout.buffer.write(prefix + b'b' * (65536 - len(prefix)))"
+        ),
+    )
+    assert len(status.stdout.encode()) == 64 * 1024
+    assert status.output_truncated is False
+    runner = fake_runner(status, _write_codex_output("codex answer"))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert result.text == "codex answer"
+
+
+def test_command_runner_reports_truncated_multibyte_boundary(tmp_path):
+    result = _run_capped_python_output(
+        tmp_path,
+        "import sys; sys.stdout.buffer.write('ab€'.encode('utf-8'))",
+        max_output_bytes=4,
+    )
+
+    assert result.output_truncated is True
+    assert result.stdout == "ab\ufffd"
+
+
+def test_command_result_defaults_to_nontruncated():
+    import providers
+
+    assert providers.CommandResult(0).output_truncated is False
 
 
 def test_codex_error_reason_is_bounded_and_redacts_credentials(

@@ -102,6 +102,7 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    output_truncated: bool = False
 
 
 class AsyncCommandRunner:
@@ -150,16 +151,18 @@ class AsyncCommandRunner:
             ),
         )
         try:
-            communication = (
-                process.communicate(stdin.encode())
-                if max_output_bytes is None
-                else self._communicate_capped(
-                    process, stdin.encode(), max_output_bytes
+            if max_output_bytes is None:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(stdin.encode()), timeout=timeout_seconds
                 )
-            )
-            stdout, stderr = await asyncio.wait_for(
-                communication, timeout=timeout_seconds
-            )
+                output_truncated = False
+            else:
+                stdout, stderr, output_truncated = await asyncio.wait_for(
+                    self._communicate_capped(
+                        process, stdin.encode(), max_output_bytes
+                    ),
+                    timeout=timeout_seconds,
+                )
         except BaseException:
             cleanup = asyncio.create_task(
                 self._cleanup_process_tree(
@@ -178,16 +181,18 @@ class AsyncCommandRunner:
             process.returncode,
             stdout.decode(errors="replace"),
             stderr.decode(errors="replace"),
+            output_truncated,
         )
 
     @staticmethod
     async def _communicate_capped(
         process: Any, stdin: bytes, max_output_bytes: int
-    ) -> tuple[bytes, bytes]:
+    ) -> tuple[bytes, bytes, bool]:
         """Drain both pipes while retaining at most one shared byte budget."""
         if max_output_bytes < 0:
             raise ValueError("max_output_bytes must be non-negative")
         remaining = [max_output_bytes]
+        output_truncated = [False]
 
         async def read_stream(stream: Any) -> bytes:
             retained: list[bytes] = []
@@ -196,6 +201,8 @@ class AsyncCommandRunner:
                 if keep:
                     retained.append(chunk[:keep])
                     remaining[0] -= keep
+                if keep < len(chunk):
+                    output_truncated[0] = True
             return b"".join(retained)
 
         async def write_stdin() -> None:
@@ -221,7 +228,7 @@ class AsyncCommandRunner:
             read_stream(process.stderr),
             process.wait(),
         )
-        return stdout, stderr
+        return stdout, stderr, output_truncated[0]
 
     async def _cleanup_process_tree(
         self, process: Any, *, terminate_process_group: bool
@@ -427,7 +434,12 @@ class CodexProvider:
         if max_output_bytes is not None:
             kwargs["max_output_bytes"] = max_output_bytes
         result = await runner(command, **kwargs)
-        return CommandResult(result.returncode, result.stdout, result.stderr)
+        return CommandResult(
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            getattr(result, "output_truncated", False),
+        )
 
     def _result(
         self,
@@ -476,6 +488,13 @@ class CodexProvider:
                 "error",
                 started,
                 reason=_safe_reason(str(exc), self._source_env),
+            )
+        if status.output_truncated:
+            return self._result(
+                request,
+                "error",
+                started,
+                reason="login status output too large",
             )
         combined = "\n".join((status.stdout, status.stderr)).strip()
         status_lines = {
