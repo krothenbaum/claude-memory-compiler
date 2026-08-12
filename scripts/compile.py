@@ -298,6 +298,7 @@ async def compile_daily_log(
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
         except StageValidationError as validation_error:
             if result.provider != "codex" or (router is not None and router_factory is None):
+                result = routed_invalid_output(result, validation_error)
                 record_usage(result)
                 discard_stage(selected)
                 return 0.0

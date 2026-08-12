@@ -217,6 +217,7 @@ async def _file_answer(
         if getattr(result, "provider", None) != "codex" or (
             router is not None and router_factory is None
         ):
+            authoritative_result = routed_invalid_output(result, exc)
             if stage.root.exists():
                 discard_stage(stage)
             return f"Error querying knowledge base: {exc}"

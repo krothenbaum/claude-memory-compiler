@@ -732,6 +732,82 @@ def test_invalid_successful_claude_workspace_records_authoritative_invalid_outpu
     assert list((home / "scripts/staging").iterdir()) == []
 
 
+@pytest.mark.parametrize("operation", ["query", "compile", "connections"])
+def test_outer_router_claude_invalid_stage_reclassifies_only_final_attempt(
+    tmp_path, operation
+):
+    home = _memory_home(tmp_path)
+    for slug in ("a", "b"):
+        path = home / f"knowledge/concepts/{slug}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ntitle: {slug}\nproject: memory\nsources:\n  - daily/2026-08-11.md\n"
+            "created: 2026-08-11\nupdated: 2026-08-11\n---\n",
+            encoding="utf-8",
+        )
+    task = {
+        "query": TaskKind.FILE_ANSWER,
+        "compile": TaskKind.COMPILE,
+        "connections": TaskKind.CONNECTIONS,
+    }[operation]
+    codex = ProviderResult(
+        "codex", "terra", task, "capacity", input_tokens=2, output_tokens=1,
+        elapsed_ms=4, reason="subscription full",
+    )
+    claude = ProviderResult(
+        "claude", "sonnet", task, "success", input_tokens=13, output_tokens=8,
+        elapsed_ms=21,
+    )
+    routed = RoutedResult.from_result(
+        claude, (codex, claude), "codex:capacity:subscription full"
+    )
+
+    class InvalidOuterRouter:
+        async def edit_workspace(self, request, **_kwargs):
+            (request.cwd / "unexpected.txt").write_text("invalid", encoding="utf-8")
+            return routed
+
+    if operation == "query":
+        answer = asyncio.run(
+            query.run_query(
+                "What?", file_back=True, router=InvalidOuterRouter(), memory_home=home
+            )
+        )
+        assert answer.startswith("Error querying knowledge base:")
+    elif operation == "compile":
+        state, baseline = query._state_with_baseline(home)
+        asyncio.run(
+            compile_module.compile_daily_log(
+                home / "daily/2026-08-11.md", state, baseline,
+                router=InvalidOuterRouter(), memory_home=home,
+            )
+        )
+    else:
+        asyncio.run(
+            connections.synthesize_connections(
+                [connections.Candidate("a", "b", [], 1.0)],
+                router=InvalidOuterRouter(), memory_home=home,
+            )
+        )
+
+    records = [
+        json.loads(line)
+        for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 2
+    assert [(record["provider"], record["outcome"]) for record in records] == [
+        ("codex", "capacity"),
+        ("claude", "invalid_output"),
+    ]
+    assert records[0]["reason"] == "subscription full"
+    assert records[-1]["model"] == "sonnet"
+    assert records[-1]["task"] == task.value
+    assert (records[-1]["input_tokens"], records[-1]["output_tokens"]) == (13, 8)
+    assert records[-1]["elapsed_ms"] == 21
+    assert records[-1]["fallback_reason"] == "codex:capacity:subscription full"
+    assert list((home / "scripts/staging").iterdir()) == []
+
+
 def test_connections_records_authoritative_usage(tmp_path):
     home = _memory_home(tmp_path)
     for slug in ("a", "b"):
