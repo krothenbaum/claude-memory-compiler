@@ -729,6 +729,26 @@ def _legacy_accounting_identity(session: NormalizedSession) -> str:
     return hashlib.sha256("\0".join(_identity(session)).encode()).hexdigest()
 
 
+def _reported_claude_cost(
+    repository: QueueRepository,
+    queue_identity: tuple[str, str, str, str],
+) -> Decimal:
+    """Return only an actual Claude-reported legacy cost for one logical job."""
+    row = repository._connection.execute(
+        """
+        SELECT a.legacy_cost_usd
+        FROM jobs AS j
+        JOIN provider_attempts AS a ON a.job_id = j.id
+        WHERE j.kind = ? AND j.source_agent = ? AND j.session_id = ?
+          AND j.source_hash = ? AND a.provider = 'claude'
+          AND a.outcome = 'success' AND a.legacy_cost_usd IS NOT NULL
+        ORDER BY a.id DESC LIMIT 1
+        """,
+        queue_identity,
+    ).fetchone()
+    return _legacy_cost_value(row[0]) if row is not None else Decimal(0)
+
+
 def _read_state_bytes(state_path: Path) -> bytes | None:
     if not state_path.exists() and not state_path.is_symlink():
         return None
@@ -801,7 +821,7 @@ def _reconcile_legacy_claude_cost(
     sessions: Sequence[NormalizedSession],
     memory_home: Path,
 ) -> None:
-    succeeded: set[str] = set()
+    succeeded: dict[str, Decimal] = {}
     has_claude = False
     for session in sessions:
         if session.agent != "claude":
@@ -816,7 +836,11 @@ def _reconcile_legacy_claude_cost(
             (session.agent, session.session_id, session.source_hash),
         ).fetchone()
         if status is not None and status[0] == "succeeded":
-            succeeded.add(_legacy_accounting_identity(session))
+            identity = _legacy_accounting_identity(session)
+            succeeded[identity] = _reported_claude_cost(
+                repository,
+                ("capture", session.agent, session.session_id, session.source_hash),
+            )
     if not has_claude:
         return
     state_path = memory_home / "scripts" / "state.json"
@@ -864,7 +888,9 @@ def _reconcile_legacy_claude_cost(
             ).fetchone()
             status = row[0] if row is not None else None
             if status == "succeeded":
-                succeeded.add(identity)
+                succeeded[identity] = _reported_claude_cost(
+                    repository, tuple(queue_identity)
+                )
             elif status in {"pending", "leased"}:
                 retained_reservations[identity] = reservation
             elif status is None:
@@ -878,12 +904,13 @@ def _reconcile_legacy_claude_cost(
         changed = retained_reservations != reservations or bool(new_identities)
         if not changed:
             return
-        estimate = Decimal(str(FLUSH_COST_ESTIMATE))
         for identity in new_identities:
-            accounted[identity] = str(estimate)
+            accounted[identity] = str(succeeded[identity])
         batch_state["accounted_historical_jobs"] = accounted
         batch_state["historical_cost_reservations"] = retained_reservations
-        batch_state["total_cost"] = str(current + estimate * len(new_identities))
+        batch_state["total_cost"] = str(
+            current + sum((succeeded[item] for item in new_identities), Decimal(0))
+        )
         state["batch_flush"] = batch_state
         _atomic_write_state(state_path, state)
 
@@ -950,8 +977,11 @@ def _reserve_claude_cost(
                 lease_expires = lease_expires.astimezone(timezone.utc)
             if status == "succeeded":
                 if identity not in accounted:
-                    accounted[identity] = str(estimate)
-                    total += estimate
+                    actual = _reported_claude_cost(
+                        repository, tuple(queue_identity)
+                    )
+                    accounted[identity] = str(actual)
+                    total += actual
             expires = _parse_timestamp(str(reservation.get("expires_at", "")))
             if expires is not None:
                 expires = expires.astimezone(timezone.utc)
@@ -1102,7 +1132,7 @@ async def execute_historical_import(
         _print_import_report(report, config)
         return report
 
-    repository = QueueRepository(queue_path)
+    repository = QueueRepository(queue_path, memory_home=config.root_dir)
     try:
         _reconcile_legacy_claude_cost(repository, candidate_chunks, home)
         if args.max_cost is not None:

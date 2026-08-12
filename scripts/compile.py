@@ -13,7 +13,6 @@ from config import DAILY_DIR, load_config, now_iso
 from providers import (
     ClaudeProvider,
     CodexProvider,
-    ProviderResult,
     ProviderRouter,
     TaskKind,
     WorkspaceRequest,
@@ -302,10 +301,7 @@ async def compile_daily_log(
                 record_usage(result)
                 discard_stage(selected)
                 return 0.0
-            failed = ProviderResult(
-                "codex", result.model, TaskKind.COMPILE, "invalid_output",
-                reason=str(validation_error),
-            )
+            failed = routed_invalid_output(result, validation_error).attempts[-1]
             result = await provider_router.edit_workspace(request, codex_attempt=failed)
             if result.outcome != "success" or not fallback_holder:
                 record_usage(result)

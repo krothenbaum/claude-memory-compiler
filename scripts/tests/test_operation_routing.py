@@ -329,7 +329,7 @@ def test_structural_lint_never_constructs_or_calls_provider(monkeypatch, tmp_pat
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("provider called")),
     )
     monkeypatch.setattr(lint, "load_state", lambda: {})
-    monkeypatch.setattr(lint, "save_state", lambda _state: None)
+    monkeypatch.setattr(lint, "update_state", lambda mutate: mutate({}))
     monkeypatch.setattr(lint, "REPORTS_DIR", tmp_path / "reports")
 
     assert lint.main(["--structural-only"]) == 0

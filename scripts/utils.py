@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
+from typing import Callable
 
 try:
     import fcntl
@@ -466,6 +467,38 @@ def save_state_unlocked(state: dict, path: Path | str | None = None) -> None:
         _fsync_directory(parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def update_state(
+    mutate: Callable[[dict], object],
+    *,
+    max_attempts: int = 3,
+) -> dict:
+    """Apply a locked same-byte state mutation without losing concurrent fields."""
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    target = Path(os.path.abspath(STATE_FILE.expanduser()))
+    if target.is_symlink():
+        raise ValueError("state path must not be a symlink")
+    root = target.parents[1]
+    for _attempt in range(max_attempts):
+        with ExclusiveFileLock(root / "scripts/memory-writer.lock"):
+            data, baseline = _read_file_with_baseline(target)
+            if data is None:
+                state = {
+                    "ingested": {}, "query_count": 0,
+                    "last_lint": None, "total_cost": 0.0,
+                }
+            else:
+                state = json.loads(data.decode("utf-8"))
+                if not isinstance(state, dict):
+                    raise ValueError("state.json must contain an object")
+            mutate(state)
+            if capture_file_baseline(target) != baseline:
+                continue
+            save_state_unlocked(state, target)
+            return state
+    raise RuntimeError("state update conflicted after bounded retries")
 
 
 # ── File hashing ──────────────────────────────────────────────────────

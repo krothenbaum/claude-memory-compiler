@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 
@@ -558,7 +559,8 @@ def test_file_back_invalid_codex_stage_records_authoritative_fallback_usage(tmp_
         async def edit_workspace(self, request):
             (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
             return ProviderResult(
-                "codex", "gpt-5.6-terra", request.task, "success", text="bad"
+                "codex", "gpt-5.6-terra", request.task, "success", text="bad",
+                input_tokens=19, output_tokens=6, elapsed_ms=23,
             )
 
     class Claude:
@@ -598,6 +600,8 @@ def test_file_back_invalid_codex_stage_records_authoritative_fallback_usage(tmp_
         ("codex", "invalid_output"),
         ("claude", "success"),
     ]
+    assert (records[0]["input_tokens"], records[0]["output_tokens"]) == (19, 6)
+    assert records[0]["elapsed_ms"] == 23
     assert records[-1]["fallback_reason"].startswith("codex:invalid_output:")
     assert (records[-1]["input_tokens"], records[-1]["output_tokens"]) == (7, 3)
 
@@ -608,7 +612,10 @@ def test_file_back_invalid_claude_fallback_records_authoritative_failure(tmp_pat
     class Codex:
         async def edit_workspace(self, request):
             (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
-            return ProviderResult("codex", "terra", request.task, "success")
+            return ProviderResult(
+                "codex", "terra", request.task, "success",
+                input_tokens=19, output_tokens=6, elapsed_ms=23,
+            )
 
     class Claude:
         _model = "sonnet"
@@ -638,7 +645,10 @@ def test_file_back_invalid_successful_claude_stage_records_invalid_output(tmp_pa
     class Codex:
         async def edit_workspace(self, request):
             (request.cwd / "unexpected.txt").write_text("bad", encoding="utf-8")
-            return ProviderResult("codex", "terra", request.task, "success")
+            return ProviderResult(
+                "codex", "terra", request.task, "success",
+                input_tokens=19, output_tokens=6, elapsed_ms=23,
+            )
 
     class Claude:
         _model = "sonnet"
@@ -660,6 +670,8 @@ def test_file_back_invalid_successful_claude_stage_records_invalid_output(tmp_pa
         ("codex", "invalid_output"),
         ("claude", "invalid_output"),
     ]
+    assert (records[0]["input_tokens"], records[0]["output_tokens"]) == (19, 6)
+    assert records[0]["elapsed_ms"] == 23
 
 
 @pytest.mark.parametrize("operation", ["compile", "connections"])
@@ -806,6 +818,161 @@ def test_outer_router_claude_invalid_stage_reclassifies_only_final_attempt(
     assert records[-1]["elapsed_ms"] == 21
     assert records[-1]["fallback_reason"] == "codex:capacity:subscription full"
     assert list((home / "scripts/staging").iterdir()) == []
+
+
+def test_custom_queue_projects_usage_only_to_canonical_memory_home(tmp_path):
+    home = tmp_path / "memory"
+    custom = tmp_path / "custom-queue/jobs.sqlite3"
+    with QueueRepository(custom, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt())
+
+    assert (home / "scripts/logs/usage.jsonl").exists()
+    assert not (custom.parent / "logs").exists()
+
+
+@pytest.mark.parametrize("corruption", [b'{"broken":', b'{bad}\n'])
+def test_queue_reopen_quarantines_corrupt_usage_and_reprojects_once(tmp_path, corruption):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt())
+    usage_path = home / "scripts/logs/usage.jsonl"
+    valid = usage_path.read_bytes()
+    usage_path.write_bytes(valid + corruption + valid)
+
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+
+    records = [json.loads(line) for line in usage_path.read_text().splitlines()]
+    assert len(records) == 1
+    quarantine = list((home / "scripts/logs").glob("usage.corrupt-*.jsonl"))
+    assert len(quarantine) == 1
+    assert corruption.strip() in quarantine[0].read_bytes()
+    assert quarantine[0].stat().st_mode & 0o777 == 0o600
+
+
+def test_concurrent_corrupt_usage_recovery_is_idempotent(tmp_path):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt())
+    path = home / "scripts/logs/usage.jsonl"
+    path.write_bytes(path.read_bytes() + b'{"truncated":')
+
+    def reopen():
+        with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+            pass
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda _: reopen(), range(2)))
+    assert len(path.read_text().splitlines()) == 1
+    assert len(list(path.parent.glob("usage.corrupt-*.jsonl"))) == 1
+
+
+def test_recreated_queue_does_not_collide_with_old_attempt_ids(tmp_path):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt("codex"))
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{queue_path}{suffix}").unlink(missing_ok=True)
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt("claude"))
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+
+    records = [json.loads(line) for line in (home / "scripts/logs/usage.jsonl").read_text().splitlines()]
+    assert [record["provider"] for record in records] == ["codex", "claude"]
+    assert records[0]["queue_id"] != records[1]["queue_id"]
+
+
+def test_v1_queue_migrates_atomically_and_preserves_attempts(tmp_path):
+    queue_path = tmp_path / "memory/scripts/jobs.sqlite3"
+    queue_path.parent.mkdir(parents=True)
+    connection = __import__("sqlite3").connect(queue_path)
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY, kind TEXT, source_agent TEXT, session_id TEXT,
+            project TEXT, cwd TEXT, trigger TEXT, source_path TEXT, source_hash TEXT,
+            payload_json TEXT, status TEXT, attempt_count INTEGER, available_at TEXT,
+            lease_owner TEXT, lease_expires_at TEXT, last_error TEXT, created_at TEXT,
+            updated_at TEXT, completed_at TEXT
+        );
+        CREATE TABLE provider_attempts (
+            id INTEGER PRIMARY KEY, job_id INTEGER, provider TEXT, model TEXT,
+            task TEXT, started_at TEXT, ended_at TEXT, outcome TEXT, reason TEXT,
+            input_tokens INTEGER, output_tokens INTEGER, elapsed_ms INTEGER
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.close()
+
+    with QueueRepository(queue_path, memory_home=tmp_path / "memory") as repository:
+        columns = {
+            row[1] for row in repository._connection.execute(
+                "PRAGMA table_info(provider_attempts)"
+            )
+        }
+        assert "legacy_cost_usd" in columns
+        assert len(repository.queue_id) == 32
+        assert repository._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_corrupt_usage_recovery_rejects_unsafe_existing_quarantine(tmp_path):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt())
+    usage_path = home / "scripts/logs/usage.jsonl"
+    corrupt = b'{"truncated":'
+    usage_path.write_bytes(usage_path.read_bytes() + corrupt)
+    digest = __import__("hashlib").sha256(corrupt).hexdigest()
+    quarantine = usage_path.parent / f"usage.corrupt-{digest}.jsonl"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"safe")
+    quarantine.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="quarantine"):
+        usage.recover_usage_log(home)
+    assert outside.read_bytes() == b"safe"
+
+
+def test_update_state_preserves_concurrent_fields_and_retries(tmp_path, monkeypatch):
+    state_path = tmp_path / "scripts/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text('{"query_count":2,"unknown":"keep"}', encoding="utf-8")
+    monkeypatch.setattr(utils, "STATE_FILE", state_path)
+
+    utils.update_state(lambda state: state.__setitem__("last_lint", "now"))
+
+    assert json.loads(state_path.read_text()) == {
+        "query_count": 2, "unknown": "keep", "last_lint": "now"
+    }
+
+
+def test_update_state_retry_exhaustion_does_not_overwrite(tmp_path, monkeypatch):
+    state_path = tmp_path / "scripts/state.json"
+    state_path.parent.mkdir(parents=True)
+    original = b'{"query_count":9,"unknown":"keep"}'
+    state_path.write_bytes(original)
+    monkeypatch.setattr(utils, "STATE_FILE", state_path)
+    monkeypatch.setattr(
+        utils, "capture_file_baseline", lambda _path: utils.FileBaseline(True, 1, "race")
+    )
+
+    with pytest.raises(RuntimeError, match="conflicted"):
+        utils.update_state(lambda state: state.__setitem__("last_lint", "now"), max_attempts=2)
+    assert state_path.read_bytes() == original
 
 
 def test_connections_records_authoritative_usage(tmp_path):

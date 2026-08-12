@@ -12,7 +12,6 @@ from config import QA_DIR, load_config, now_iso
 from providers import (
     ClaudeProvider,
     CodexProvider,
-    ProviderResult,
     ProviderRouter,
     TaskKind,
     TextRequest,
@@ -221,13 +220,7 @@ async def _file_answer(
             if stage.root.exists():
                 discard_stage(stage)
             return f"Error querying knowledge base: {exc}"
-        failed = ProviderResult(
-            provider="codex",
-            model=result.model,
-            task=TaskKind.FILE_ANSWER,
-            outcome="invalid_output",
-            reason=str(exc),
-        )
+        failed = routed_invalid_output(result, exc).attempts[-1]
         retry = await provider_router.edit_workspace(request, codex_attempt=failed)
         authoritative_result = retry
         if retry.outcome != "success" or not fallback_holder:

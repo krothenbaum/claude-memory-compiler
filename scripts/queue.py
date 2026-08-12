@@ -16,11 +16,16 @@ from typing import Callable, Literal, Mapping
 try:
     from .providers import ProviderResult
     from .transcripts import NormalizedSession, render_turns
-    from .usage import UsageRecord, append_usage_record, logged_provider_attempt_ids
+    from .usage import (
+        UsageRecord,
+        append_usage_record,
+        logged_provider_attempt_ids,
+        recover_usage_log,
+    )
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from providers import ProviderResult
     from transcripts import NormalizedSession, render_turns
-    from usage import UsageRecord, append_usage_record, logged_provider_attempt_ids
+    from usage import UsageRecord, append_usage_record, logged_provider_attempt_ids, recover_usage_log
 
 
 # The repository adds scripts/ to sys.path, so this required filename can shadow
@@ -43,7 +48,7 @@ SimpleQueue = _stdlib_queue.SimpleQueue
 
 
 JobStatus = Literal["pending", "leased", "succeeded", "failed", "dead"]
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
@@ -142,6 +147,7 @@ class ProviderAttempt:
     input_tokens: int | None
     output_tokens: int | None
     elapsed_ms: int
+    legacy_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -170,12 +176,22 @@ class QueueRepository:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clock: Callable[[], datetime] = _utc_now,
         redaction_env: Mapping[str, str] | None = None,
+        memory_home: Path | str | None = None,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.path = Path(os.path.abspath(Path(path).expanduser()))
+        self.memory_home = (
+            Path(memory_home).expanduser().resolve()
+            if memory_home is not None
+            else (
+                self.path.parent.parent
+                if self.path.parent.name == "scripts"
+                else self.path.parent
+            )
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.parent.is_symlink():
             raise ValueError("queue parent must not be a symlink")
@@ -246,6 +262,25 @@ class QueueRepository:
             )
         if version == SCHEMA_VERSION:
             return
+        if version == 1:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    "ALTER TABLE provider_attempts ADD COLUMN legacy_cost_usd REAL"
+                )
+                self._connection.execute(
+                    "CREATE TABLE queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                self._connection.execute(
+                    "INSERT INTO queue_metadata(key, value) VALUES ('queue_id', lower(hex(randomblob(16))))"
+                )
+                self._connection.execute("PRAGMA user_version = 2")
+                self._connection.execute("COMMIT")
+                return
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
         try:
             self._connection.executescript(
                 """
@@ -290,13 +325,20 @@ class QueueRepository:
                     reason TEXT,
                     input_tokens INTEGER,
                     output_tokens INTEGER,
-                    elapsed_ms INTEGER NOT NULL
+                    elapsed_ms INTEGER NOT NULL,
+                    legacy_cost_usd REAL
                 );
                 CREATE INDEX IF NOT EXISTS jobs_status_available_idx
                     ON jobs(status, available_at);
                 CREATE INDEX IF NOT EXISTS jobs_lease_expiry_idx
                     ON jobs(lease_expires_at);
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS queue_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO queue_metadata(key, value)
+                    VALUES ('queue_id', lower(hex(randomblob(16))));
+                PRAGMA user_version = 2;
                 COMMIT;
                 """
             )
@@ -307,6 +349,12 @@ class QueueRepository:
 
     def _now(self) -> datetime:
         return _datetime(self._clock())
+
+    @property
+    def queue_id(self) -> str:
+        return self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = 'queue_id'"
+        ).fetchone()[0]
 
     @staticmethod
     def _job(row: sqlite3.Row) -> Job:
@@ -438,15 +486,21 @@ class QueueRepository:
         )
         return cursor.rowcount == 1
 
-    def record_attempt(self, job_id: int, result: ProviderResult) -> None:
+    def record_attempt(
+        self,
+        job_id: int,
+        result: ProviderResult,
+        *,
+        legacy_cost_usd: float | None = None,
+    ) -> None:
         ended = self._now()
         started = ended - timedelta(milliseconds=max(0, result.elapsed_ms))
         cursor = self._connection.execute(
             """
             INSERT INTO provider_attempts (
                 job_id, provider, model, task, started_at, ended_at, outcome,
-                reason, input_tokens, output_tokens, elapsed_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reason, input_tokens, output_tokens, elapsed_ms, legacy_cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -464,6 +518,7 @@ class QueueRepository:
                 result.input_tokens,
                 result.output_tokens,
                 max(0, result.elapsed_ms),
+                legacy_cost_usd if result.provider == "claude" else None,
             ),
         )
         self._append_attempt_usage(cursor.lastrowid)
@@ -502,13 +557,8 @@ class QueueRepository:
         """Best-effort JSONL projection after the authoritative DB commit."""
         row = self._usage_row(attempt_id)
         try:
-            memory_home = (
-                self.path.parent.parent
-                if self.path.parent.name == "scripts"
-                else self.path.parent
-            )
             append_usage_record(
-                memory_home,
+                self.memory_home,
                 UsageRecord(
                     provider=row["provider"],
                     model=row["model"],
@@ -523,6 +573,8 @@ class QueueRepository:
                     fallback_reason=self._fallback_reason_for(row),
                     reason=row["reason"],
                     provider_attempt_id=row["id"],
+                    queue_id=self.queue_id,
+                    legacy_cost_usd=row["legacy_cost_usd"],
                 ),
                 env=self._redaction_env,
             )
@@ -532,20 +584,16 @@ class QueueRepository:
             return
 
     def _sync_usage_records(self) -> None:
-        memory_home = (
-            self.path.parent.parent
-            if self.path.parent.name == "scripts"
-            else self.path.parent
-        )
         try:
-            logged = logged_provider_attempt_ids(memory_home)
+            recover_usage_log(self.memory_home)
+            logged = logged_provider_attempt_ids(self.memory_home)
         except (OSError, ValueError):
             logged = set()
         rows = self._connection.execute(
             "SELECT id FROM provider_attempts ORDER BY id"
         ).fetchall()
         for row in rows:
-            if row["id"] not in logged:
+            if (self.queue_id, row["id"]) not in logged:
                 self._append_attempt_usage(row["id"])
 
     def complete(self, job_id: int, owner: str) -> None:
@@ -695,6 +743,7 @@ class QueueRepository:
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
                 elapsed_ms=row["elapsed_ms"],
+                legacy_cost_usd=row["legacy_cost_usd"],
             )
             for row in rows
         ]

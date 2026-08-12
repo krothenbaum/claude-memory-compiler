@@ -508,7 +508,9 @@ def capture_transcript(
             for attempt in range(25):
                 try:
                     repository = QueueRepository(
-                        queue_config.queue_path, **repository_options
+                        queue_config.queue_path,
+                        memory_home=queue_config.root_dir,
+                        **repository_options,
                     )
                     break
                 except (FileExistsError, sqlite3.OperationalError) as error:

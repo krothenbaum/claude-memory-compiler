@@ -21,7 +21,6 @@ from config import AGENTS_FILE, CONCEPTS_DIR, CONNECTIONS_DIR, KNOWLEDGE_DIR, lo
 from providers import (
     ClaudeProvider,
     CodexProvider,
-    ProviderResult,
     ProviderRouter,
     TaskKind,
     WorkspaceRequest,
@@ -313,10 +312,7 @@ async def synthesize_connections(
                 record_usage()
                 discard_stage(selected)
                 return 0.0
-            failed = ProviderResult(
-                "codex", result.model, TaskKind.CONNECTIONS, "invalid_output",
-                reason=str(validation_error),
-            )
+            failed = routed_invalid_output(result, validation_error).attempts[-1]
             result = await provider_router.edit_workspace(request, codex_attempt=failed)
             if result.outcome != "success" or not fallback_holder:
                 record_usage()

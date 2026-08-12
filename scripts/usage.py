@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import hashlib
 from typing import Literal, Mapping
 
 try:
@@ -25,6 +26,8 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
 
 
 MAX_ERROR_CHARS = 1_000
+MAX_USAGE_BYTES = 8 * 1024 * 1024
+MAX_USAGE_LINE_BYTES = 64 * 1024
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 
@@ -95,6 +98,7 @@ class UsageRecord:
     reason: str | None = None
     legacy_cost_usd: float | None = None
     provider_attempt_id: int | None = None
+    queue_id: str | None = None
 
     @classmethod
     def from_attempt(
@@ -152,6 +156,8 @@ class UsageRecord:
             value["cost_usd"] = self.legacy_cost_usd
         if self.provider_attempt_id is not None:
             value["provider_attempt_id"] = self.provider_attempt_id
+        if self.queue_id is not None:
+            value["queue_id"] = self.queue_id
         return value
 
 
@@ -185,13 +191,34 @@ def _read_private_log(path: Path) -> bytes:
     descriptor = os.open(path, flags)
     try:
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            return stream.read()
+            data = stream.read(MAX_USAGE_BYTES + 1)
+            if len(data) > MAX_USAGE_BYTES:
+                raise ValueError("usage log exceeds byte limit")
+            return data
     finally:
         os.close(descriptor)
 
 
-def _contains_attempt(data: bytes, provider_attempt_id: int | None) -> bool:
-    if provider_attempt_id is None:
+def _attempt_key(value: Mapping[str, object]) -> tuple[str, int] | None:
+    attempt_id = value.get("provider_attempt_id")
+    queue_id = value.get("queue_id")
+    if (
+        isinstance(queue_id, str)
+        and queue_id
+        and isinstance(attempt_id, int)
+        and not isinstance(attempt_id, bool)
+    ):
+        return queue_id, attempt_id
+    return None
+
+
+def _contains_attempt(data: bytes, record: UsageRecord) -> bool:
+    expected = (
+        (record.queue_id, record.provider_attempt_id)
+        if record.queue_id and record.provider_attempt_id is not None
+        else None
+    )
+    if expected is None:
         return False
     for line in data.splitlines():
         try:
@@ -200,27 +227,93 @@ def _contains_attempt(data: bytes, provider_attempt_id: int | None) -> bool:
             raise ValueError("usage log contains malformed JSONL") from exc
         if not isinstance(value, dict):
             raise ValueError("usage log records must be JSON objects")
-        if value.get("provider_attempt_id") == provider_attempt_id:
+        if _attempt_key(value) == expected:
             return True
     return False
 
 
-def logged_provider_attempt_ids(memory_home: Path | str) -> set[int]:
+def _valid_usage_records(data: bytes) -> tuple[list[dict[str, object]], bytes]:
+    records: list[dict[str, object]] = []
+    corrupt = bytearray()
+    seen: set[tuple[str, int]] = set()
+    for line in data.splitlines(keepends=True):
+        raw = line.rstrip(b"\r\n")
+        try:
+            if len(raw) > MAX_USAGE_LINE_BYTES:
+                raise ValueError("usage record exceeds byte limit")
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("usage record must be an object")
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            corrupt.extend(line)
+            continue
+        key = _attempt_key(value)
+        if key is not None and key in seen:
+            corrupt.extend(line)
+            continue
+        if key is not None:
+            seen.add(key)
+        records.append(value)
+    return records, bytes(corrupt)
+
+
+def logged_provider_attempt_ids(memory_home: Path | str) -> set[tuple[str, int]]:
     """Read stable queue-attempt identities without taking the writer lock."""
     home = Path(memory_home).expanduser().resolve()
     data = _read_private_log(home / "scripts/logs/usage.jsonl")
-    identifiers: set[int] = set()
-    for line in data.splitlines():
-        try:
-            value = json.loads(line)
-        except (UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError("usage log contains malformed JSONL") from exc
-        if not isinstance(value, dict):
-            raise ValueError("usage log records must be JSON objects")
-        identifier = value.get("provider_attempt_id")
-        if isinstance(identifier, int) and not isinstance(identifier, bool):
-            identifiers.add(identifier)
-    return identifiers
+    records, _corrupt = _valid_usage_records(data)
+    return {key for value in records if (key := _attempt_key(value)) is not None}
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_existing_quarantine(path: Path, expected: bytes) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("usage quarantine must be a regular file")
+    if info.st_nlink != 1:
+        raise ValueError("usage quarantine must not be hard-linked")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError("usage quarantine has an unsafe owner")
+    if _read_private_log(path) != expected:
+        raise ValueError("usage quarantine content does not match its digest")
+
+
+def _recover_usage_unlocked(path: Path, original: bytes) -> bytes:
+    records, corrupt = _valid_usage_records(original)
+    canonical = b"".join(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        for value in records
+    )
+    if not corrupt and canonical == original:
+        return original
+    if corrupt:
+        digest = hashlib.sha256(corrupt).hexdigest()
+        quarantine = path.parent / f"usage.corrupt-{digest}.jsonl"
+        _validate_existing_quarantine(quarantine, corrupt)
+        if not quarantine.exists():
+            _write_private(quarantine, corrupt)
+    _write_private(path, canonical)
+    return canonical
 
 
 def _append_usage_record_unlocked(
@@ -240,28 +333,13 @@ def _append_usage_record_unlocked(
     _prepare_private_directory(logs)
     path = logs / "usage.jsonl"
     original = _read_private_log(path)
-    if _contains_attempt(original, record.provider_attempt_id):
+    original = _recover_usage_unlocked(path, original) if original else original
+    if _contains_attempt(original, record):
         return path
     serialized = json.dumps(
         record.to_dict(env=env), sort_keys=True, separators=(",", ":")
     ).encode("utf-8") + b"\n"
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=logs
-    )
-    temporary = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(original)
-            stream.write(serialized)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        path.chmod(0o600)
-        _fsync_directory(logs)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_private(path, original + serialized)
     return path
 
 
@@ -276,6 +354,26 @@ def append_usage_record(
     source_env = dict(os.environ if env is None else env)
     with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
         return _append_usage_record_unlocked(home, record, env=source_env)
+
+
+def recover_usage_log(memory_home: Path | str) -> Path:
+    """Quarantine malformed records and retain every recoverable valid record."""
+    home = Path(memory_home).expanduser().resolve()
+    path = home / "scripts/logs/usage.jsonl"
+    if not path.exists() and not path.is_symlink():
+        return path
+    original = _read_private_log(path)
+    records, corrupt = _valid_usage_records(original)
+    canonical = b"".join(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        for value in records
+    )
+    if not corrupt and canonical == original:
+        return path
+    with ExclusiveFileLock(home / "scripts/memory-writer.lock"):
+        original = _read_private_log(path)
+        _recover_usage_unlocked(path, original)
+    return path
 
 
 def record_routed_usage(

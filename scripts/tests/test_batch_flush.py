@@ -1232,7 +1232,9 @@ def test_claude_max_cost_tolerates_missing_or_corrupt_legacy_state(
 
 
 @pytest.mark.parametrize("response", ["**Context:** captured", "FLUSH_OK"])
-def test_successful_claude_jobs_advance_legacy_cost_once(batch, tmp_path, response):
+def test_claude_transcript_via_codex_does_not_fabricate_legacy_cost(
+    batch, tmp_path, response
+):
     memory_home = tmp_path / "memory"
     discovered = make_discovered(batch, tmp_path, 1)[0]
     historical = replace(
@@ -1264,8 +1266,67 @@ def test_successful_claude_jobs_advance_legacy_cost_once(batch, tmp_path, respon
 
     assert first.succeeded == 1
     assert second.preexisting == 1
-    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
     assert len(state["accounted_historical_jobs"]) == 1
+
+
+def test_explicit_claude_legacy_cost_advances_total_exactly_once(batch, tmp_path):
+    memory_home = tmp_path / "memory"
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    session = replace(discovered.session, agent="claude")
+    historical = replace(discovered, session=session)
+    queue_path = memory_home / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=memory_home) as repository:
+        queued = repository.enqueue_capture(session)
+        claimed = repository.claim_next(
+            "prior-worker", batch.datetime.now(batch.timezone.utc), 30
+        )
+        assert claimed is not None
+        repository.record_attempt(
+            queued.job_id,
+            ProviderResult(
+                provider="codex",
+                model="gpt-5.6-terra",
+                task=TaskKind.EXTRACT,
+                outcome="capacity",
+                reason="subscription full",
+            ),
+        )
+        repository.record_attempt(
+            queued.job_id,
+            ProviderResult(
+                provider="claude",
+                model="claude-sonnet-5",
+                task=TaskKind.EXTRACT,
+                outcome="success",
+            ),
+            legacy_cost_usd=0.037,
+        )
+        repository.complete(queued.job_id, "prior-worker")
+        batch._reconcile_legacy_claude_cost(
+            repository, [historical.session], memory_home
+        )
+        batch._reconcile_legacy_claude_cost(
+            repository, [historical.session], memory_home
+        )
+
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+    assert Decimal(str(state["total_cost"])) == Decimal("0.037")
+    assert list(state["accounted_historical_jobs"].values()) == ["0.037"]
+    records = [
+        json.loads(line)
+        for line in (memory_home / "scripts/logs/usage.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(item["provider"], item["outcome"]) for item in records] == [
+        ("codex", "capacity"),
+        ("claude", "success"),
+    ]
+    assert records[-1]["fallback_reason"] == "codex:capacity:subscription full"
+    assert records[-1]["cost_usd"] == 0.037
 
 
 def test_failed_claude_job_does_not_advance_legacy_cost(batch, tmp_path, monkeypatch):
@@ -1273,7 +1334,7 @@ def test_failed_claude_job_does_not_advance_legacy_cost(batch, tmp_path, monkeyp
     monkeypatch.setattr(
         batch,
         "QueueRepository",
-        lambda path: original_repository(path, max_attempts=1),
+        lambda path, **kwargs: original_repository(path, max_attempts=1, **kwargs),
     )
     memory_home = tmp_path / "memory"
     discovered = make_discovered(batch, tmp_path, 1)[0]
@@ -1321,7 +1382,7 @@ def test_resume_repairs_cost_after_queue_success_before_state_commit(batch, tmp_
 
     assert report.preexisting == 1
     assert report.processed == 0
-    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
 
 
 def test_resume_repairs_cost_before_enforcing_remaining_ceiling(batch, tmp_path):
@@ -1349,10 +1410,14 @@ def test_resume_repairs_cost_before_enforcing_remaining_ceiling(batch, tmp_path)
         )
     )
 
-    assert report.chunks == 0
+    assert report.chunks == 1
     assert report.preexisting == 1
-    assert report.newly_enqueued == 0
-    assert router.calls == 0
+    assert report.newly_enqueued == 1
+    assert router.calls == 1
+    state = json.loads(
+        (memory_home / "scripts" / "state.json").read_text(encoding="utf-8")
+    )["batch_flush"]
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
 
 
 def test_concurrent_claude_imports_do_not_lose_legacy_cost_updates(batch, tmp_path):
@@ -1379,7 +1444,7 @@ def test_concurrent_claude_imports_do_not_lose_legacy_cost_updates(batch, tmp_pa
     )["batch_flush"]
 
     assert sum(report.succeeded for report in reports) == 2
-    assert Decimal(str(state["total_cost"])) == Decimal("0.08")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
     assert len(state["accounted_historical_jobs"]) == 2
 
 
@@ -1455,7 +1520,7 @@ print(json.dumps({"new": report.newly_enqueued, "succeeded": report.succeeded}))
     )["batch_flush"]
     assert job_count == 1
     assert succeeded == 1
-    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
 
 
 def test_abandoned_claude_cost_reservation_without_job_is_released(
@@ -1510,7 +1575,7 @@ def test_abandoned_claude_cost_reservation_without_job_is_released(
     ]
 
     assert report.succeeded == 1
-    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
     assert abandoned not in state.get("historical_cost_reservations", {})
 
 
@@ -1571,7 +1636,7 @@ def test_resume_processes_stale_leased_job_left_by_crashed_cost_reservation(
     assert report.processed == 1
     assert report.succeeded == 1
     assert router.calls == 1
-    assert Decimal(str(state["total_cost"])) == Decimal("0.04")
+    assert Decimal(str(state["total_cost"])) == Decimal("0")
     assert state.get("historical_cost_reservations", {}) == {}
 
 
@@ -1582,7 +1647,7 @@ def test_failed_reserved_claude_job_releases_capacity(
     monkeypatch.setattr(
         batch,
         "QueueRepository",
-        lambda path: original_repository(path, max_attempts=1),
+        lambda path, **kwargs: original_repository(path, max_attempts=1, **kwargs),
     )
     memory_home = tmp_path / "memory"
     discovered = make_discovered(batch, tmp_path, 1)[0]
@@ -1771,7 +1836,7 @@ def test_failed_import_reports_dead_job_and_main_returns_nonzero(
     monkeypatch.setattr(
         batch,
         "QueueRepository",
-        lambda path: original_repository(path, max_attempts=1),
+        lambda path, **kwargs: original_repository(path, max_attempts=1, **kwargs),
     )
     args = batch.parse_cli_args(["--source", "codex"])
     report = asyncio.run(
