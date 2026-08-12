@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -1610,7 +1611,16 @@ def test_hook_examples_preserve_ten_second_capture_timeouts_and_are_opt_in():
 
     codex = json.loads((ROOT / ".codex" / "hooks.json.example").read_text())
     assert set(codex["hooks"]) == {"SessionStart", "SessionEnd"}
-    assert codex["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] == 3
+    for event, timeout in (("SessionStart", 15), ("SessionEnd", 3)):
+        groups = codex["hooks"][event]
+        assert len(groups) == 1
+        assert groups[0]["matcher"] == ""
+        handlers = groups[0]["hooks"]
+        assert len(handlers) == 1
+        assert handlers[0]["type"] == "command"
+        assert handlers[0]["timeout"] == timeout
+        assert "AI_MEMORY_HOME" in handlers[0]["command"]
+        assert "CLAUDE_MEMORY_HOME" in handlers[0]["command"]
     assert not (ROOT / ".codex" / "hooks.json").exists()
 
 
@@ -1627,3 +1637,46 @@ def test_global_setup_only_prints_safe_merge_instructions():
     assert "~/.codex/hooks.json" in result.stdout
     assert "codex-cli 0.146.1 or newer" in result.stdout
     assert result.stdout.count("do not replace") == 2
+
+
+def test_codex_hook_setup_requires_interactive_trust_review():
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin" / "setup-global.sh")],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    documents = {
+        "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
+        "AGENTS.md": (ROOT / "AGENTS.md").read_text(encoding="utf-8"),
+        "setup output": result.stdout,
+    }
+
+    for name, content in documents.items():
+        assert "launch Codex interactively" in content, name
+        assert "new or changed hook commands and hashes" in content, name
+        assert "only the vetted repository hooks" in content, name
+        assert "enabled and trusted" in content, name
+
+    assert "--dangerously-bypass-hook-trust" not in documents["README.md"]
+    assert "--dangerously-bypass-hook-trust" not in documents["setup output"]
+    assert "DANGEROUS" in documents["AGENTS.md"]
+    assert "disposable Gate 2" in documents["AGENTS.md"]
+    assert "Never persist" in documents["AGENTS.md"]
+
+
+def test_installed_codex_help_marks_hook_trust_bypass_as_dangerous():
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("Codex CLI is not installed")
+
+    result = subprocess.run(
+        [codex, "--help"],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=True,
+    )
+
+    assert "--dangerously-bypass-hook-trust" in result.stdout
+    assert "DANGEROUS" in result.stdout

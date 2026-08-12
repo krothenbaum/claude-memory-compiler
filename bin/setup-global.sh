@@ -54,6 +54,12 @@ This setup is opt-in and does not edit either agent's configuration.
    Preserve every unrelated setting and hook already present; do not replace
    the destination file. The example remains inert until you merge it.
 
+   After merging, launch Codex interactively. In the hook trust review,
+   compare the new or changed hook commands and hashes with the repository
+   example and checked-out hook scripts. Approve only the vetted repository hooks.
+   Before relying on capture, verify that both hooks appear as enabled and trusted.
+   Repeat this review whenever a hook command or hash changes.
+
 Hooks inherit environment variables from the terminal that launches Claude
 Code or Codex. Start each agent from a fresh shell where AI_MEMORY_HOME is set.
 EOF
