@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import tomllib
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,20 @@ from providers import (
     TextRequest,
     WorkspaceRequest,
 )
+
+
+def test_provider_runtime_imports_are_declared_direct_dependencies():
+    project = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    declared = {
+        requirement.split("[", 1)[0].split(">", 1)[0].split("=", 1)[0].lower()
+        for requirement in project["project"]["dependencies"]
+    }
+
+    assert {"jsonschema", "referencing"} <= declared
 
 
 @dataclass
