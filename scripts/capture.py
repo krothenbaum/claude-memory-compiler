@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Callable, Literal, Mapping
 
@@ -308,6 +309,32 @@ def _retain_failed_snapshot(
     _publish_snapshot(temporary, destination)
 
 
+def _wake_after_commit(
+    launcher: Callable[[Path], None],
+    root: Path,
+    *,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    """Best-effort worker wake that can never roll back a committed capture."""
+    if deadline is None:
+        try:
+            launcher(root)
+        except Exception:
+            pass
+        return
+
+    def wake() -> None:
+        try:
+            launcher(root)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=wake, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.0, deadline - monotonic()))
+
+
 def capture_transcript(
     transcript_path: Path | str,
     *,
@@ -438,9 +465,12 @@ def capture_transcript(
                 repository.close()
         if deadline is not None and not result.created:
             final_snapshot.unlink(missing_ok=True)
-        if deadline is not None and monotonic() >= deadline:
-            return CaptureOutcome.from_enqueue(result)
-        launcher(root)
+        _wake_after_commit(
+            launcher,
+            root,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         return CaptureOutcome.from_enqueue(result)
     except CaptureDeadlineExceeded:
         if committed_result is None and temporary.exists():
@@ -451,6 +481,16 @@ def capture_transcript(
                 pass
         raise
     except BaseException:
+        if committed_result is not None:
+            if deadline is not None and not committed_result.created:
+                temporary.unlink(missing_ok=True)
+            _wake_after_commit(
+                launcher,
+                root,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            return CaptureOutcome.from_enqueue(committed_result)
         # A private snapshot is the recovery boundary even when parsing fails.
         if temporary.exists():
             try:

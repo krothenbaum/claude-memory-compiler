@@ -37,6 +37,9 @@ MIN_TURNS_TO_FLUSH = 1
 MAX_LIVE_TRANSCRIPT_SCAN_BYTES = 16_000_000
 MAX_LIVE_JSONL_RECORD_BYTES = 500_000
 SEMANTIC_SCAN_CHUNK_BYTES = 500_000
+MAX_SEMANTIC_CANDIDATE_RECORDS = 4_096
+MAX_SEMANTIC_CANDIDATE_BYTES = 16_000_000
+RECORD_OFFSET_SCALE = 1_000_000
 HOOK_WORK_BUDGET_SECONDS = 2.25
 MIN_CAPTURE_REMAINING_SECONDS = 0.75
 
@@ -429,10 +432,192 @@ def _could_contain_semantic_record(
     }
 
 
+def _is_self_contained_turn(
+    record: dict[str, object], source_agent: Literal["claude", "codex"]
+) -> bool:
+    """Whether this record yields a turn without any earlier call context."""
+    if source_agent == "codex":
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("type") == "agent_message":
+            return _completed_agent_message(payload) is not None
+        if payload.get("type") != "message":
+            return False
+        role = payload.get("role")
+        expected = "input_text" if role == "user" else "output_text"
+        content = payload.get("content")
+        return role in ("user", "assistant") and isinstance(content, list) and any(
+            isinstance(block, dict)
+            and block.get("type") == expected
+            and isinstance(block.get("text"), str)
+            and bool(block["text"].strip())
+            for block in content
+        )
+
+    message = record.get("message")
+    role = message.get("role") if isinstance(message, dict) else record.get("role")
+    content = (
+        message.get("content") if isinstance(message, dict) else record.get("content")
+    )
+    if role not in ("user", "assistant"):
+        return False
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    if any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    ):
+        return False
+    return any(
+        (isinstance(block, str) and bool(block.strip()))
+        or (
+            isinstance(block, dict)
+            and (
+                (
+                    block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and bool(block["text"].strip())
+                )
+                or (
+                    block.get("type") == "tool_use"
+                    and block.get("name") == "AskUserQuestion"
+                )
+            )
+        )
+        for block in content
+    )
+
+
+def _json_output(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _has_text(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(
+            _has_text(block.get("text"))
+            if isinstance(block, dict) and block.get("type") == "text"
+            else _has_text(block)
+            for block in value
+        )
+    return False
+
+
+def _answer_text(value: object) -> str:
+    if isinstance(value, dict) and "answers" in value:
+        return _answer_text(value["answers"])
+    if isinstance(value, list):
+        return ", ".join(filter(None, (_answer_text(item) for item in value)))
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _choice_text(value: object) -> str:
+    if isinstance(value, dict) and "answers" in value:
+        return _choice_text(value["answers"])
+    if isinstance(value, list):
+        return ", ".join(
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _completed_output(value: object) -> bool:
+    parsed = _json_output(value)
+    if isinstance(parsed, dict):
+        if parsed.get("completed") not in (None, False) and _answer_text(
+            parsed.get("completed")
+        ).strip():
+            return True
+        if str(parsed.get("status", "")).lower() in {
+            "complete",
+            "completed",
+            "done",
+            "finished",
+        }:
+            return any(
+                bool(_answer_text(parsed.get(key)).strip())
+                for key in ("message", "result", "output", "final_answer", "finding")
+            )
+        return any(_completed_output(child) for child in parsed.values())
+    if isinstance(parsed, list):
+        return any(_completed_output(child) for child in parsed)
+    if isinstance(parsed, str):
+        lowered = parsed.lower()
+        return "<subagent_notification>" in lowered and "completed" in lowered
+    return False
+
+
+def _result_is_durable(
+    source_agent: Literal["claude", "codex"], name: str, encoded: bytes
+) -> bool:
+    record = json.loads(encoded)
+    if source_agent == "claude":
+        content = record["message"]["content"][0].get("content")
+        if name == "AskUserQuestion":
+            return _has_text(content)
+        return _has_text(content) and not (
+            isinstance(content, str) and content.startswith("Async agent launched")
+        )
+    output = record["payload"].get("output")
+    parsed = _json_output(output)
+    if name in {"ask_user_question", "askuserquestion", "request_user_input"}:
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), dict):
+            return False
+        return any(_choice_text(value) for value in parsed["answers"].values())
+    return _completed_output(parsed)
+
+
+def _merge_claude_entries(
+    entries: dict[int, bytes],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> dict[int, bytes]:
+    merged: dict[int, dict[str, object]] = {}
+    for entry_index, (offset, encoded) in enumerate(sorted(entries.items())):
+        if entry_index % 64 == 0:
+            require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
+        parent = (offset // RECORD_OFFSET_SCALE) * RECORD_OFFSET_SCALE
+        record = json.loads(encoded)
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [content]
+        if parent not in merged:
+            merged[parent] = {
+                "message": {"role": message.get("role"), "content": []}
+            }
+            if isinstance(record.get("timestamp"), str):
+                merged[parent]["timestamp"] = record["timestamp"]
+        merged_message = merged[parent]["message"]
+        assert isinstance(merged_message, dict)
+        merged_content = merged_message["content"]
+        assert isinstance(merged_content, list)
+        merged_content.extend(block for block in blocks if block is not None)
+    return {offset: _encoded_record(record) for offset, record in merged.items()}
+
+
 def _semantic_compaction(
     records: list[tuple[int, dict[str, object]]],
     *,
     source_agent: Literal["claude", "codex"],
+    deadline: float,
+    clock: Callable[[], float],
 ) -> bytes:
     """Keep only records that the shared parser can turn into durable signal.
 
@@ -449,8 +634,10 @@ def _semantic_compaction(
         entries[offset] = encoded
         groups.append((offset, {offset}))
 
-    for offset, record in records:
-        record_offset = offset * 1_000
+    for record_index, (offset, record) in enumerate(records):
+        if record_index % 64 == 0:
+            require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
+        record_offset = offset * RECORD_OFFSET_SCALE
         timestamp = record.get("timestamp")
         if source_agent == "claude":
             message = record.get("message", {})
@@ -468,12 +655,14 @@ def _semantic_compaction(
                 continue
             if not isinstance(content, list):
                 continue
-            text_blocks: list[object] = []
             for block_index, block in enumerate(content):
                 item_offset = record_offset + block_index + 1
                 if isinstance(block, str):
                     if block.strip():
-                        text_blocks.append(block)
+                        add_group(
+                            item_offset,
+                            _record_message(role, [block], timestamp),
+                        )
                     continue
                 if not isinstance(block, dict):
                     continue
@@ -481,7 +670,14 @@ def _semantic_compaction(
                 if block_type == "text":
                     text = block.get("text")
                     if isinstance(text, str) and text.strip():
-                        text_blocks.append({"type": "text", "text": text})
+                        add_group(
+                            item_offset,
+                            _record_message(
+                                role,
+                                [{"type": "text", "text": text}],
+                                timestamp,
+                            ),
+                        )
                 elif block_type == "tool_use":
                     call_id = block.get("id")
                     name = block.get("name")
@@ -517,8 +713,6 @@ def _semantic_compaction(
                             _record_message(role, [sanitized], timestamp),
                         )
                     )
-            if text_blocks:
-                add_group(record_offset, _record_message(role, text_blocks, timestamp))
         else:
             if record.get("type") != "response_item":
                 continue
@@ -595,6 +789,7 @@ def _semantic_compaction(
         "wait_for_agent",
     }
     for call_id, declarations in calls.items():
+        require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
         allowed = [
             declaration
             for declaration in declarations
@@ -617,15 +812,30 @@ def _semantic_compaction(
         if source_agent == "claude" and name == "AskUserQuestion":
             entries[call_offset] = call_record
             groups.append((call_offset, {call_offset}))
-        if not matching_results:
+        durable_result = next(
+            (
+                result
+                for result in matching_results
+                if _result_is_durable(source_agent, name, result[1])
+            ),
+            None,
+        )
+        if durable_result is None:
             continue
-        result_offset, result_record = matching_results[0]
+        result_offset, result_record = durable_result
         entries[call_offset] = call_record
         entries[result_offset] = result_record
         groups.append((call_offset, {call_offset, result_offset}))
 
+    if source_agent == "claude":
+        entries = _merge_claude_entries(
+            entries, deadline=deadline, clock=clock
+        )
+        groups = [(offset, {offset}) for offset in entries]
     total = sum(len(value) for value in entries.values())
-    for _group_offset, offsets in sorted(groups):
+    for group_index, (_group_offset, offsets) in enumerate(sorted(groups)):
+        if group_index % 64 == 0:
+            require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
         if total <= MAX_LIVE_TRANSCRIPT_SCAN_BYTES:
             break
         for offset in offsets:
@@ -679,17 +889,44 @@ def bounded_transcript_slice(
             os.fchmod(descriptor, 0o600)
         os.close(descriptor)
         semantic_records: list[tuple[int, dict[str, object]]] = []
+        candidate_bytes = 0
+        selection_complete = False
         for start, chunk in _validated_chunks_backward(
             source, size, deadline=deadline, clock=clock
         ):
+            positioned: list[tuple[int, bytes]] = []
             relative = 0
             for line in chunk.splitlines():
+                positioned.append((start + relative, line))
+                relative += len(line) + 1
+            for offset, line in reversed(positioned):
+                require_time_remaining(
+                    deadline, clock, MIN_CAPTURE_REMAINING_SECONDS
+                )
                 record = json.loads(line)
                 if _could_contain_semantic_record(record, source_agent):
-                    semantic_records.append((start + relative, record))
-                relative += len(line) + 1
+                    semantic_records.append((offset, record))
+                    candidate_bytes += len(line) + 1
+                    if (
+                        len(semantic_records) > MAX_SEMANTIC_CANDIDATE_RECORDS
+                        or candidate_bytes > MAX_SEMANTIC_CANDIDATE_BYTES
+                    ):
+                        raise LiveTranscriptRejected(
+                            "semantic candidate state exceeds live safety bound"
+                        )
+                    if len(semantic_records) >= MAX_TURNS and all(
+                        _is_self_contained_turn(candidate, source_agent)
+                        for _candidate_offset, candidate in semantic_records[:MAX_TURNS]
+                    ):
+                        selection_complete = True
+                        break
+            if selection_complete:
+                break
         compacted = metadata_prefix + _semantic_compaction(
-            semantic_records, source_agent=source_agent
+            semantic_records,
+            source_agent=source_agent,
+            deadline=deadline,
+            clock=clock,
         )
         if len(compacted) > MAX_LIVE_TRANSCRIPT_SCAN_BYTES:
             raise LiveTranscriptRejected(

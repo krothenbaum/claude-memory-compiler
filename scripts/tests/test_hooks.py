@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 import importlib.util
 import io
@@ -15,6 +16,8 @@ import sys
 import time
 
 import pytest
+
+from scripts.transcripts import parse_claude_transcript
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -867,6 +870,213 @@ def test_semantic_compaction_pairs_calls_across_chunks_and_suppresses_reused_ids
     assert "REUSED_PRIVATE_OUTPUT" not in snapshot_text
     assert "AGENT_MESSAGE_PRIVATE" not in snapshot_text
     assert list(hook_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("agent", "hook_name"),
+    [("claude", "session-end.py"), ("codex", "codex-session-end.py")],
+)
+def test_semantic_compaction_keeps_later_durable_result_after_empty_result(
+    tmp_path, agent, hook_name
+):
+    source = tmp_path / f"{agent}-later-result.jsonl"
+    if agent == "claude":
+        records = [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "result-call",
+                            "name": "Agent",
+                            "input": {},
+                        }
+                    ],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "result-call",
+                            "content": "",
+                        }
+                    ],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "result-call",
+                            "content": "LATER_DURABLE_RESULT",
+                        }
+                    ],
+                }
+            },
+        ]
+        payload = {
+            "session_id": "later-result",
+            "transcript_path": str(source),
+            "cwd": "/projects/later-result",
+        }
+    else:
+        records = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "wait_agent",
+                    "call_id": "result-call",
+                    "arguments": "{}",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "result-call",
+                    "output": "{}",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "result-call",
+                    "output": json.dumps(
+                        {"status": "completed", "result": "LATER_DURABLE_RESULT"}
+                    ),
+                },
+            },
+        ]
+        payload = {"transcript_path": str(source)}
+    source.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, _elapsed = _run_hook(
+        hook_name, payload, memory_home, fake_bin=fake_bin
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "LATER_DURABLE_RESULT" in _only_job_payload(memory_home)[
+        "rendered_context"
+    ]
+
+
+def test_mixed_text_and_question_blocks_remain_one_turn_each(tmp_path):
+    source = tmp_path / "mixed-blocks.jsonl"
+    records = []
+    for index in range(20):
+        text_block = {"type": "text", "text": f"TEXT_{index:02d}"}
+        question_block = {
+            "type": "tool_use",
+            "id": f"ask-{index}",
+            "name": "AskUserQuestion",
+            "input": {
+                "questions": [
+                    {
+                        "question": f"QUESTION_{index:02d}?",
+                        "options": [{"label": "Yes"}],
+                    }
+                ]
+            },
+        }
+        records.append(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [text_block, question_block]
+                    if index % 2 == 0
+                    else [question_block, text_block],
+                }
+            }
+        )
+    source.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, _elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "mixed-blocks",
+            "transcript_path": str(source),
+            "cwd": "/projects/mixed-blocks",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+    )
+
+    assert result.returncode == 0, result.stderr
+    queued = _only_job_payload(memory_home)
+    rendered = queued["rendered_context"]
+    expected = parse_claude_transcript(
+        source,
+        {
+            "session_id": "mixed-blocks",
+            "cwd": "/projects/mixed-blocks",
+            "trigger": "session_end",
+        },
+        limits={"max_turns": 30, "max_chars": 15_000},
+    )
+    assert "TEXT_00" in rendered
+    assert "QUESTION_00" in rendered
+    assert "TEXT_19" in rendered
+    assert queued["turns"] == [asdict(turn) for turn in expected.turns]
+
+
+def test_huge_semantic_suffix_stops_after_safe_final_thirty(tmp_path):
+    source = tmp_path / "huge-semantic.jsonl"
+    with source.open("w", encoding="utf-8") as stream:
+        for index in range(150_000):
+            stream.write(
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "user",
+                            "content": f"SEMANTIC_{index:06d}",
+                        }
+                    }
+                )
+                + "\n"
+            )
+    assert source.stat().st_size > 8_000_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "huge-semantic",
+            "transcript_path": str(source),
+            "cwd": "/projects/huge-semantic",
+        },
+        memory_home,
+        fake_bin=fake_bin,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 2.75
+    payload = _only_job_payload(memory_home)
+    assert len(payload["turns"]) == 30
+    assert "SEMANTIC_149970" in payload["rendered_context"]
+    assert "SEMANTIC_149999" in payload["rendered_context"]
+    assert _only_job_source_path(memory_home).stat().st_size < 100_000
 
 
 def test_process_deadline_kills_blocking_enqueue_with_margin(tmp_path):

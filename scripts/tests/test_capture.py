@@ -199,7 +199,7 @@ def test_deadline_before_queue_open_leaves_no_database_or_snapshot(
     assert list((home / "scripts" / "spool").glob("*.jsonl")) == []
 
 
-def test_deadline_after_committed_enqueue_retains_job_and_skips_launch(tmp_path):
+def test_deadline_after_committed_enqueue_retains_job_and_attempts_wake(tmp_path):
     source = tmp_path / "source.jsonl"
     write_claude_transcript(source)
     home = tmp_path / "memory"
@@ -231,7 +231,136 @@ def test_deadline_after_committed_enqueue_retains_job_and_skips_launch(tmp_path)
 
     assert result.created is True
     assert Path(result.job.source_path).exists()
-    assert launched == []
+    assert launched == [home]
+
+
+def test_launcher_failure_after_commit_preserves_referenced_snapshot_and_dedup(
+    tmp_path,
+):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+
+    first = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"session_id": "launch-failure", "trigger": "session_end"},
+        memory_home=home,
+        launcher=lambda _: (_ for _ in ()).throw(RuntimeError("launch failed")),
+        env={},
+        deadline=time.monotonic() + 5,
+        monotonic=time.monotonic,
+        capture_token="launchfailure",
+    )
+
+    assert first.created is True
+    snapshot = Path(first.job.source_path)
+    assert snapshot.exists()
+    assert "failed-" not in snapshot.name
+    assert list(snapshot.parent.glob("failed-*.jsonl")) == []
+
+    second = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"session_id": "launch-failure", "trigger": "session_end"},
+        memory_home=home,
+        launcher=lambda _: None,
+        env={},
+        deadline=time.monotonic() + 5,
+        monotonic=time.monotonic,
+        capture_token="equivalent",
+    )
+
+    assert second.created is False
+    assert second.job_id == first.job_id
+    assert Path(second.job.source_path) == snapshot
+    assert snapshot.exists()
+
+
+def test_postcommit_deadline_attempts_wake_without_blocking_or_losing_job(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    current = [0.0]
+    wake_started = threading.Event()
+    release_wake = threading.Event()
+
+    class CommittingQueue:
+        def enqueue_capture(self, normalized):
+            current[0] = 2.0
+            job = type(
+                "CommittedJob",
+                (),
+                {"id": 42, "source_path": normalized.source_path},
+            )()
+            return type("Committed", (), {"created": True, "job": job})()
+
+    def blocked_wake(_root):
+        wake_started.set()
+        release_wake.wait(5)
+
+    started = time.monotonic()
+    result = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        queue=CommittingQueue(),
+        launcher=blocked_wake,
+        env={},
+        deadline=1.0,
+        monotonic=lambda: current[0],
+        capture_token="postcommitwake",
+    )
+    elapsed = time.monotonic() - started
+    release_wake.set()
+
+    assert result.created is True
+    assert wake_started.wait(0.2)
+    assert elapsed < 0.2
+    assert Path(result.job.source_path).exists()
+
+
+def test_queue_close_failure_after_commit_keeps_snapshot_and_attempts_wake(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    launched = []
+
+    class CloseFailureQueue:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def enqueue_capture(self, normalized):
+            job = type(
+                "CommittedJob",
+                (),
+                {"id": 43, "source_path": normalized.source_path},
+            )()
+            return type("Committed", (), {"created": True, "job": job})()
+
+        def close(self):
+            raise RuntimeError("close failed after commit")
+
+    monkeypatch.setattr(capture_module, "QueueRepository", CloseFailureQueue)
+
+    result = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        launcher=lambda root: launched.append(root),
+        env={},
+        deadline=time.monotonic() + 5,
+        monotonic=time.monotonic,
+        capture_token="closefailure",
+    )
+
+    assert result.created is True
+    assert Path(result.job.source_path).exists()
+    assert launched == [home]
 
 
 def test_deadline_capture_tokens_isolate_concurrent_equivalent_snapshots(tmp_path):
