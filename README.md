@@ -142,9 +142,9 @@ db.close()
 PY
 ```
 
-The configuration lookup honors `AI_MEMORY_QUEUE_PATH`, `AI_MEMORY_HOME`, and the legacy root alias. It also avoids requiring the platform-specific `sqlite3` command-line tool.
+The displayed wrapper uses Bash/Zsh command substitution and a heredoc, so run it from a POSIX Bash or Zsh shell. The configuration lookup honors `AI_MEMORY_QUEUE_PATH`, `AI_MEMORY_HOME`, and the legacy root alias, and the Python/SQLite inspection logic itself is cross-platform. On Windows, set the same environment variables in PowerShell and run the Python body with the absolute path returned by `load_config(os.environ).queue_path`, or use the displayed wrapper from a Bash environment. No separate `sqlite3` command-line tool is required.
 
-For pending, failed, or expired leased jobs, fix the underlying authentication, capacity, path, or filesystem problem and run `uv run python scripts/worker.py --drain`. The live worker is a serialized singleton: it recovers expired leases and applies bounded retry backoff one job at a time. `AI_MEMORY_WORKER_CONCURRENCY` is parsed and reserved for future live-worker concurrency but is not currently consumed. Historical discovery and extraction use the explicit `--concurrency N` option.
+For pending, failed, or expired leased jobs, fix the underlying authentication, capacity, path, or filesystem problem and run `uv run python scripts/worker.py --drain`. The live worker is a serialized singleton: it recovers expired leases and applies bounded retry backoff one job at a time. `AI_MEMORY_WORKER_CONCURRENCY` is parsed and reserved for future live-worker concurrency but is not currently consumed. Historical import's explicit `--concurrency N` option bounds parallel transcript parsing and provider work; all historical and live filesystem writes remain serialized by the writer lock.
 
 A dead job has exhausted its attempts. This release has no supported command to reset or requeue a dead row. Preserve `scripts/jobs.sqlite3*` and the matching private file in `scripts/spool/`, inspect `last_error` and provider attempts with the read-only command above, correct the cause, and obtain an operator-reviewed recovery rather than mutating SQLite directly. Never delete an active spool snapshot or edit a queue payload by hand. Remove a spool file only after its job succeeds and no queue row references it.
 
