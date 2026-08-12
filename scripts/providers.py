@@ -549,6 +549,7 @@ class CodexProvider:
             "--ask-for-approval",
             "never",
             "exec",
+            "--skip-git-repo-check",
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
@@ -563,8 +564,6 @@ class CodexProvider:
         ]
         if request.output_schema is not None:
             command.extend(["--output-schema", str(request.output_schema.resolve())])
-        if workspace and not _is_git_worktree(stage):
-            command.append("--skip-git-repo-check")
         command.append("-")
 
         try:
@@ -611,11 +610,6 @@ class CodexProvider:
             output_path.unlink(missing_ok=True)
             if temporary_directory is not None:
                 temporary_directory.cleanup()
-
-
-def _is_git_worktree(path: Path) -> bool:
-    return any((candidate / ".git").exists() for candidate in (path, *path.parents))
-
 
 def _load_output_schema(
     output_schema: Path | None,

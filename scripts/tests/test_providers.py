@@ -528,12 +528,15 @@ def test_codex_text_command_is_ephemeral_read_only_and_noninteractive(
     command, kwargs = runner.calls[1]
     assert command[:4] == ["codex", "--ask-for-approval", "never", "exec"]
     assert "--ask-for-approval" not in command[4:]
+    assert command.count("--skip-git-repo-check") == 1
+    assert command[4] == "--skip-git-repo-check"
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
     assert command[command.index("--model") + 1] == "model-query"
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert command[command.index("--cd") + 1] == str(text_request.cwd)
+    assert "--add-dir" not in command
     assert command[-1] == "-"
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert kwargs["stdin"] == text_request.prompt
@@ -559,7 +562,10 @@ def test_codex_workspace_command_writes_only_in_stage(fake_runner, tmp_path):
     command, kwargs = runner.calls[1]
     assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert command[command.index("--cd") + 1] == str(stage)
-    assert "--skip-git-repo-check" in command
+    assert command.count("--skip-git-repo-check") == 1
+    assert command[4] == "--skip-git-repo-check"
+    assert "--add-dir" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
     output_path = Path(command[command.index("--output-last-message") + 1])
     assert output_path.parent == stage
     assert kwargs["cwd"] == stage
