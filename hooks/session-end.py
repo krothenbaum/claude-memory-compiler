@@ -174,8 +174,9 @@ def bounded_transcript_slice(
 ) -> Iterator[tuple[Path, object]]:
     """Select a semantic tail under a hard 16 MB fail-closed scan budget.
 
-    Windows expand geometrically until the shared normalizer finds a durable
-    turn or the file start is reached. A larger file with no signal in the
+    Windows expand geometrically until the shared normalizer retains 30 turns,
+    the file start is reached, or the hard cap is reached. At the cap, the
+    largest signal-bearing preview wins. A larger file with no signal in the
     final 16 MB is pathological live input and is rejected for later recovery.
     """
     size = source.stat().st_size
@@ -201,14 +202,21 @@ def bounded_transcript_slice(
             )
             _write_private_slice(temporary, payload, durable=False)
             preview = previewer(temporary)
-            if getattr(preview, "turns", ()) or reached_start:
+            turns = getattr(preview, "turns", ())
+            if len(turns) >= MAX_TURNS or reached_start:
                 _write_private_slice(temporary, payload, durable=True)
                 yield temporary, preview
                 return
             if window >= MAX_LIVE_TRANSCRIPT_SCAN_BYTES:
-                raise LiveTranscriptRejected(
-                    "no durable signal found within the 16 MB live scan budget"
-                )
+                if not turns:
+                    raise LiveTranscriptRejected(
+                        "no durable signal found within the 16 MB live scan budget"
+                    )
+                # The hard cap wins over the 30-turn target. The geometrically
+                # largest valid preview is the best bounded recovery slice.
+                _write_private_slice(temporary, payload, durable=True)
+                yield temporary, preview
+                return
             window = min(window * 2, MAX_LIVE_TRANSCRIPT_SCAN_BYTES)
     except BaseException:
         try:

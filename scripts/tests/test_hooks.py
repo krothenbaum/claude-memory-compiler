@@ -324,7 +324,7 @@ def test_large_valid_live_transcripts_use_a_bounded_private_tail(tmp_path):
         assert result.returncode == 0, result.stderr
         assert elapsed < 3
         snapshot = _only_job_source_path(memory_home)
-        assert snapshot.stat().st_size <= 1_100_000
+        assert snapshot.stat().st_size <= 16_100_000
         assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
         assert "raw-private-session-name" not in snapshot.name
         snapshot_lines = snapshot.read_text(encoding="utf-8").splitlines()
@@ -489,6 +489,80 @@ def test_claude_semantic_tail_expansion_preserves_signal_and_dedup(tmp_path):
         isinstance(json.loads(line), dict)
         for line in snapshot.read_text(encoding="utf-8").splitlines()
     )
+    assert list(hook_tmp.iterdir()) == []
+
+
+def test_semantic_expansion_preserves_four_older_turns_before_routine_tail(
+    tmp_path,
+):
+    source = tmp_path / "claude-threshold-edge.jsonl"
+    padding = "t" * 60_000
+    with source.open("w", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "sessionId": "threshold-session",
+                    "cwd": "/projects/threshold-project",
+                }
+            )
+            + "\n"
+        )
+        for index in range(4):
+            stream.write(
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "user" if index % 2 == 0 else "assistant",
+                            "content": f"OLDER_DURABLE_TURN_{index}",
+                        }
+                    }
+                )
+                + "\n"
+            )
+        routine = json.dumps({"type": "progress", "data": padding}) + "\n"
+        for _ in range(65):
+            stream.write(routine)
+        stream.write(
+            json.dumps(
+                {"message": {"role": "user", "content": "FINAL_DURABLE_TURN"}}
+            )
+            + "\n"
+        )
+    assert source.stat().st_size > 3_700_000
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+    _fake_uv(fake_bin)
+    payload = {
+        "session_id": "threshold-session",
+        "transcript_path": str(source),
+        "cwd": "/projects/threshold-project",
+    }
+
+    precompact, precompact_elapsed = _run_hook(
+        "pre-compact.py",
+        payload,
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+    session_end, session_end_elapsed = _run_hook(
+        "session-end.py",
+        payload,
+        memory_home,
+        fake_bin=fake_bin,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert precompact.returncode == session_end.returncode == 0
+    assert precompact_elapsed < 3
+    assert session_end_elapsed < 3
+    assert len(_job_rows(memory_home)) == 1
+    rendered = _only_job_payload(memory_home)["rendered_context"]
+    for index in range(4):
+        assert f"OLDER_DURABLE_TURN_{index}" in rendered
+    assert "FINAL_DURABLE_TURN" in rendered
     assert list(hook_tmp.iterdir()) == []
 
 
