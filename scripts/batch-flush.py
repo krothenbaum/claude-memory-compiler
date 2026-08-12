@@ -31,6 +31,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 from pathlib import Path
 
@@ -470,7 +471,7 @@ def filter_historical_sessions(
 
 
 def _plan_chunks(
-    sessions: Sequence[HistoricalSession], max_cost: float | None
+    sessions: Sequence[HistoricalSession], max_cost: float | Decimal | None
 ) -> list[NormalizedSession]:
     planned = [
         chunk
@@ -478,7 +479,9 @@ def _plan_chunks(
         for chunk in chunk_session(historical.session, CHUNK_TARGET_CHARS)
     ]
     if max_cost is not None:
-        planned = planned[: max(0, int(max_cost / FLUSH_COST_ESTIMATE))]
+        budget = Decimal(str(max_cost))
+        estimate = Decimal(str(FLUSH_COST_ESTIMATE))
+        planned = planned[: max(0, int(budget // estimate))]
     return planned
 
 
@@ -609,6 +612,26 @@ def _read_legacy_processed_sessions(state_path: Path) -> set[str]:
     return set(processed) if isinstance(processed, dict) else set()
 
 
+def _read_legacy_total_cost(state_path: Path) -> Decimal:
+    if not state_path.is_file():
+        return Decimal(0)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        value = state.get("batch_flush", {}).get("total_cost", 0)
+        total = Decimal(str(value))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        AttributeError,
+        InvalidOperation,
+    ):
+        return Decimal(0)
+    if not total.is_finite() or total < 0:
+        return Decimal(0)
+    return total
+
+
 def _dedup_plan(
     planned: Sequence[NormalizedSession], memory_home: Path, *, resume: bool
 ) -> tuple[list[NormalizedSession], int, int]:
@@ -622,19 +645,26 @@ def _dedup_plan(
     )
     retained: list[NormalizedSession] = []
     skipped = 0
-    completed = 0
+    would_create = 0
+    seen: set[tuple[str, str, str, str]] = set()
     for session in planned:
-        status = queue_identities.get(_identity(session))
+        identity = _identity(session)
+        if identity in seen:
+            skipped += 1
+            continue
+        seen.add(identity)
+        status = queue_identities.get(identity)
         legacy_match = (
             resume and session.agent == "claude" and session.session_id in legacy
         )
         if status is not None or legacy_match:
             skipped += 1
             if resume and (status == "succeeded" or legacy_match):
-                completed += 1
                 continue
+        else:
+            would_create += 1
         retained.append(session)
-    return retained, skipped, completed
+    return retained, skipped, would_create
 
 
 def _print_import_report(report: ImportReport, config) -> None:
@@ -665,19 +695,23 @@ async def execute_historical_import(
     home = Path(memory_home).expanduser().resolve()
     config = _config_for_home(home)
     selected = filter_historical_sessions(sessions, args)
-    all_planned = _plan_chunks(selected, args.max_cost)
-    planned, deduplicated, completed = _dedup_plan(
+    cost_budget: Decimal | None = None
+    if args.max_cost is not None:
+        accumulated = _read_legacy_total_cost(home / "scripts" / "state.json")
+        cost_budget = max(Decimal(0), Decimal(str(args.max_cost)) - accumulated)
+    all_planned = _plan_chunks(selected, cost_budget)
+    planned, deduplicated, would_create = _dedup_plan(
         all_planned, home, resume=args.resume
     )
     report = ImportReport(
         sessions=len(selected),
-        chunks=len(all_planned) - completed,
+        chunks=len(planned),
         projects=tuple(sorted({item.session.project for item in selected})),
         dates=tuple(sorted({item.date for item in selected})),
         estimated_tokens=sum(
             max(1, (len(render_turns(chunk)) + 3) // 4) for chunk in planned
         ),
-        enqueued=(len(planned) - deduplicated + completed) if args.dry_run else 0,
+        enqueued=would_create if args.dry_run else 0,
         skipped=deduplicated,
     )
     if args.dry_run:

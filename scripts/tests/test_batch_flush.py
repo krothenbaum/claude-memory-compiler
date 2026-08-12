@@ -683,6 +683,150 @@ def test_import_bounds_provider_concurrency_and_serializes_daily_writes(batch, t
     assert daily.count("**Agent:** Codex") == 5
 
 
+def test_import_collapses_repeated_identical_chunks_before_estimate_and_enqueue(
+    batch, tmp_path
+):
+    discovered = make_discovered(batch, tmp_path, 1)[0]
+    repeated_turns = tuple(
+        turn
+        for _ in range(3)
+        for turn in (
+            batch.NormalizedTurn("user", "same request " + "x" * 26_000),
+            batch.NormalizedTurn("assistant", "same response"),
+        )
+    )
+    historical = replace(
+        discovered,
+        session=replace(discovered.session, turns=repeated_turns),
+    )
+    dry_home = tmp_path / "dry-memory"
+    dry_args = batch.parse_cli_args(["--source", "codex", "--dry-run"])
+
+    dry_report = asyncio.run(
+        batch.execute_historical_import(
+            [historical], dry_args, memory_home=dry_home, router=None
+        )
+    )
+    unique_chunk = batch.chunk_session(
+        historical.session, batch.CHUNK_TARGET_CHARS
+    )[0]
+    unique_tokens = max(1, (len(batch.render_turns(unique_chunk)) + 3) // 4)
+
+    assert dry_report.chunks == 1
+    assert dry_report.enqueued == 1
+    assert dry_report.skipped == 2
+    assert dry_report.estimated_tokens == unique_tokens
+
+    memory_home = tmp_path / "memory"
+    router = TrackingRouter()
+    run_args = batch.parse_cli_args(["--source", "codex"])
+    report = asyncio.run(
+        batch.execute_historical_import(
+            [historical], run_args, memory_home=memory_home, router=router
+        )
+    )
+
+    with QueueRepository(memory_home / "scripts" / "jobs.sqlite3") as repository:
+        job_count = repository._connection.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone()[0]
+    daily = (memory_home / "daily" / "2026-08-10.md").read_text(encoding="utf-8")
+    assert job_count == 1
+    assert report.chunks == 1
+    assert report.enqueued == 1
+    assert report.succeeded == 1
+    assert report.skipped == 2
+    assert router.calls == 1
+    assert daily.count("**Agent:** Codex") == 1
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_claude_max_cost_subtracts_legacy_total_at_exact_boundary(
+    batch, tmp_path, resume
+):
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "state.json").write_text(
+        json.dumps({"batch_flush": {"total_cost": 0.04}}), encoding="utf-8"
+    )
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 3)
+    ]
+    argv = ["--source", "claude", "--max-cost", "0.12", "--dry-run"]
+    if resume:
+        argv.append("--resume")
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions,
+            batch.parse_cli_args(argv),
+            memory_home=memory_home,
+            router=None,
+        )
+    )
+
+    assert report.chunks == 2
+    assert report.enqueued == 2
+
+
+@pytest.mark.parametrize("accumulated", [0.12, 0.13])
+def test_claude_max_cost_processes_nothing_when_legacy_total_reaches_ceiling(
+    batch, tmp_path, accumulated
+):
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "state.json").write_text(
+        json.dumps({"batch_flush": {"total_cost": accumulated}}), encoding="utf-8"
+    )
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 1)
+    ]
+    args = batch.parse_cli_args(
+        ["--source", "claude", "--max-cost", "0.12", "--dry-run"]
+    )
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert report.chunks == 0
+    assert report.enqueued == 0
+    assert report.estimated_tokens == 0
+
+
+@pytest.mark.parametrize("legacy_state", [None, "{broken"])
+def test_claude_max_cost_tolerates_missing_or_corrupt_legacy_state(
+    batch, tmp_path, legacy_state
+):
+    memory_home = tmp_path / "memory"
+    if legacy_state is not None:
+        scripts = memory_home / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "state.json").write_text(legacy_state, encoding="utf-8")
+    sessions = [
+        replace(item, session=replace(item.session, agent="claude"))
+        for item in make_discovered(batch, tmp_path, 2)
+    ]
+    args = batch.parse_cli_args(
+        ["--source", "claude", "--max-cost", "0.04", "--dry-run"]
+    )
+
+    report = asyncio.run(
+        batch.execute_historical_import(
+            sessions, args, memory_home=memory_home, router=None
+        )
+    )
+
+    assert report.chunks == 1
+    assert report.enqueued == 1
+
+
 @pytest.mark.parametrize("agent", ["claude", "codex"])
 def test_flush_ok_completes_dedup_without_daily_write(batch, tmp_path, agent):
     memory_home = tmp_path / "memory"
