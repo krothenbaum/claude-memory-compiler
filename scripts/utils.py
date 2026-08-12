@@ -152,14 +152,20 @@ def prepare_secure_log_directory(memory_root: Path | str) -> Path:
     """
     root = Path(os.path.abspath(Path(memory_root).expanduser()))
     if not root.exists() and not root.is_symlink():
-        root.mkdir(mode=0o700)
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     _validate_log_directory(root.lstat(), root)
 
     current = root
     for name in ("scripts", "logs"):
         candidate = current / name
         if not candidate.exists() and not candidate.is_symlink():
-            candidate.mkdir(mode=0o700)
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
         _validate_log_directory(candidate.lstat(), candidate)
         current = candidate
     try:

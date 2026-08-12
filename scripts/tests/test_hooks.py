@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
@@ -50,6 +51,12 @@ def _close_hook_handlers(logger: logging.Logger) -> None:
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
+
+
+def _hook_log_records(path: Path) -> list[dict[str, object]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines
+    return [json.loads(line) for line in lines]
 
 
 def _tree_manifest(root: Path) -> dict[str, tuple[str, int, int, bytes | str | None]]:
@@ -1659,7 +1666,25 @@ def test_hook_logger_creates_private_log_and_preserves_host_handlers(
         assert path.stat().st_nlink == 1
         if hasattr(os, "getuid"):
             assert path.stat().st_uid == os.getuid()
-        assert f"[{label}] private hook message" in path.read_text(encoding="utf-8")
+        record = _hook_log_records(path)[0]
+        assert set(record) == {
+            "timestamp",
+            "level",
+            "component",
+            "event",
+            "logger",
+            "message",
+        }
+        assert record["timestamp"].endswith("Z")
+        datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
+        assert record == {
+            **record,
+            "level": "INFO",
+            "component": label,
+            "event": "hook_log",
+            "logger": logger_name,
+            "message": "private hook message",
+        }
     finally:
         _close_hook_handlers(logger)
 
@@ -1742,7 +1767,9 @@ def test_hook_logger_cross_platform_fallback_creates_private_file(
         hook._logger().warning("fallback message")
 
         path = memory_home / "scripts" / "logs" / "hooks.log"
-        assert path.read_text(encoding="utf-8").count("fallback message") == 1
+        assert [record["message"] for record in _hook_log_records(path)] == [
+            "fallback message"
+        ]
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert path.stat().st_nlink == 1
     finally:
@@ -1762,6 +1789,62 @@ def test_secure_hook_logging_detects_windows_reparse_attribute(monkeypatch):
     )()
 
     assert memory_utils._link_or_reparse(info)
+
+
+def test_hook_jsonl_encodes_quotes_newlines_and_omits_exception_details(
+    tmp_path, monkeypatch
+):
+    hook = _load_hook("session-end.py")
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    logger = logging.getLogger("ai-memory-session-end")
+    _close_hook_handlers(logger)
+    try:
+        try:
+            raise RuntimeError("credential-must-not-leak")
+        except RuntimeError:
+            hook._logger().error('quoted "message"\nsecond line', exc_info=True)
+
+        path = memory_home / "scripts" / "logs" / "hooks.log"
+        physical_lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(physical_lines) == 1
+        record = json.loads(physical_lines[0])
+        assert record["message"] == 'quoted "message"\nsecond line'
+        assert "credential-must-not-leak" not in physical_lines[0]
+        assert "Traceback" not in physical_lines[0]
+    finally:
+        _close_hook_handlers(logger)
+
+
+def test_hook_jsonl_concurrent_process_appends_remain_complete_records(tmp_path):
+    memory_home = tmp_path / "memory"
+    probe = """
+import sys
+from scripts.hook_logging import configure_hook_logger
+logger = configure_hook_logger("concurrent-hook-test", "session-end", sys.argv[1])
+logger.info('worker=%s quote=" newline=\\n', sys.argv[2])
+"""
+
+    def write_one(index: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", probe, str(memory_home), str(index)],
+            cwd=ROOT,
+            env=_hook_env(memory_home),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_one, range(24)))
+
+    assert all(result.returncode == 0 for result in results)
+    records = _hook_log_records(memory_home / "scripts" / "logs" / "hooks.log")
+    assert len(records) == 24
+    assert {record["message"] for record in records} == {
+        f'worker={index} quote=" newline=\n' for index in range(24)
+    }
+    assert all(record["component"] == "session-end" for record in records)
 
 
 @pytest.mark.parametrize("hook_name,logger_name,_label", HOOK_LOGGERS)

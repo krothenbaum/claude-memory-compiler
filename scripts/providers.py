@@ -472,11 +472,19 @@ class CodexProvider:
         self, request: TextRequest, started: float
     ) -> ProviderResult | None:
         try:
-            version = await self._run_command(
-                ["codex", "--version"],
-                request,
-                max_output_bytes=_CODEX_VERSION_MAX_OUTPUT_BYTES,
-            )
+            try:
+                version = await self._run_command(
+                    ["codex", "--version"],
+                    request,
+                    max_output_bytes=_CODEX_VERSION_MAX_OUTPUT_BYTES,
+                )
+            except TimeoutError:
+                return self._result(
+                    request,
+                    "timeout",
+                    started,
+                    reason="Codex CLI version check timed out",
+                )
             if version.output_truncated:
                 return self._result(
                     request,
@@ -517,18 +525,19 @@ class CodexProvider:
                     started,
                     reason="unsupported Codex CLI version",
                 )
-            status = await self._run_command(
-                ["codex", "login", "status"],
-                request,
-                max_output_bytes=_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES,
-            )
-        except TimeoutError as exc:
-            return self._result(
-                request,
-                "timeout",
-                started,
-                reason=_safe_reason(str(exc) or "codex login status timed out", self._source_env),
-            )
+            try:
+                status = await self._run_command(
+                    ["codex", "login", "status"],
+                    request,
+                    max_output_bytes=_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES,
+                )
+            except TimeoutError:
+                return self._result(
+                    request,
+                    "timeout",
+                    started,
+                    reason="codex login status timed out",
+                )
         except FileNotFoundError:
             return self._result(
                 request, "auth_failed", started, reason="codex CLI unavailable"

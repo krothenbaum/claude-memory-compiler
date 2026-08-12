@@ -169,6 +169,31 @@ def test_codex_preflight_fails_closed_for_unusable_version_result(
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("version_response", "responses", "reason", "call_count"),
+    [
+        (TimeoutError(), (), "Codex CLI version check timed out", 1),
+        (
+            None,
+            (TimeoutError(),),
+            "codex login status timed out",
+            2,
+        ),
+    ],
+    ids=["version", "login-status"],
+)
+def test_codex_preflight_timeout_reason_identifies_operation(
+    fake_runner, text_request, version_response, responses, reason, call_count
+):
+    runner = fake_runner(*responses, version_response=version_response)
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "timeout"
+    assert result.reason == reason
+    assert len(runner.calls) == call_count
+
+
 def _run(awaitable):
     return asyncio.run(awaitable)
 
