@@ -4,6 +4,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+printf -v REPO_ROOT_SHELL '%q' "$REPO_ROOT"
 SHELL_RC=""
 case "${SHELL:-}" in
   */zsh) SHELL_RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
@@ -20,7 +21,7 @@ This setup is opt-in and does not edit either agent's configuration.
 
 1) Export the canonical memory root in $SHELL_RC:
 
-     export AI_MEMORY_HOME="$REPO_ROOT"
+     export AI_MEMORY_HOME=$REPO_ROOT_SHELL
 
    CLAUDE_MEMORY_HOME remains a deprecated fallback for existing installs.
    Reload your shell after editing the file.

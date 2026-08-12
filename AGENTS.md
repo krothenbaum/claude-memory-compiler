@@ -383,7 +383,7 @@ Capture, model execution, and durable writes are separate boundaries. Hooks perf
 | `AI_MEMORY_CLAUDE_MODEL` | `claude-sonnet-5` | Claude subscription fallback |
 | `AI_MEMORY_JOB_TIMEOUT_SECONDS` | `900` | Provider attempt timeout |
 | `AI_MEMORY_QUEUE_PATH` | `$AI_MEMORY_HOME/scripts/jobs.sqlite3` | Absolute queue path |
-| `AI_MEMORY_WORKER_CONCURRENCY` | `2` | Model/read concurrency |
+| `AI_MEMORY_WORKER_CONCURRENCY` | `2` | Reserved; parsed but not consumed by the live worker |
 | `AI_MEMORY_INTERNAL_JOB` | unset | Recursion guard for provider children |
 | `AI_MEMORY_USAGE_ESTIMATE_ONLY` | `0` | Advisory usage estimation mode |
 
@@ -416,7 +416,7 @@ Claude JSONL records store user and assistant content under `message`. The parse
 
 Before provider execution, both parsers exclude developer instructions, hidden reasoning, duplicate `event_msg.agent_message` records, routine tool calls and output, token counts, session instructions, and asynchronous launch acknowledgements. Unknown tool records remain excluded. Selected explicit choices and completed collaboration findings use a small allowlist and bounded text.
 
-Transcripts, stages, queue rows, usage logs, daily logs, and knowledge files remain stored locally. Each model-backed task sends the selected ChatGPT-authenticated Codex or Claude subscription provider only its minimum task-specific inputs. Extraction may send normalized transcript content. Text queries and semantic lint send their prompts and relevant text. Staged compile, connection, and filed-answer tasks send their prompts plus the minimum staged copies of the selected daily log, index, build log, relevant articles, or compatible state they need. The parser exclusions above still apply before extraction. Local structural lint sends no content to either provider. Logs retain job metadata and bounded errors, not transcript bodies or credentials. Codex cloud-only history cannot be imported unless Codex exposes a local transcript or hook event.
+Transcripts, stages, queue rows, usage logs, daily logs, and knowledge files remain stored locally, but model-backed operations transmit task inputs to the selected ChatGPT-authenticated Codex or Claude subscription provider. Extraction may send normalized transcript content. A text query sends a prompt containing the full index and every concept, connection, and Q&A article. Semantic lint sends a prompt containing the full index and all articles. Compile sends a prompt plus a staged copy of the schema, selected daily log, index, build log, every article, and compatible state when present; its broad current output allowlist covers all concept and connection articles, the index, and the build log. A filed answer receives the full knowledge base in its prompt and a stage containing every article; its output allowlist covers Q&A articles, the index, and the build log. A connection pass receives its prompt, schema, index, build log, and staged candidate and bridge concept articles; its output allowlist covers connection articles, the index, and the build log. The parser exclusions above still apply before extraction. Local structural lint sends no content to either provider. Logs retain job metadata and bounded errors, not transcript bodies or credentials. Codex cloud-only history cannot be imported unless Codex exposes a local transcript or hook event.
 
 ## Provider Layer and Model Routing
 
@@ -439,24 +439,44 @@ Capacity and usage limits are subscription constraints, not dollar balances. The
 
 `scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs` plus `provider_attempts`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
 
-Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one own the queue drain. A later worker exits successfully when another healthy worker owns it.
+Claims use short immediate transactions. A worker renews its lease while a provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one serialized live worker own the queue drain. A later worker exits successfully when another healthy worker owns it. `AI_MEMORY_WORKER_CONCURRENCY` is reserved configuration: the loader validates it, but the live worker does not consume it. Historical import uses `--concurrency N` for bounded discovery and extraction.
 
 Queue inspection is read-only:
 
 ```bash
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status;'
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT id,kind,source_agent,attempt_count,status,last_error FROM jobs WHERE status IN ("failed","dead");'
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT job_id,provider,model,outcome,reason FROM provider_attempts ORDER BY id DESC LIMIT 20;'
+QUEUE_PATH="$(uv run python -c 'import os; from scripts.config import load_config; print(load_config(os.environ).queue_path)')"
+uv run python - "$QUEUE_PATH" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+for row in db.execute(
+    "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status"
+):
+    print(row)
+for row in db.execute(
+    "SELECT id,kind,source_agent,attempt_count,status,last_error "
+    "FROM jobs WHERE status IN ('failed','dead') ORDER BY id"
+):
+    print(row)
+for row in db.execute(
+    "SELECT job_id,provider,model,outcome,reason "
+    "FROM provider_attempts ORDER BY id DESC LIMIT 20"
+):
+    print(row)
+db.close()
+PY
 ```
 
-After correcting authentication, capacity, or filesystem failures, run `uv run python scripts/worker.py --drain`. This recovers expired leases and drains ready retry jobs. A dead job requires an explicit, targeted requeue after inspecting its `last_error`, attempts, and retained spool input. Never delete or rewrite active queue payloads.
+The configuration lookup honors `AI_MEMORY_QUEUE_PATH`, `AI_MEMORY_HOME`, and `CLAUDE_MEMORY_HOME`, and Python's standard library keeps the command cross-platform. After correcting authentication, capacity, or filesystem failures, run `uv run python scripts/worker.py --drain`. This recovers expired leases and drains ready retry jobs.
+
+A dead job has exhausted its attempts. The current CLI exposes no supported reset or requeue command. Preserve the queue database and retained spool input, inspect `last_error` and attempts read-only, correct the root cause, and obtain an operator-reviewed recovery. Do not mutate SQLite directly or delete active queue payloads.
 
 ## Staging and Single-Writer Transactions
 
-Compile, connection, and filed-answer providers edit a fresh owner-only stage containing the schema, selected daily input, index, build log, relevant articles, and compatible state snapshot. Validation rejects unexpected paths, escaping links, special files, structural deletion, malformed UTF-8 or frontmatter, source-daily edits, and incomplete article/index/log change sets. A rejected Codex stage is discarded before Claude receives a fresh stage.
+Compile, connection, and filed-answer providers edit fresh owner-only stages. Compile and filed-answer currently copy every article; compile also copies the selected daily input and compatible state. Connections copy only their candidate and bridge concept articles. Every stage contains the schema, index, and build log. Output allowlists remain deliberately broader where the operation may create or update articles. Validation rejects unexpected paths outside those allowlists, escaping links, special files, structural deletion, malformed UTF-8 or frontmatter, source-daily edits, and incomplete article/index/log change sets. A rejected Codex stage is discarded before Claude receives a fresh stage.
 
 Approved changes pass through `scripts/memory-writer.lock`. The host rechecks real-file baselines, writes an fsynced journal of original and replacement bytes, applies same-directory atomic replacements, and commits markers, state, and usage bookkeeping. Any failure restores original bytes and leaves the job retryable. Daily-log appends use the same lock.
 

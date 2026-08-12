@@ -73,7 +73,7 @@ The resulting source entry keeps the existing daily-log schema and adds provenan
 **CWD:** /full/path/to/project
 ```
 
-Transcripts, queue rows, stages, spools, daily logs, and knowledge files remain stored locally. Model-backed operations send the selected ChatGPT-authenticated Codex or Claude subscription provider only their minimum task-specific inputs. Extraction may send normalized transcript content; text queries and semantic lint send their prompts and relevant text; staged compile, connection, and filed-answer tasks send their prompts plus the minimum staged daily-log, index, build-log, article, or state copies they need. The exclusions above still apply before extraction, and local structural lint sends nothing to either provider. Structured logs omit transcript bodies and credentials. Codex conversations that exist only in cloud history remain unavailable: live capture and historical import require a local transcript or hook event.
+Transcripts, queue rows, stages, spools, daily logs, and knowledge files remain stored locally, but model-backed operations transmit task inputs to the selected ChatGPT-authenticated Codex or Claude subscription provider. Extraction may send normalized transcript content. A text query sends its prompt containing the full index and every concept, connection, and Q&A article. Semantic lint sends its prompt containing the full index and all articles. A compile sends its prompt plus a staged workspace containing the schema, selected daily log, index, build log, every article, and compatible state when present; its output allowlist covers all concept and connection articles, the index, and the build log. A filed answer also receives the full knowledge base in its prompt and a stage containing every article, with writes allowed to Q&A articles, the index, and the build log. A connection pass receives its prompt, schema, index, build log, and staged candidate and bridge concept articles, with writes allowed to connection articles, the index, and the build log. The exclusions above still apply before extraction, and local structural lint sends nothing to either provider. Structured logs omit transcript bodies and credentials. Codex conversations that exist only in cloud history remain unavailable: live capture and historical import require a local transcript or hook event.
 
 ## Commands
 
@@ -116,23 +116,37 @@ uv run python scripts/batch-flush.py --source all --resume --concurrency 2
 Runtime data lives below `scripts/` and is gitignored. Inspect the queue without changing it:
 
 ```bash
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status;'
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT id,kind,source_agent,attempt_count,status,last_error FROM jobs WHERE status IN ("failed","dead");'
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'SELECT job_id,provider,model,outcome,reason FROM provider_attempts ORDER BY id DESC LIMIT 20;'
+QUEUE_PATH="$(uv run python -c 'import os; from scripts.config import load_config; print(load_config(os.environ).queue_path)')"
+uv run python - "$QUEUE_PATH" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+for row in db.execute(
+    "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status"
+):
+    print(row)
+for row in db.execute(
+    "SELECT id,kind,source_agent,attempt_count,status,last_error "
+    "FROM jobs WHERE status IN ('failed','dead') ORDER BY id"
+):
+    print(row)
+for row in db.execute(
+    "SELECT job_id,provider,model,outcome,reason "
+    "FROM provider_attempts ORDER BY id DESC LIMIT 20"
+):
+    print(row)
+db.close()
+PY
 ```
 
-For pending, failed, or expired leased jobs, fix the underlying authentication, capacity, path, or filesystem problem and run `uv run python scripts/worker.py --drain`. The worker recovers expired leases and applies bounded retry backoff. A dead job has exhausted its attempts. Preserve `scripts/jobs.sqlite3*` and the matching private file in `scripts/spool/`, inspect `last_error` and provider attempts, then requeue only after correcting the cause:
+The configuration lookup honors `AI_MEMORY_QUEUE_PATH`, `AI_MEMORY_HOME`, and the legacy root alias. It also avoids requiring the platform-specific `sqlite3` command-line tool.
 
-```bash
-sqlite3 "$AI_MEMORY_HOME/scripts/jobs.sqlite3" \
-  'BEGIN IMMEDIATE; UPDATE jobs SET status="failed",attempt_count=0,available_at=strftime("%Y-%m-%dT%H:%M:%f+00:00","now"),lease_owner=NULL,lease_expires_at=NULL,completed_at=NULL WHERE id=JOB_ID AND status="dead"; COMMIT;'
-uv run python scripts/worker.py --drain
-```
+For pending, failed, or expired leased jobs, fix the underlying authentication, capacity, path, or filesystem problem and run `uv run python scripts/worker.py --drain`. The live worker is a serialized singleton: it recovers expired leases and applies bounded retry backoff one job at a time. `AI_MEMORY_WORKER_CONCURRENCY` is parsed and reserved for future live-worker concurrency but is not currently consumed. Historical discovery and extraction use the explicit `--concurrency N` option.
 
-Replace `JOB_ID` with one inspected numeric ID. Never delete an active spool snapshot or edit queue payloads by hand. A spool file is recovery input; remove it only after its job succeeds and no queue row references it.
+A dead job has exhausted its attempts. This release has no supported command to reset or requeue a dead row. Preserve `scripts/jobs.sqlite3*` and the matching private file in `scripts/spool/`, inspect `last_error` and provider attempts with the read-only command above, correct the cause, and obtain an operator-reviewed recovery rather than mutating SQLite directly. Never delete an active spool snapshot or edit a queue payload by hand. Remove a spool file only after its job succeeds and no queue row references it.
 
 An interrupted staged apply leaves `scripts/memory-apply-journal/` in place. Stop new writes and recover it before other maintenance:
 
