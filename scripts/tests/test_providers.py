@@ -252,6 +252,96 @@ def test_codex_accepts_chatgpt_login(fake_runner, text_request):
     assert runner.calls[0][0] == ["codex", "login", "status"]
 
 
+def test_codex_accepts_exact_chatgpt_login_from_stderr(fake_runner, text_request):
+    runner = fake_runner(
+        FakeCommandResult(stderr="Logged in using ChatGPT\n"),
+        _write_codex_output("codex answer"),
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert result.text == "codex answer"
+    assert result.reason is None
+
+
+def test_codex_accepts_exact_chatgpt_login_beside_benign_stderr_warning(
+    fake_runner, text_request
+):
+    warning = "WARNING: PATH does not include the Codex installation directory"
+    runner = fake_runner(
+        FakeCommandResult(stderr=f"{warning}\n  Logged in using ChatGPT  \r\n"),
+        _write_codex_output("codex answer"),
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert result.text == "codex answer"
+    assert result.reason is None
+    assert warning not in result.text
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ("prefix Logged in using ChatGPT suffix", ""),
+        ("", '"Logged in using ChatGPT"'),
+        ("", "error: expected Logged in using ChatGPT"),
+    ],
+    ids=["substring", "quoted", "error-mention"],
+)
+def test_codex_rejects_nonexact_chatgpt_login_mentions(
+    fake_runner, text_request, stdout, stderr
+):
+    runner = fake_runner(FakeCommandResult(stdout=stdout, stderr=stderr))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "auth_failed"
+    assert result.text == ""
+    assert len(runner.calls) == 1
+
+
+def test_codex_rejects_api_key_status_even_with_chatgpt_status(
+    fake_runner, text_request
+):
+    runner = fake_runner(
+        FakeCommandResult(
+            stdout="Logged in using ChatGPT\n",
+            stderr="Logged in using an API key\n",
+        )
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "auth_failed"
+    assert result.text == ""
+    assert len(runner.calls) == 1
+
+
+def test_codex_rejects_nonzero_chatgpt_status_without_leaking_secret(
+    fake_runner, text_request
+):
+    secret = "openai-preflight-secret"
+    runner = fake_runner(
+        FakeCommandResult(
+            returncode=1,
+            stderr=f"Logged in using ChatGPT\nfatal status failure: {secret}\n",
+        )
+    )
+
+    result = _run(
+        _codex_provider(runner, env={**os.environ, "OPENAI_API_KEY": secret})
+        .generate_text(text_request)
+    )
+
+    assert result.outcome == "error"
+    assert result.text == ""
+    assert secret not in result.reason
+    assert len(runner.calls) == 1
+
+
 def test_codex_rejects_api_key_login(fake_runner, text_request):
     runner = fake_runner(FakeCommandResult(stdout="Logged in using an API key"))
 

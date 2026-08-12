@@ -269,6 +269,8 @@ _AUTH_MARKERS = (
     "log in",
 )
 _MAX_REASON_LENGTH = 500
+_CODEX_CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT"
+_CODEX_API_KEY_LOGIN_STATUS = "Logged in using an API key"
 
 
 def subscription_child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -413,7 +415,17 @@ class CodexProvider:
                 reason=_safe_reason(str(exc), self._source_env),
             )
         combined = "\n".join((status.stdout, status.stderr)).strip()
-        if status.returncode == 0 and "Logged in using ChatGPT" in status.stdout:
+        status_lines = {
+            line.strip()
+            for stream in (status.stdout, status.stderr)
+            for line in stream.splitlines()
+            if line.strip()
+        }
+        if (
+            status.returncode == 0
+            and _CODEX_CHATGPT_LOGIN_STATUS in status_lines
+            and _CODEX_API_KEY_LOGIN_STATUS not in status_lines
+        ):
             return None
         if status.returncode == 0:
             reason = _safe_reason(
