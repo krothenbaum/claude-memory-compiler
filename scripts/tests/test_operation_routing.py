@@ -704,6 +704,38 @@ def test_invalid_claude_fallback_cleans_every_stage_and_can_rerun(
         assert str(second).startswith("Error querying knowledge base:")
 
 
+def test_compile_fallback_error_discards_actual_claude_stage_and_can_rerun(memory_home: Path):
+    calls: list[Path] = []
+
+    class Codex:
+        async def edit_workspace(self, request):
+            return ProviderResult("codex", "gpt-5.6-terra", request.task, "capacity")
+
+    class Claude:
+        async def edit_workspace(self, request):
+            calls.append(request.cwd)
+            return ProviderResult(
+                "claude", "claude-sonnet-5", request.task, "error", reason="failed"
+            )
+
+    def router_factory(fallback_workspace_factory):
+        from providers import ProviderRouter
+        return ProviderRouter(Codex(), Claude(), fallback_workspace_factory=fallback_workspace_factory)
+
+    def run_once():
+        return asyncio.run(compile_module.compile_daily_log(
+            memory_home / "daily/2026-08-11.md", {"ingested": {}},
+            capture_file_baseline(memory_home / "scripts/state.json"),
+            router_factory=router_factory, memory_home=memory_home,
+        ))
+
+    assert run_once() == 0.0
+    assert list((memory_home / "scripts/staging").iterdir()) == []
+    assert run_once() == 0.0
+    assert list((memory_home / "scripts/staging").iterdir()) == []
+    assert len(calls) == 2
+
+
 def test_compile_apply_conflict_cleans_stage_and_next_run_succeeds(memory_home: Path, monkeypatch):
     router = EditingRouter()
     real_apply = compile_module.apply_validated_stage
@@ -748,6 +780,7 @@ def test_connections_all_rejected_applies_only_canonical_audit(
                     "\n## malformed audit\n" if malformed else
                     "\n## [2026-08-11T12:00:00+00:00] connections | swanson-pass\n"
                     "- Candidates evaluated: 1\n- Connections created: none\n"
+                    "- Rejected (co-occurrence / too weak): concepts/a <-> concepts/b - weak\n"
                 )
             return _routed(TaskKind.CONNECTIONS)
 

@@ -286,7 +286,12 @@ async def synthesize_connections(
             return 0.0
         selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
         try:
-            validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.CONNECTIONS)
+            validated = validate_stage(
+                selected,
+                allowed_paths=allowed,
+                task=TaskKind.CONNECTIONS,
+                expected_candidate_count=len(cands),
+            )
         except StageValidationError as validation_error:
             if result.provider != "codex" or (router is not None and router_factory is None):
                 discard_stage(selected)
@@ -301,7 +306,12 @@ async def synthesize_connections(
                     discard_stage(stage)
                 return 0.0
             selected = fallback_holder[-1]
-            validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.CONNECTIONS)
+            validated = validate_stage(
+                selected,
+                allowed_paths=allowed,
+                task=TaskKind.CONNECTIONS,
+                expected_candidate_count=len(cands),
+            )
         apply_validated_stage(validated, validated.before, ApplyBookkeeping())
     except Exception as exc:
         logger.exception("connections provider failed")

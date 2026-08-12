@@ -391,6 +391,63 @@ def test_specialized_tasks_require_article_index_row_and_log_entry(memory_home, 
 
 
 @pytest.mark.parametrize(
+    ("body", "candidate_count", "valid"),
+    [
+        (
+            "- Candidates evaluated: 2\n"
+            "- Connections created: none\n"
+            "- Rejected (co-occurrence / too weak): concepts/a <-> concepts/b - weak; concepts/c <-> concepts/d - overlap only\n",
+            2,
+            True,
+        ),
+        ("", 2, False),
+        ("- Candidates evaluated: 2\n", 2, False),
+        ("- Candidates evaluated: 2\n- Connections created: none\n", 2, False),
+        (
+            "- Candidates evaluated: 1\n- Connections created: none\n"
+            "- Rejected (co-occurrence / too weak): concepts/a <-> concepts/b - weak\n",
+            2,
+            False,
+        ),
+        (
+            "- Candidates evaluated: two\n- Connections created: none\n"
+            "- Rejected (co-occurrence / too weak): weak\n",
+            2,
+            False,
+        ),
+        (
+            "- Candidates evaluated: 2\n- Connections created: [[connections/a-b]]\n"
+            "- Rejected (co-occurrence / too weak): weak\n",
+            2,
+            False,
+        ),
+        (
+            "- Candidates evaluated: 2\n- Connections created: none\n"
+            "- Rejected (co-occurrence / too weak):\n",
+            2,
+            False,
+        ),
+    ],
+)
+def test_connections_audit_only_contract(memory_home, body, candidate_count, valid):
+    stage = create_stage(memory_home, "connections-audit", str(abs(hash(body))))
+    with (stage.root / "knowledge/log.md").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\n## [2026-08-11T12:00:00+00:00] connections | swanson-pass\n" + body
+        )
+    operation = lambda: validate_stage(
+        stage,
+        allowed_paths=("knowledge/connections/*.md", "knowledge/index.md", "knowledge/log.md"),
+        task="connections",
+        expected_candidate_count=candidate_count,
+    )
+    if valid:
+        assert operation().changed_paths == ("knowledge/log.md",)
+    else:
+        with pytest.raises(StageValidationError, match="audit|candidate|created|rejection"):
+            operation()
+
+@pytest.mark.parametrize(
     ("heading", "valid"),
     [
         ("## [now] query (filed) | How auth redirects work", True),

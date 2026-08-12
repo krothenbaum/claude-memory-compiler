@@ -274,7 +274,9 @@ async def compile_daily_log(
     try:
         result = await provider_router.edit_workspace(request)
         if result.outcome != "success":
-            discard_stage(fallback_holder[-1] if fallback_holder else stage)
+            for candidate in [*fallback_holder, stage]:
+                if candidate.root.exists():
+                    discard_stage(candidate)
             return 0.0
         selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
         try:
@@ -289,8 +291,9 @@ async def compile_daily_log(
             )
             result = await provider_router.edit_workspace(request, codex_attempt=failed)
             if result.outcome != "success" or not fallback_holder:
-                if stage.root.exists():
-                    discard_stage(stage)
+                for candidate in [*fallback_holder, stage]:
+                    if candidate.root.exists():
+                        discard_stage(candidate)
                 return 0.0
             selected = fallback_holder[-1]
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)

@@ -636,6 +636,7 @@ def _validate_task_contract(
     after: Mapping[str, ManifestEntry],
     changed: tuple[str, ...],
     task: str,
+    expected_candidate_count: int | None = None,
 ) -> None:
     all_articles = tuple(
         path for path in after if path.endswith(".md") and path.startswith(_ARTICLE_PREFIXES)
@@ -664,6 +665,26 @@ def _validate_task_contract(
             if changed != ("knowledge/log.md",):
                 raise StageValidationError(
                     "connections without an article requires only a valid audit log update"
+                )
+            if expected_candidate_count is None:
+                raise StageValidationError(
+                    "connections audit-only validation requires an expected candidate count"
+                )
+            audit_lines = [line.strip() for line in added_log_lines if line.strip()]
+            if audit_lines and audit_lines[0].startswith("## "):
+                audit_lines = audit_lines[1:]
+            expected_lines = (
+                f"- Candidates evaluated: {expected_candidate_count}",
+                "- Connections created: none",
+            )
+            if len(audit_lines) != 3 or tuple(audit_lines[:2]) != expected_lines:
+                raise StageValidationError(
+                    "connections audit must contain the exact candidate count and created-none declaration"
+                )
+            rejection_prefix = "- Rejected (co-occurrence / too weak): "
+            if not audit_lines[2].startswith(rejection_prefix) or not audit_lines[2][len(rejection_prefix):].strip():
+                raise StageValidationError(
+                    "connections audit requires a non-empty rejection audit"
                 )
             return
         if task == "compile" and "knowledge/log.md" not in changed:
@@ -713,6 +734,7 @@ def validate_stage(
     *,
     allowed_paths: Sequence[str],
     task: object,
+    expected_candidate_count: int | None = None,
 ) -> ValidatedStage:
     """Validate an attempted model edit and return its immutable change set."""
     _validate_stage_location(stage)
@@ -765,7 +787,9 @@ def validate_stage(
         if not isinstance(staged_state, dict):
             raise StageValidationError("staged state.json must contain an object")
     task_name = getattr(task, "value", str(task))
-    _validate_task_contract(stage, after, changed, task_name)
+    _validate_task_contract(
+        stage, after, changed, task_name, expected_candidate_count
+    )
     validated = ValidatedStage(
         stage=stage,
         before=before,
