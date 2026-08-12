@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
 import os
 from pathlib import Path
@@ -22,6 +23,16 @@ from scripts.transcripts import parse_codex_transcript
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
+
+
+def _live_capture_helpers():
+    path = Path(__file__).with_name("session-end.py")
+    spec = importlib.util.spec_from_file_location("ai_memory_live_capture", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load live capture helpers from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _runtime_root() -> Path:
@@ -72,26 +83,30 @@ def main() -> None:
         return
 
     try:
-        preview = parse_codex_transcript(
-            transcript_path,
-            {
-                "session_id": value.get("session_id", ""),
-                "cwd": value.get("cwd", ""),
-                "timestamp": value.get("timestamp", ""),
-                "project": value.get("project", ""),
-                "trigger": "session_end",
-            },
-            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
-        )
-        if not preview.turns:
-            logger.info("skip: empty normalized transcript")
-            return
-        outcome = enqueue_hook_input(
-            value,
-            source_agent="codex",
-            trigger="session_end",
-            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
-        )
+        helpers = _live_capture_helpers()
+        with helpers.bounded_transcript_slice(transcript_path) as live_slice:
+            preview = parse_codex_transcript(
+                live_slice,
+                {
+                    "session_id": value.get("session_id", ""),
+                    "cwd": value.get("cwd", ""),
+                    "timestamp": value.get("timestamp", ""),
+                    "project": value.get("project", ""),
+                    "trigger": "session_end",
+                },
+                limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+            )
+            if not preview.turns:
+                logger.info("skip: empty normalized transcript")
+                return
+            capture_input = dict(value)
+            capture_input["transcript_path"] = str(live_slice)
+            outcome = enqueue_hook_input(
+                capture_input,
+                source_agent="codex",
+                trigger="session_end",
+                limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+            )
         logger.info("capture %s for session %s", outcome.status, outcome.job_id)
     except Exception as error:
         logger.error("capture failed: %s", error)

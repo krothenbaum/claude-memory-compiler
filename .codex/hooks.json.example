@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "uv run --directory \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}\" python \"${AI_MEMORY_HOME:-$CLAUDE_MEMORY_HOME}/hooks/codex-session-end.py\"",
-            "timeout": 10
+            "timeout": 3
           }
         ]
       }

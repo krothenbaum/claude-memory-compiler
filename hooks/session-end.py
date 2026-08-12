@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -9,6 +10,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+from typing import Iterator
 
 
 # This must precede imports of the capture/queue modules: those modules can
@@ -27,6 +30,12 @@ from scripts.transcripts import parse_claude_transcript, render_turns
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 1
+LIVE_TRANSCRIPT_TAIL_BYTES = 1_000_000
+MAX_LIVE_JSONL_RECORD_BYTES = 500_000
+
+
+class LiveTranscriptRejected(ValueError):
+    """A live transcript cannot be sliced without risking partial capture."""
 
 
 def _runtime_root() -> Path:
@@ -68,6 +77,94 @@ def _read_hook_input() -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("hook input must be a JSON object")
     return value
+
+
+def _metadata_prefix(first_record: bytes) -> bytes:
+    """Preserve bounded session metadata when the head falls outside the tail."""
+    if not first_record or len(first_record) > MAX_LIVE_JSONL_RECORD_BYTES:
+        return b""
+    try:
+        record = json.loads(first_record)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return b""
+    if not isinstance(record, dict):
+        return b""
+    if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict):
+        preserved: dict[str, object] = {
+            "type": "session_meta",
+            "payload": {
+                key: record["payload"][key]
+                for key in ("id", "cwd")
+                if key in record["payload"]
+            },
+        }
+        if "timestamp" in record:
+            preserved["timestamp"] = record["timestamp"]
+    else:
+        preserved = {
+            key: record[key]
+            for key in ("sessionId", "session_id", "cwd", "timestamp")
+            if key in record
+        }
+    if not preserved:
+        return b""
+    return json.dumps(preserved, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _bounded_tail(source: Path) -> bytes:
+    """Read a deterministic JSONL tail without retaining a partial first line."""
+    size = source.stat().st_size
+    with source.open("rb") as stream:
+        first_record = stream.readline(MAX_LIVE_JSONL_RECORD_BYTES + 1).rstrip(b"\r\n")
+        start = max(0, size - LIVE_TRANSCRIPT_TAIL_BYTES)
+        stream.seek(start)
+        tail = stream.read(LIVE_TRANSCRIPT_TAIL_BYTES)
+
+    if start:
+        boundary = tail.find(b"\n")
+        tail = b"" if boundary < 0 else tail[boundary + 1 :]
+        prefix = _metadata_prefix(first_record)
+    else:
+        prefix = b""
+
+    lines = tail.splitlines(keepends=True)
+    for line in lines:
+        record = line.rstrip(b"\r\n")
+        if len(record) > MAX_LIVE_JSONL_RECORD_BYTES:
+            raise LiveTranscriptRejected("live transcript contains an oversized JSONL record")
+
+    # A concurrently written final line is safe only when it is complete JSON.
+    if lines and not lines[-1].endswith((b"\n", b"\r")):
+        try:
+            json.loads(lines[-1])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            lines.pop()
+    return prefix + b"".join(lines)
+
+
+@contextmanager
+def bounded_transcript_slice(source: Path) -> Iterator[Path]:
+    """Yield an owner-private bounded live JSONL slice and always remove it."""
+    payload = _bounded_tail(source)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="ai-memory-live-", suffix=".jsonl"
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        yield temporary
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def extract_conversation_context(
@@ -145,29 +242,32 @@ def main() -> None:
     hook_input.setdefault("project", Path(cwd).name or "unknown")
 
     try:
-        context, turn_count = extract_conversation_context(
-            transcript_path,
-            {
-                "session_id": hook_input.get("session_id", ""),
-                "cwd": cwd,
-                "project": hook_input["project"],
-                "timestamp": hook_input.get("timestamp", ""),
-                "trigger": "session_end",
-            },
-        )
-        if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
-            logger.info("skip: empty or too-short transcript")
-            return
+        with bounded_transcript_slice(transcript_path) as live_slice:
+            context, turn_count = extract_conversation_context(
+                live_slice,
+                {
+                    "session_id": hook_input.get("session_id", ""),
+                    "cwd": cwd,
+                    "project": hook_input["project"],
+                    "timestamp": hook_input.get("timestamp", ""),
+                    "trigger": "session_end",
+                },
+            )
+            if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
+                logger.info("skip: empty or too-short transcript")
+                return
 
-        tty_path = _resolve_user_tty()
-        if tty_path:
-            os.environ["CLAUDE_MEMORY_TTY"] = tty_path
-        outcome = enqueue_hook_input(
-            hook_input,
-            source_agent="claude",
-            trigger="session_end",
-            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
-        )
+            tty_path = _resolve_user_tty()
+            if tty_path:
+                os.environ["CLAUDE_MEMORY_TTY"] = tty_path
+            capture_input = dict(hook_input)
+            capture_input["transcript_path"] = str(live_slice)
+            outcome = enqueue_hook_input(
+                capture_input,
+                source_agent="claude",
+                trigger="session_end",
+                limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+            )
         logger.info("capture %s for session %s", outcome.status, outcome.job_id)
     except Exception as error:
         # Hooks are advisory. A capture failure must never block the host agent.

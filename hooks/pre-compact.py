@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
 import os
 from pathlib import Path
@@ -24,6 +25,16 @@ from scripts.transcripts import parse_claude_transcript, render_turns
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
 MIN_TURNS_TO_FLUSH = 5
+
+
+def _live_capture_helpers():
+    path = Path(__file__).with_name("session-end.py")
+    spec = importlib.util.spec_from_file_location("ai_memory_live_capture", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load live capture helpers from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _runtime_root() -> Path:
@@ -107,25 +118,29 @@ def main() -> None:
     hook_input.setdefault("project", Path(cwd).name or "unknown")
 
     try:
-        context, turn_count = extract_conversation_context(
-            transcript_path,
-            {
-                "session_id": hook_input.get("session_id", ""),
-                "cwd": cwd,
-                "project": hook_input["project"],
-                "timestamp": hook_input.get("timestamp", ""),
-                "trigger": "pre_compact",
-            },
-        )
-        if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
-            logger.info("skip: empty or too-short transcript")
-            return
-        outcome = enqueue_hook_input(
-            hook_input,
-            source_agent="claude",
-            trigger="pre_compact",
-            limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
-        )
+        helpers = _live_capture_helpers()
+        with helpers.bounded_transcript_slice(transcript_path) as live_slice:
+            context, turn_count = extract_conversation_context(
+                live_slice,
+                {
+                    "session_id": hook_input.get("session_id", ""),
+                    "cwd": cwd,
+                    "project": hook_input["project"],
+                    "timestamp": hook_input.get("timestamp", ""),
+                    "trigger": "pre_compact",
+                },
+            )
+            if not context.strip() or turn_count < MIN_TURNS_TO_FLUSH:
+                logger.info("skip: empty or too-short transcript")
+                return
+            capture_input = dict(hook_input)
+            capture_input["transcript_path"] = str(live_slice)
+            outcome = enqueue_hook_input(
+                capture_input,
+                source_agent="claude",
+                trigger="pre_compact",
+                limits={"max_turns": MAX_TURNS, "max_chars": MAX_CONTEXT_CHARS},
+            )
         logger.info("capture %s for session %s", outcome.status, outcome.job_id)
     except Exception as error:
         logger.error("capture failed: %s", error)

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -87,6 +88,14 @@ def _job_rows(memory_home: Path) -> list[tuple[str, str, str]]:
         return connection.execute(
             "SELECT source_agent, session_id, trigger FROM jobs ORDER BY id"
         ).fetchall()
+
+
+def _only_job_source_path(memory_home: Path) -> Path:
+    database = memory_home / "scripts" / "jobs.sqlite3"
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute("SELECT source_path FROM jobs").fetchall()
+    assert len(rows) == 1
+    return Path(rows[0][0])
 
 
 def _wait_for(path: Path, timeout: float = 2.0) -> None:
@@ -227,6 +236,133 @@ def test_missing_transcript_fails_closed_without_blocking_host(tmp_path):
     assert not (memory_home / "scripts" / "spool").exists()
 
 
+def _write_large_valid_transcript(path: Path, agent: str) -> None:
+    padding = "x" * 60_000
+    with path.open("w", encoding="utf-8") as stream:
+        if agent == "claude":
+            stream.write(
+                json.dumps(
+                    {
+                        "sessionId": "large-claude-session",
+                        "cwd": "/projects/large-claude",
+                    }
+                )
+                + "\n"
+            )
+            routine = {"type": "progress", "data": padding}
+            final = {
+                "message": {"role": "user", "content": "CLAUDE_TAIL_SIGNAL"}
+            }
+        else:
+            stream.write(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-11T10:15:00Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "large-codex-session",
+                            "cwd": "/projects/large-codex",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            routine = {
+                "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": padding},
+            }
+            final = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "CODEX_TAIL_SIGNAL"}
+                    ],
+                },
+            }
+        encoded_routine = json.dumps(routine) + "\n"
+        for _ in range(220):
+            stream.write(encoded_routine)
+        stream.write(json.dumps(final) + "\n")
+
+
+def test_large_valid_live_transcripts_use_a_bounded_private_tail(tmp_path):
+    for agent, hook_name in (
+        ("claude", "session-end.py"),
+        ("codex", "codex-session-end.py"),
+    ):
+        case = tmp_path / agent
+        case.mkdir()
+        source = case / f"raw-private-session-name-{agent}.jsonl"
+        _write_large_valid_transcript(source, agent)
+        assert source.stat().st_size > 12_000_000
+        memory_home = case / "memory"
+        fake_bin = case / "bin"
+        hook_tmp = case / "hook-tmp"
+        hook_tmp.mkdir()
+        _fake_uv(fake_bin)
+
+        payload = {"transcript_path": str(source)}
+        if agent == "claude":
+            payload.update(
+                {
+                    "session_id": "large-claude-session",
+                    "cwd": "/projects/large-claude",
+                }
+            )
+        result, elapsed = _run_hook(
+            hook_name,
+            payload,
+            memory_home,
+            fake_bin=fake_bin,
+            extra_env={"TMPDIR": str(hook_tmp)},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert elapsed < 3
+        snapshot = _only_job_source_path(memory_home)
+        assert snapshot.stat().st_size <= 1_100_000
+        assert stat.S_IMODE(snapshot.stat().st_mode) == 0o600
+        assert "raw-private-session-name" not in snapshot.name
+        snapshot_lines = snapshot.read_text(encoding="utf-8").splitlines()
+        assert f"{agent.upper()}_TAIL_SIGNAL" in snapshot_lines[-1]
+        assert all(isinstance(json.loads(line), dict) for line in snapshot_lines)
+        assert list(hook_tmp.iterdir()) == []
+        row = _job_rows(memory_home)[0]
+        assert row[1] == f"large-{agent}-session"
+
+
+def test_oversized_final_jsonl_record_fails_closed_without_partial_job(tmp_path):
+    source = tmp_path / "raw-secret-name.jsonl"
+    source.write_text(
+        json.dumps(
+            {"message": {"role": "user", "content": "x" * 2_000_000}}
+        ),
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    hook_tmp = tmp_path / "hook-tmp"
+    hook_tmp.mkdir()
+
+    result, elapsed = _run_hook(
+        "session-end.py",
+        {
+            "session_id": "oversized",
+            "transcript_path": str(source),
+            "cwd": "/projects/oversized",
+        },
+        memory_home,
+        extra_env={"TMPDIR": str(hook_tmp)},
+    )
+
+    assert result.returncode == 0
+    assert elapsed < 3
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    assert not (memory_home / "scripts" / "spool").exists()
+    assert list(hook_tmp.iterdir()) == []
+
+
 def _load_hook(name: str):
     path = HOOKS / name
     spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
@@ -321,6 +457,7 @@ def test_hook_examples_preserve_ten_second_capture_timeouts_and_are_opt_in():
 
     codex = json.loads((ROOT / ".codex" / "hooks.json.example").read_text())
     assert set(codex["hooks"]) == {"SessionStart", "SessionEnd"}
+    assert codex["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] == 3
     assert not (ROOT / ".codex" / "hooks.json").exists()
 
 
