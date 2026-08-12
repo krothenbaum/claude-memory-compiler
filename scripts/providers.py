@@ -132,6 +132,7 @@ class AsyncCommandRunner:
         timeout_seconds: int,
         start_new_session: bool,
         terminate_process_group_on_timeout: bool,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         windows = self._platform_name == "Windows"
         process = await self._process_factory(
@@ -149,8 +150,15 @@ class AsyncCommandRunner:
             ),
         )
         try:
+            communication = (
+                process.communicate(stdin.encode())
+                if max_output_bytes is None
+                else self._communicate_capped(
+                    process, stdin.encode(), max_output_bytes
+                )
+            )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(stdin.encode()), timeout=timeout_seconds
+                communication, timeout=timeout_seconds
             )
         except BaseException:
             cleanup = asyncio.create_task(
@@ -171,6 +179,49 @@ class AsyncCommandRunner:
             stdout.decode(errors="replace"),
             stderr.decode(errors="replace"),
         )
+
+    @staticmethod
+    async def _communicate_capped(
+        process: Any, stdin: bytes, max_output_bytes: int
+    ) -> tuple[bytes, bytes]:
+        """Drain both pipes while retaining at most one shared byte budget."""
+        if max_output_bytes < 0:
+            raise ValueError("max_output_bytes must be non-negative")
+        remaining = [max_output_bytes]
+
+        async def read_stream(stream: Any) -> bytes:
+            retained: list[bytes] = []
+            while chunk := await stream.read(64 * 1024):
+                keep = min(len(chunk), remaining[0])
+                if keep:
+                    retained.append(chunk[:keep])
+                    remaining[0] -= keep
+            return b"".join(retained)
+
+        async def write_stdin() -> None:
+            if process.stdin is None:
+                return
+            try:
+                process.stdin.write(stdin)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                process.stdin.close()
+                wait_closed = getattr(process.stdin, "wait_closed", None)
+                if wait_closed is not None:
+                    try:
+                        await wait_closed()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+        _, stdout, stderr, _ = await asyncio.gather(
+            write_stdin(),
+            read_stream(process.stdout),
+            read_stream(process.stderr),
+            process.wait(),
+        )
+        return stdout, stderr
 
     async def _cleanup_process_tree(
         self, process: Any, *, terminate_process_group: bool
@@ -269,8 +320,9 @@ _AUTH_MARKERS = (
     "log in",
 )
 _MAX_REASON_LENGTH = 500
-_CODEX_LOGIN_STATUS_PREFIX = "Logged in using "
+_CODEX_LOGIN_STATUS_MARKER = "Logged in using"
 _CODEX_CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT"
+_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES = 64 * 1024
 
 
 def subscription_child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -356,18 +408,25 @@ class CodexProvider:
         return await self._generate(request, workspace=True)
 
     async def _run_command(
-        self, command: Sequence[str], request: TextRequest, stdin: str = ""
+        self,
+        command: Sequence[str],
+        request: TextRequest,
+        stdin: str = "",
+        *,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         runner = self._runner.run if hasattr(self._runner, "run") else self._runner
-        result = await runner(
-            command,
-            cwd=request.cwd,
-            env=subscription_child_env(self._source_env),
-            stdin=stdin,
-            timeout_seconds=request.timeout_seconds,
-            start_new_session=True,
-            terminate_process_group_on_timeout=True,
-        )
+        kwargs = {
+            "cwd": request.cwd,
+            "env": subscription_child_env(self._source_env),
+            "stdin": stdin,
+            "timeout_seconds": request.timeout_seconds,
+            "start_new_session": True,
+            "terminate_process_group_on_timeout": True,
+        }
+        if max_output_bytes is not None:
+            kwargs["max_output_bytes"] = max_output_bytes
+        result = await runner(command, **kwargs)
         return CommandResult(result.returncode, result.stdout, result.stderr)
 
     def _result(
@@ -395,7 +454,11 @@ class CodexProvider:
         self, request: TextRequest, started: float
     ) -> ProviderResult | None:
         try:
-            status = await self._run_command(["codex", "login", "status"], request)
+            status = await self._run_command(
+                ["codex", "login", "status"],
+                request,
+                max_output_bytes=_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES,
+            )
         except TimeoutError as exc:
             return self._result(
                 request,
@@ -424,8 +487,7 @@ class CodexProvider:
         login_status_lines = {
             line
             for line in status_lines
-            if line.startswith(_CODEX_LOGIN_STATUS_PREFIX)
-            and len(line) > len(_CODEX_LOGIN_STATUS_PREFIX)
+            if _CODEX_LOGIN_STATUS_MARKER in line
         }
         if (
             status.returncode == 0
@@ -434,14 +496,14 @@ class CodexProvider:
         ):
             return None
         if status.returncode == 0:
-            reason = _safe_reason(
-                f"unsupported Codex login: {combined or 'unknown status'}",
-                self._source_env,
+            return self._result(
+                request, "auth_failed", started, reason="unsupported login type"
             )
-            return self._result(request, "auth_failed", started, reason=reason)
-        reason = _safe_reason(combined or "codex login status failed", self._source_env)
         return self._result(
-            request, _failure_outcome(combined), started, reason=reason
+            request,
+            _failure_outcome(combined),
+            started,
+            reason="login status failed",
         )
 
     async def _generate(

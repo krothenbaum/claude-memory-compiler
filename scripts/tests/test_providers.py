@@ -252,6 +252,16 @@ def test_codex_accepts_chatgpt_login(fake_runner, text_request):
     assert runner.calls[0][0] == ["codex", "login", "status"]
 
 
+def test_codex_caps_only_login_status_capture(fake_runner, text_request):
+    runner = fake_runner(_chatgpt_login(), _write_codex_output("codex answer"))
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "success"
+    assert runner.calls[0][1]["max_output_bytes"] == 64 * 1024
+    assert "max_output_bytes" not in runner.calls[1][1]
+
+
 def test_codex_accepts_exact_chatgpt_login_from_stderr(fake_runner, text_request):
     runner = fake_runner(
         FakeCommandResult(stderr="Logged in using ChatGPT\n"),
@@ -340,6 +350,33 @@ def test_codex_rejects_other_exact_login_mode_beside_chatgpt(
     assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "extra_line",
+    [
+        "warning: Logged in using an API key",
+        '"Logged in using SSO"',
+        "Logged in using",
+    ],
+    ids=["warning", "quoted-status", "missing-mode"],
+)
+def test_codex_rejects_any_nonexact_status_shaped_login_line(
+    fake_runner, text_request, extra_line
+):
+    runner = fake_runner(
+        FakeCommandResult(
+            stdout="Logged in using ChatGPT\n",
+            stderr=f"{extra_line}\n",
+        )
+    )
+
+    result = _run(_codex_provider(runner).generate_text(text_request))
+
+    assert result.outcome == "auth_failed"
+    assert result.reason == "unsupported login type"
+    assert result.text == ""
+    assert len(runner.calls) == 1
+
+
 def test_codex_accepts_duplicate_exact_chatgpt_status_lines(
     fake_runner, text_request
 ):
@@ -409,29 +446,37 @@ def test_codex_rejects_unknown_login_output(fake_runner, text_request):
 
 
 def test_codex_preflight_classifies_capacity(fake_runner, text_request):
-    runner = fake_runner(FakeCommandResult(1, stderr="usage limit exceeded"))
+    runner = fake_runner(
+        FakeCommandResult(1, stderr="usage limit exceeded sk-proj-preflight-secret")
+    )
 
     result = _run(_codex_provider(runner).generate_text(text_request))
 
     assert result.outcome == "capacity"
+    assert result.reason == "login status failed"
+    assert "sk-proj-preflight-secret" not in result.reason
     assert len(runner.calls) == 1
 
 
 def test_codex_preflight_classifies_unknown_nonzero_as_error(
     fake_runner, text_request
 ):
-    runner = fake_runner(FakeCommandResult(23, stderr="unexpected status failure"))
+    runner = fake_runner(
+        FakeCommandResult(23, stderr="unexpected status failure sk-proj-sentinel")
+    )
 
     result = _run(_codex_provider(runner).generate_text(text_request))
 
     assert result.outcome == "error"
+    assert result.reason == "login status failed"
+    assert "sk-proj-sentinel" not in result.reason
     assert len(runner.calls) == 1
 
 
-def test_codex_unsupported_login_reason_is_bounded_and_redacted(
+def test_codex_unsupported_login_reason_never_echoes_status_output(
     fake_runner, text_request
 ):
-    secret = "tiny"
+    secret = "sk-proj-credential-store-token"
     runner = fake_runner(
         FakeCommandResult(stdout=f"unknown login {secret} " + "x" * 1000)
     )
@@ -442,8 +487,10 @@ def test_codex_unsupported_login_reason_is_bounded_and_redacted(
     )
 
     assert result.outcome == "auth_failed"
-    assert result.reason.startswith("unsupported Codex login:")
+    assert result.reason == "unsupported login type"
     assert secret not in result.reason
+    assert "unknown login" not in result.reason
+    assert "x" * 20 not in result.reason
     assert len(result.reason) <= 500
 
 
@@ -657,6 +704,37 @@ def test_command_runner_uses_windows_tree_termination(tmp_path):
     assert opened["start_new_session"] is False
     assert "creationflags" in opened
     assert tree_calls == [(process.pid, False), (process.pid, True)]
+
+
+def test_command_runner_caps_and_drains_subprocess_output(tmp_path):
+    import providers
+
+    runner = providers.AsyncCommandRunner(platform_name="Linux")
+    result = _run(
+        runner(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "sys.stdout.buffer.write(b'o' * 200000); "
+                    "sys.stdout.buffer.flush(); "
+                    "sys.stderr.buffer.write(b'e' * 200000); "
+                    "sys.stderr.buffer.flush()"
+                ),
+            ],
+            cwd=tmp_path,
+            env={},
+            stdin="",
+            timeout_seconds=5,
+            start_new_session=True,
+            terminate_process_group_on_timeout=True,
+            max_output_bytes=1024,
+        )
+    )
+
+    assert result.returncode == 0
+    assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 1024
 
 
 def test_codex_error_reason_is_bounded_and_redacts_credentials(
