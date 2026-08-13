@@ -1088,7 +1088,12 @@ def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypat
     )
     repository = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(worker_module, "load_config", lambda _env: config)
-    monkeypatch.setattr(worker_module, "recover_incomplete_apply", lambda _root: None)
+    recoveries = []
+    monkeypatch.setattr(
+        worker_module,
+        "recover_incomplete_apply",
+        lambda root: recoveries.append(root),
+    )
     repository_options = {}
 
     def open_repository(*_args, **kwargs):
@@ -1104,9 +1109,12 @@ def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypat
     assert configured.concurrency == 3
     assert returned_repository is repository
     assert repository_options["sync_usage"] is False
+    assert recoveries == []
+    configured.startup_recovery()
+    assert recoveries == [tmp_path]
 
 
-def test_losing_worker_does_not_sync_usage(tmp_path):
+def test_losing_worker_does_not_recover_apply_or_sync_usage(tmp_path):
     lock_path = tmp_path / "memory-worker.lock"
     held = SingletonDrainLock(lock_path)
     assert held.acquire()
@@ -1122,6 +1130,7 @@ def test_losing_worker_does_not_sync_usage(tmp_path):
                 daily_writer=lambda *_: None,
                 clock=lambda: NOW,
                 lock_path=lock_path,
+                startup_recovery=lambda: calls.append("recover-apply"),
             )
             assert asyncio.run(worker.run_drain()) == 0
     finally:
@@ -1130,7 +1139,7 @@ def test_losing_worker_does_not_sync_usage(tmp_path):
     assert calls == []
 
 
-def test_winning_worker_syncs_usage_once_before_queue_recovery(tmp_path):
+def test_winning_worker_recovers_apply_then_syncs_usage_before_queue_recovery(tmp_path):
     events = []
     with QueueRepository(
         tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
@@ -1149,11 +1158,12 @@ def test_winning_worker_syncs_usage_once_before_queue_recovery(tmp_path):
             daily_writer=lambda *_: None,
             clock=lambda: NOW,
             lock_path=tmp_path / "memory-worker.lock",
+            startup_recovery=lambda: events.append("recover-apply"),
         )
 
         assert asyncio.run(worker.run_drain()) == 0
 
-    assert events == ["sync", "recover"]
+    assert events == ["recover-apply", "sync", "recover"]
 
 
 def test_live_capture_queue_open_does_not_wait_for_usage_writer_lock(tmp_path):

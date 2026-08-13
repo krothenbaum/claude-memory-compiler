@@ -95,6 +95,7 @@ class MemoryWorker:
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         heartbeat_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         concurrency: int = 1,
+        startup_recovery: Callable[[], object] | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -124,6 +125,7 @@ class MemoryWorker:
         self.sleeper = sleeper
         self.heartbeat_sleeper = heartbeat_sleeper
         self.concurrency = concurrency
+        self.startup_recovery = startup_recovery
         self._writer_lock = asyncio.Lock()
 
     def _now(self) -> datetime:
@@ -340,6 +342,8 @@ class MemoryWorker:
         if not lock.acquire():
             return 0
         try:
+            if self.startup_recovery is not None:
+                self.startup_recovery()
             self.queue.sync_usage_records()
             return await self._drain(lock.release)
         finally:
@@ -348,7 +352,6 @@ class MemoryWorker:
 
 def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     config = load_config(os.environ)
-    recover_incomplete_apply(config.root_dir)
     repository = QueueRepository(
         config.queue_path,
         memory_home=config.root_dir,
@@ -365,6 +368,7 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
         lease_seconds=config.job_timeout_seconds + 120,
         provider_timeout_seconds=config.job_timeout_seconds,
         concurrency=config.worker_concurrency,
+        startup_recovery=lambda: recover_incomplete_apply(config.root_dir),
     )
     return worker, repository
 
