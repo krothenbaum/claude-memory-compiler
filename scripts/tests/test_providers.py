@@ -273,6 +273,45 @@ def test_codex_attempt_rejects_login_result_returned_after_deadline(tmp_path):
     assert len(runner.calls) == 2
 
 
+@pytest.mark.parametrize("late_stage", ["output-read", "validation"])
+def test_codex_attempt_rejects_output_that_finishes_after_deadline(
+    tmp_path, monkeypatch, late_stage
+):
+    import providers
+
+    clock = [0.0]
+    runner = FakeRunner(_chatgpt_login(), _write_codex_output("late answer"))
+    request = TextRequest(TaskKind.QUERY, "answer", tmp_path, 1)
+
+    if late_stage == "output-read":
+        real_read_text = Path.read_text
+
+        def late_read(path, *args, **kwargs):
+            text = real_read_text(path, *args, **kwargs)
+            if path.name.startswith("last-message"):
+                clock[0] = 1.0
+            return text
+
+        monkeypatch.setattr(Path, "read_text", late_read)
+    else:
+        real_validate = providers._invalid_text_reason
+
+        def late_validate(text, schema):
+            outcome = real_validate(text, schema)
+            clock[0] = 1.0
+            return outcome
+
+        monkeypatch.setattr(providers, "_invalid_text_reason", late_validate)
+
+    result = _run(
+        _codex_provider(runner, monotonic=lambda: clock[0]).generate_text(request)
+    )
+
+    assert result.outcome == "timeout"
+    assert result.reason == "codex execution timed out"
+    assert result.text == ""
+
+
 def _run(awaitable):
     return asyncio.run(awaitable)
 

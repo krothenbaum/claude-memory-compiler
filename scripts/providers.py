@@ -670,11 +670,15 @@ class CodexProvider:
                     started,
                     reason=_safe_reason(str(exc), self._source_env),
                 )
+            if self._monotonic() >= deadline:
+                raise TimeoutError("codex execution timed out")
             invalid_reason = _invalid_text_reason(text, output_schema)
             if invalid_reason is not None:
                 return self._result(
                     request, "invalid_output", started, reason=invalid_reason
                 )
+            if self._monotonic() >= deadline:
+                raise TimeoutError("codex execution timed out")
             return self._result(request, "success", started, text=text)
         except TimeoutError as exc:
             return self._result(
