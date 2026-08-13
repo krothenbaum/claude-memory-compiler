@@ -607,6 +607,10 @@ class QueueRepository:
             if (self.queue_id, row["id"]) not in logged:
                 self._append_attempt_usage(row["id"])
 
+    def sync_usage_records(self) -> None:
+        """Recover and project usage after the caller owns worker singleton."""
+        self._sync_usage_records()
+
     def complete(self, job_id: int, owner: str) -> None:
         now = _stored_time(self._now())
         cursor = self._connection.execute(

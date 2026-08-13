@@ -1030,7 +1030,57 @@ def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypat
 
     assert configured.concurrency == 3
     assert returned_repository is repository
-    assert repository_options["sync_usage"] is True
+    assert repository_options["sync_usage"] is False
+
+
+def test_losing_worker_does_not_sync_usage(tmp_path):
+    lock_path = tmp_path / "memory-worker.lock"
+    held = SingletonDrainLock(lock_path)
+    assert held.acquire()
+    calls = []
+    try:
+        with QueueRepository(
+            tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+        ) as repository:
+            repository.sync_usage_records = lambda: calls.append("sync")
+            worker = MemoryWorker(
+                repository,
+                FakeRouter(None),
+                daily_writer=lambda *_: None,
+                clock=lambda: NOW,
+                lock_path=lock_path,
+            )
+            assert asyncio.run(worker.run_drain()) == 0
+    finally:
+        held.release()
+
+    assert calls == []
+
+
+def test_winning_worker_syncs_usage_once_before_queue_recovery(tmp_path):
+    events = []
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        real_recover = repository.recover_stale
+        repository.sync_usage_records = lambda: events.append("sync")
+
+        def observed_recover(now):
+            events.append("recover")
+            return real_recover(now)
+
+        repository.recover_stale = observed_recover
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(None),
+            daily_writer=lambda *_: None,
+            clock=lambda: NOW,
+            lock_path=tmp_path / "memory-worker.lock",
+        )
+
+        assert asyncio.run(worker.run_drain()) == 0
+
+    assert events == ["sync", "recover"]
 
 
 def test_live_capture_queue_open_does_not_wait_for_usage_writer_lock(tmp_path):

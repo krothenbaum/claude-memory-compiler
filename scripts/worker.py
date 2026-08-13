@@ -340,6 +340,7 @@ class MemoryWorker:
         if not lock.acquire():
             return 0
         try:
+            self.queue.sync_usage_records()
             return await self._drain(lock.release)
         finally:
             lock.release()
@@ -351,7 +352,7 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     repository = QueueRepository(
         config.queue_path,
         memory_home=config.root_dir,
-        sync_usage=True,
+        sync_usage=False,
     )
     codex = CodexProvider(task_models=config.task_models)
     claude = ClaudeProvider(model=config.claude_model)
