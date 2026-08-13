@@ -125,6 +125,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             transcript_path,
             previewer,
             source_agent="claude",
+            memory_root=_runtime_root(),
             deadline=deadline,
             clock=clock,
         ) as selected:

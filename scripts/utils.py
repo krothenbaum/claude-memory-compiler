@@ -175,6 +175,33 @@ def prepare_secure_log_directory(memory_root: Path | str) -> Path:
     return current
 
 
+def prepare_secure_runtime_directory(memory_root: Path | str) -> Path:
+    """Create and validate the private live-hook scratch directory."""
+    root = Path(os.path.abspath(Path(memory_root).expanduser()))
+    if not root.exists() and not root.is_symlink():
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    _validate_log_directory(root.lstat(), root)
+
+    current = root
+    for name in ("scripts", "runtime"):
+        candidate = current / name
+        if not candidate.exists() and not candidate.is_symlink():
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        _validate_log_directory(candidate.lstat(), candidate)
+        current = candidate
+    try:
+        current.chmod(0o700)
+    except OSError:
+        pass
+    return current
+
+
 def _open_secure_log_fallback(path: Path):
     """Open an existing log when directory-relative no-follow opens are unavailable."""
     root = path.parent.parent

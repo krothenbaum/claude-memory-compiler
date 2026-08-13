@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 from scripts.capture import enqueue_hook_input
 from scripts.hook_logging import configure_hook_logger
 from scripts.transcripts import parse_claude_transcript, render_turns
+from scripts.utils import prepare_secure_runtime_directory
 
 
 MAX_TURNS = 30
@@ -888,6 +889,7 @@ def bounded_transcript_slice(
     previewer: Callable[[Path], object],
     *,
     source_agent: Literal["claude", "codex"],
+    memory_root: Path | str,
     deadline: float,
     clock: Callable[[], float],
 ) -> Iterator[tuple[Path, object]]:
@@ -905,8 +907,9 @@ def bounded_transcript_slice(
             b"\r\n"
         )
     metadata_prefix = _metadata_prefix(first_record)
+    runtime_dir = prepare_secure_runtime_directory(memory_root)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix="ai-memory-live-", suffix=".jsonl"
+        prefix="ai-memory-live-", suffix=".jsonl", dir=runtime_dir
     )
     temporary = Path(temporary_name)
     try:
@@ -1114,6 +1117,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             transcript_path,
             previewer,
             source_agent="claude",
+            memory_root=_runtime_root(),
             deadline=deadline,
             clock=clock,
         ) as selected:

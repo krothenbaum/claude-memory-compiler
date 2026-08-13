@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -1486,6 +1487,7 @@ def test_bounded_slice_does_not_close_reused_descriptor(tmp_path, monkeypatch):
             source,
             lambda _path: None,
             source_agent="claude",
+            memory_root=tmp_path / "memory",
             deadline=10.0,
             clock=lambda: 0.0,
         ):
@@ -1542,6 +1544,7 @@ def test_private_slice_works_when_windows_has_no_fchmod(tmp_path, monkeypatch):
             path, {"trigger": "session_end"}, limits={"max_turns": 30}
         ),
         source_agent="claude",
+        memory_root=tmp_path / "memory",
         deadline=10.0,
         clock=lambda: 0.0,
     ) as selected:
@@ -1550,6 +1553,100 @@ def test_private_slice_works_when_windows_has_no_fchmod(tmp_path, monkeypatch):
         assert preview.turns[0].text == "WINDOWS_SIGNAL"
 
     assert not private_slice.exists()
+
+
+def test_live_slice_uses_private_memory_root_runtime_directory(tmp_path):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "MEMORY_ROOT_SIGNAL"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+
+    with hook.bounded_transcript_slice(
+        source,
+        lambda path: path.read_text(encoding="utf-8"),
+        source_agent="claude",
+        memory_root=memory_home,
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) as selected:
+        private_slice, _preview = selected
+        assert private_slice.parent == memory_home / "scripts" / "runtime"
+        assert stat.S_IMODE(private_slice.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(private_slice.stat().st_mode) == 0o600
+
+    assert not private_slice.exists()
+
+
+@pytest.mark.parametrize("failure", [ValueError("preview failed"), asyncio.CancelledError()])
+def test_live_slice_in_memory_root_is_removed_on_failure_or_cancellation(
+    tmp_path, failure
+):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "SIGNAL"}}) + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    observed: list[Path] = []
+
+    def fail(path):
+        observed.append(path)
+        raise failure
+
+    with pytest.raises(type(failure)):
+        with hook.bounded_transcript_slice(
+            source,
+            fail,
+            source_agent="claude",
+            memory_root=memory_home,
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+    assert len(observed) == 1
+    assert not observed[0].exists()
+
+
+@pytest.mark.parametrize("linked_component", ["root", "scripts", "runtime"])
+def test_live_slice_rejects_linked_memory_root_parents(tmp_path, linked_component):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    memory_home = tmp_path / "memory"
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    if linked_component == "root":
+        memory_home.symlink_to(external, target_is_directory=True)
+    else:
+        memory_home.mkdir()
+        scripts = memory_home / "scripts"
+        if linked_component == "scripts":
+            scripts.symlink_to(external, target_is_directory=True)
+        else:
+            scripts.mkdir()
+            (scripts / "runtime").symlink_to(external, target_is_directory=True)
+
+    before = _tree_manifest(external)
+    with pytest.raises(ValueError):
+        with hook.bounded_transcript_slice(
+            source,
+            lambda _path: None,
+            source_agent="claude",
+            memory_root=memory_home,
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+    assert _tree_manifest(external) == before
 
 
 def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
