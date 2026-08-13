@@ -82,7 +82,7 @@ Expected: the observed path is the system temporary directory.
 
 **Step 3: Implement the minimum fix**
 
-Create or reuse a no-follow, owner-only runtime directory under `AI_MEMORY_HOME/scripts/`. Retain a descriptor for every slice write and validate that the preview path still names that descriptor before and after preview. Use pinned directory-relative creation when available. Without secure `dir_fd`, safely create a fresh root/scripts/runtime one component at a time with no-link/reparse, owner, mode, and pre/post identity checks; fail closed on unsafe ancestry, swaps, or chmod failure. Preserve standalone hook imports and the internal deadline.
+Create or reuse a no-follow, owner-only runtime directory under `AI_MEMORY_HOME/scripts/`. Retain a descriptor for every slice write and validate that the preview path still names that descriptor before and after preview. Use pinned directory-relative creation when available. Without secure `dir_fd`, safely create a fresh root/scripts/runtime one component at a time with no-link/reparse, owner, permission, and pre/post identity checks; fail closed on unsafe ancestry, swaps, or permission-establishment failure. On Windows, establish and verify protected current-owner-only DACLs for fresh components, verify existing ancestry without accepting inherited or additional ACEs, and fail closed if the security API is unavailable. Preserve standalone hook imports and the internal deadline.
 
 **Step 4: Run GREEN tests**
 

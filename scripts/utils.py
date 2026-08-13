@@ -275,6 +275,19 @@ def _open_runtime_directory_nofollow(path: Path) -> int | None:
         raise
 
 
+def _windows_acl_required() -> bool:
+    return os.name == "nt"
+
+
+def _secure_windows_runtime_directory(path: Path, *, correct: bool) -> None:
+    try:
+        from scripts.windows_acl import secure_owner_only_directory
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import secure_owner_only_directory
+
+    secure_owner_only_directory(path, correct=correct)
+
+
 def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
     """Create one directory while proving its parent and final identity."""
     parent = path.parent
@@ -300,6 +313,9 @@ def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
         _validate_runtime_directory(opened, path)
         if not _same_file_identity(before, opened):
             raise ValueError(f"runtime directory identity changed: {path}")
+
+        if _windows_acl_required():
+            _secure_windows_runtime_directory(path, correct=(private or created))
 
         if private or created:
             if directory_descriptor is not None and hasattr(os, "fchmod"):

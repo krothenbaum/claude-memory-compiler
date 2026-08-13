@@ -1908,6 +1908,96 @@ def test_cross_platform_fallback_creates_fresh_tree_without_directory_handles(
     assert list((memory_home / "scripts" / "runtime").iterdir()) == []
 
 
+def test_windows_fallback_establishes_acl_for_fresh_live_capture(tmp_path, monkeypatch):
+    import scripts.utils as memory_utils
+
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "WINDOWS_SIGNAL"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    secured = []
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils, "_open_runtime_directory_nofollow", lambda _path: None)
+    monkeypatch.setattr(memory_utils, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(
+        memory_utils,
+        "_secure_windows_runtime_directory",
+        lambda path, *, correct: secured.append((path, correct)),
+    )
+
+    with hook.bounded_transcript_slice(
+        source,
+        lambda path: path.read_text(encoding="utf-8"),
+        source_agent="claude",
+        memory_root=memory_home,
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) as (_path, preview):
+        assert "WINDOWS_SIGNAL" in preview
+
+    assert secured == [
+        (memory_home, True),
+        (memory_home / "scripts", True),
+        (memory_home / "scripts" / "runtime", True),
+    ]
+
+
+def test_windows_fallback_rejects_inherited_acl_on_existing_ancestry(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+
+    def reject_inherited(path, *, correct):
+        if path == scripts:
+            assert correct is False
+            raise PermissionError("directory does not have an owner-only ACL")
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils, "_open_runtime_directory_nofollow", lambda _path: None)
+    monkeypatch.setattr(memory_utils, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(
+        memory_utils, "_secure_windows_runtime_directory", reject_inherited
+    )
+
+    with pytest.raises(PermissionError, match="owner-only ACL"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert not (scripts / "runtime").exists()
+
+
+def test_windows_fallback_fails_closed_when_acl_api_is_unavailable(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+
+    def unavailable(_path, *, correct):
+        assert correct is True
+        raise PermissionError("Windows ACL API is unavailable")
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils, "_open_runtime_directory_nofollow", lambda _path: None)
+    monkeypatch.setattr(memory_utils, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(memory_utils, "_secure_windows_runtime_directory", unavailable)
+
+    with pytest.raises(PermissionError, match="ACL API is unavailable"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert not (memory_home / "scripts").exists()
+
+
 def test_cross_platform_fallback_rejects_unsafe_owner_before_creation(
     tmp_path, monkeypatch
 ):
