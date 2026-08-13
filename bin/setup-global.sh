@@ -47,6 +47,13 @@ This setup is opt-in and does not edit either agent's configuration.
    Stop if it reports API-key authentication, another login type, or an error.
    This project never logs in automatically and never uses API billing.
 
+   Before merging hooks, install the committed environment from the repo root:
+
+     uv sync
+
+   Codex hook commands use --no-sync so dependency resolution cannot consume
+   the three-second SessionEnd timeout.
+
    Then merge .codex/hooks.json.example into:
 
      ~/.codex/hooks.json

@@ -57,6 +57,10 @@ The setup helper only prints instructions. Follow them to merge the project hook
 - Claude Code: `~/.claude/settings.json`
 - Codex: `~/.codex/hooks.json`, using `.codex/hooks.json.example`
 
+Run `uv sync` in the repository before merging or updating the Codex hooks. The
+Codex commands use `uv run --no-sync` so dependency resolution cannot consume
+the three-second SessionEnd timeout.
+
 Preserve existing settings and hooks; do not replace either file. Start each agent from a new terminal that exports `AI_MEMORY_HOME`. To capture only sessions started inside this repository, keep the project-local `.claude/settings.json` and skip the global merge.
 
 After merging `~/.codex/hooks.json`, launch Codex interactively. In the hook trust review, compare the new or changed hook commands and hashes with `.codex/hooks.json.example` and the checked-out hook scripts. Approve only the vetted repository hooks. Before relying on live capture, verify that both repository hooks appear as enabled and trusted. Repeat this review whenever a hook command or hash changes.

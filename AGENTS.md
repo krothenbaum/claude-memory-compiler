@@ -395,6 +395,10 @@ Both providers receive a minimal child environment with `OPENAI_*`, `AZURE_OPENA
 
 `.claude/settings.json` defines Claude Code `SessionStart`, `PreCompact`, and `SessionEnd`. `.codex/hooks.json.example` defines Codex `SessionStart` and `SessionEnd` for codex-cli 0.146.1 or newer. Global installation is opt-in: `bin/setup-global.sh` prints non-destructive merge instructions for `~/.claude/settings.json` and `~/.codex/hooks.json`.
 
+Run `uv sync` in the repository before installing or updating Codex hooks. The
+Codex hook commands use `uv run --no-sync` so dependency resolution stays out
+of the three-second SessionEnd timeout.
+
 After merging the Codex configuration, launch Codex interactively. In the hook trust review, compare the new or changed hook commands and hashes with `.codex/hooks.json.example` and the checked-out hook scripts. Approve only the vetted repository hooks. Before relying on live capture, verify that both repository hooks appear as enabled and trusted. Repeat this review whenever a hook command or hash changes.
 
 Gate-only exception: disposable Gate 2 automation may use `--dangerously-bypass-hook-trust` for one already-vetted invocation when an interactive review cannot be persisted in the disposable profile. Codex labels this flag **DANGEROUS**. Never persist it in configuration, aliases, scripts, or normal launch commands.

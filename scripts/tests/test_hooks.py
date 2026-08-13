@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -2121,6 +2122,58 @@ def test_hook_examples_preserve_ten_second_capture_timeouts_and_are_opt_in():
     assert not (ROOT / ".codex" / "hooks.json").exists()
 
 
+def test_codex_hook_commands_use_no_sync():
+    codex = json.loads((ROOT / ".codex" / "hooks.json.example").read_text())
+
+    for event in ("SessionStart", "SessionEnd"):
+        command = codex["hooks"][event][0]["hooks"][0]["command"]
+        assert "uv run --no-sync --directory" in command
+
+
+def test_codex_session_end_starts_from_cold_cache_with_no_sync(tmp_path):
+    real_uv = shutil.which("uv")
+    assert real_uv is not None
+    memory_home = tmp_path / "memory"
+    fake_bin = tmp_path / "bin"
+    _fake_uv(fake_bin)
+    cold_cache = tmp_path / "cold-uv-cache"
+    payload = {
+        "hook_event_name": "SessionEnd",
+        "session_id": "cold-cache-session",
+        "transcript_path": str(FIXTURES / "codex-basic.jsonl"),
+        "cwd": "/projects/cold-cache",
+    }
+    env = _hook_env(memory_home, fake_bin=fake_bin)
+    env["UV_CACHE_DIR"] = str(cold_cache)
+    env["UV_OFFLINE"] = "1"
+
+    started = time.monotonic()
+    result = subprocess.run(
+        [
+            real_uv,
+            "run",
+            "--no-sync",
+            "--directory",
+            str(ROOT),
+            "python",
+            str(HOOKS / "codex-session-end.py"),
+        ],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=3,
+        env=env,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 3
+    assert _job_rows(memory_home) == [
+        ("codex", "cold-cache-session", "session_end")
+    ]
+
+
 def test_global_setup_only_prints_safe_merge_instructions(tmp_path):
     home = tmp_path / "home"
     claude = home / ".claude"
@@ -2151,6 +2204,8 @@ def test_global_setup_only_prints_safe_merge_instructions(tmp_path):
     assert "~/.claude/settings.json" in first.stdout
     assert "~/.codex/hooks.json" in first.stdout
     assert "codex-cli 0.146.1 or newer" in first.stdout
+    assert "uv sync" in first.stdout
+    assert "--no-sync" in first.stdout
     assert first.stdout.count("do not replace") == 2
 
 
