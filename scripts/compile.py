@@ -30,6 +30,7 @@ from staging import (
     validate_stage,
 )
 from utils import (
+    ExclusiveFileLock,
     FileBaseline,
     capture_file_baseline,
     file_hash,
@@ -353,12 +354,7 @@ async def compile_daily_log(
     return 0.0
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
-    parser.add_argument("--all", action="store_true")
-    parser.add_argument("--file")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args(argv)
+def _run_compile(args: argparse.Namespace) -> int:
     if not args.dry_run:
         recover_incomplete_apply(ROOT_DIR)
     state, _ = load_state_with_baseline()
@@ -385,6 +381,29 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(compile_daily_log(path, current_state, baseline))
     print(f"Knowledge base: {len(list_wiki_articles())} articles")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--file")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    auto_lock = None
+    if os.environ.get("AI_MEMORY_AUTO_COMPILE") == "1":
+        config = load_config(os.environ)
+        auto_lock = ExclusiveFileLock(
+            config.root_dir / "scripts" / "memory-auto-compile.lock",
+            blocking=False,
+        )
+        if not auto_lock.acquire():
+            logger.info("Skipping overlapping automatic compile")
+            return 75
+    try:
+        return _run_compile(args)
+    finally:
+        if auto_lock is not None:
+            auto_lock.release()
 
 
 if __name__ == "__main__":

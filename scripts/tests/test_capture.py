@@ -1479,8 +1479,10 @@ def test_agent_session_counter_includes_interactive_claude_and_codex_only(
             "101 claude /usr/local/bin/claude --resume session-1",
             "102 claude /opt/sdk/_bundled/claude --print",
             "103 codex /usr/local/bin/codex",
-            "104 codex /usr/local/bin/codex exec --ephemeral -",
-            "105 python /usr/bin/python worker.py --drain",
+            "104 codex /usr/local/bin/codex --ask-for-approval never exec "
+            "--ephemeral --output-last-message /tmp/output -",
+            "105 codex /usr/local/bin/codex --prompt 'please exec this command'",
+            "106 python /usr/bin/python worker.py --drain",
         )
     )
     monkeypatch.setattr(
@@ -1491,7 +1493,7 @@ def test_agent_session_counter_includes_interactive_claude_and_codex_only(
         ),
     )
 
-    assert flush_module.count_interactive_agent_sessions() == 2
+    assert flush_module.count_interactive_agent_sessions() == 3
 
 
 @pytest.mark.parametrize(
@@ -1522,6 +1524,7 @@ def test_end_of_day_scheduler_requires_uncompiled_content_after_four_pm(
     scripts.mkdir(parents=True)
     daily.mkdir()
     (scripts / "compile.py").write_text("# compiler\n", encoding="utf-8")
+    (scripts / "auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
     log_path = daily / "2026-08-11.md"
     log_path.write_text(
         "# Daily\n\n<!-- @compiled-through:2026-08-11T16:01:00-07:00 -->\n",
@@ -1557,16 +1560,318 @@ def test_end_of_day_scheduler_requires_uncompiled_content_after_four_pm(
 
     assert len(launches) == 1
     command, options = launches[0]
-    assert command == [
-        "uv",
-        "run",
-        "--directory",
-        str(root.resolve()),
-        "python",
-        str(scripts / "compile.py"),
-    ]
+    assert command[:2] == [sys.executable, str(scripts / "auto-compile.py")]
+    assert command[2] == str(root.resolve())
+    assert len(command[3]) == 64
+    assert len(command[4]) == 64
     assert options["env"]["AI_MEMORY_HOME"] == str(root.resolve())
     assert options["env"]["AI_MEMORY_INTERNAL_JOB"] == "1"
+    assert options["env"]["AI_MEMORY_AUTO_COMPILE"] == "1"
+
+
+def test_end_of_day_scheduler_reserves_same_content_once_across_callers(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    launches = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **options: launches.append((command, options)),
+    )
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is False
+
+    assert len(launches) == 1
+
+
+def test_end_of_day_scheduler_releases_reservation_when_coordinator_spawn_fails(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    launches = []
+    failures = [True, False]
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+
+    def spawn(command, **options):
+        if failures.pop(0):
+            raise OSError("spawn failed")
+        launches.append((command, options))
+
+    monkeypatch.setattr(flush_module.subprocess, "Popen", spawn)
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is False
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+
+    assert len(launches) == 1
+
+
+def test_auto_compile_coordinator_cancels_if_job_arrives_after_reservation(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    coordinators = []
+    compile_launches = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: coordinators.append(command),
+    )
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    token, fingerprint = coordinators[0][-2:]
+
+    with QueueRepository(
+        root / "scripts/jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        enqueue_capture_job(repository, root, session_id="arrived-before-launch")
+
+    assert (
+        flush_module.run_auto_compile_coordinator(
+            root,
+            token,
+            fingerprint,
+            compile_launcher=lambda *_args, **_kwargs: compile_launches.append(True),
+        )
+        is False
+    )
+    assert compile_launches == []
+
+
+def test_auto_compile_reservation_fingerprint_changes_with_uncompiled_content(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    daily = root / "daily/2026-08-11.md"
+    daily.write_text("First content.\n", encoding="utf-8")
+    commands = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: commands.append(command),
+    )
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    first_token, first_fingerprint = commands[-1][3:5]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert repository.release_auto_compile(first_token, first_fingerprint) is True
+    daily.write_text("First content.\nSecond content.\n", encoding="utf-8")
+
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+
+    assert commands[-1][4] != first_fingerprint
+
+
+def test_failed_auto_compile_releases_reservation_for_retry(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    commands = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: commands.append(command),
+    )
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    token, fingerprint = commands[-1][-2:]
+
+    class FailedCompile:
+        returncode = 1
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    assert (
+        flush_module.run_auto_compile_coordinator(
+            root,
+            token,
+            fingerprint,
+            compile_launcher=lambda *_args, **_kwargs: FailedCompile(),
+        )
+        is False
+    )
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+
+
+def test_running_auto_compile_renews_reservation_lease(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    commands = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: commands.append(command),
+    )
+    now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    token, fingerprint = commands[-1][-2:]
+    renewals = []
+    real_renew = QueueRepository.renew_auto_compile
+
+    def observed_renew(self, *args, **kwargs):
+        renewals.append((args, kwargs))
+        return real_renew(self, *args, **kwargs)
+
+    monkeypatch.setattr(QueueRepository, "renew_auto_compile", observed_renew)
+
+    class SlowFailedCompile:
+        waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(["compile"], timeout)
+            return 1
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: SlowFailedCompile(),
+    )
+    assert len(renewals) == 1
+
+
+def test_end_of_day_scheduler_does_not_reserve_while_queue_has_active_work(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    with QueueRepository(
+        root / "scripts/jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        enqueue_capture_job(repository, root, session_id="pending-before-reserve")
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not launch")
+        ),
+    )
+
+    assert (
+        flush_module.maybe_trigger_compilation(
+            memory_home=root,
+            now=datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc),
+        )
+        is False
+    )
+
+
+def test_auto_compile_reservation_renewal_prevents_overlap_and_expiry_recovers(
+    tmp_path,
+):
+    first = "1" * 64
+    second = "2" * 64
+    fingerprint = "a" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.reserve_auto_compile(
+            first,
+            fingerprint,
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        )
+        assert repository.renew_auto_compile(
+            first,
+            fingerprint,
+            now=NOW + timedelta(seconds=4),
+            expires_at=NOW + timedelta(seconds=9),
+        )
+        assert not repository.reserve_auto_compile(
+            second,
+            fingerprint,
+            now=NOW + timedelta(seconds=6),
+            expires_at=NOW + timedelta(seconds=11),
+        )
+        assert repository.reserve_auto_compile(
+            second,
+            fingerprint,
+            now=NOW + timedelta(seconds=10),
+            expires_at=NOW + timedelta(seconds=15),
+        )
+
+
+def test_end_of_day_scheduler_rejects_symlinked_daily_log(tmp_path, monkeypatch):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text("# coordinator\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("Sensitive uncompiled content.\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").symlink_to(outside)
+    launches = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launches.append(command),
+    )
+
+    assert (
+        flush_module.maybe_trigger_compilation(
+            memory_home=root,
+            now=datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc),
+        )
+        is False
+    )
+    assert launches == []
 
 
 @pytest.mark.parametrize(

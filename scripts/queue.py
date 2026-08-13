@@ -58,6 +58,7 @@ JobStatus = Literal["pending", "leased", "succeeded", "failed", "dead"]
 SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
+AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 
@@ -735,6 +736,213 @@ class QueueRepository:
             release()
             self._connection.execute("COMMIT")
             return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _valid_reservation_component(value: str) -> bool:
+        return len(value) == 64 and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    def _active_work_unlocked(self) -> bool:
+        return self._connection.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE status IN ('pending', 'failed', 'leased')
+            LIMIT 1
+            """
+        ).fetchone() is not None
+
+    def reserve_auto_compile(
+        self,
+        token: str,
+        fingerprint: str,
+        *,
+        now: datetime | str | int | float,
+        expires_at: datetime | str | int | float,
+    ) -> bool:
+        """Reserve one idle-queue compile lease for a content fingerprint."""
+        if not self._valid_reservation_component(token):
+            raise ValueError("auto-compile token must be a lowercase SHA-256 value")
+        if not self._valid_reservation_component(fingerprint):
+            raise ValueError("auto-compile fingerprint must be a lowercase SHA-256 value")
+        now_dt = _datetime(now)
+        expires_dt = _datetime(expires_at)
+        if expires_dt <= now_dt:
+            raise ValueError("auto-compile reservation expiry must be in the future")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._active_work_unlocked():
+                self._connection.execute("COMMIT")
+                return False
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    existing = json.loads(row["value"])
+                    existing_expiry = _datetime(existing["expires_at"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    existing_expiry = now_dt
+                if existing_expiry > now_dt:
+                    self._connection.execute("COMMIT")
+                    return False
+            reservation = json.dumps(
+                {
+                    "token": token,
+                    "fingerprint": fingerprint,
+                    "expires_at": _stored_time(expires_dt),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO queue_metadata(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (AUTO_COMPILE_RESERVATION_KEY, reservation),
+            )
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def release_auto_compile(self, token: str, fingerprint: str) -> bool:
+        """Release a reservation only when both opaque identities match."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            matched = False
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+                matched = (
+                    reservation.get("token") == token
+                    and reservation.get("fingerprint") == fingerprint
+                )
+            if matched:
+                self._connection.execute(
+                    "DELETE FROM queue_metadata WHERE key = ?",
+                    (AUTO_COMPILE_RESERVATION_KEY,),
+                )
+            self._connection.execute("COMMIT")
+            return matched
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def renew_auto_compile(
+        self,
+        token: str,
+        fingerprint: str,
+        *,
+        now: datetime | str | int | float,
+        expires_at: datetime | str | int | float,
+    ) -> bool:
+        """Extend an unexpired reservation held by the same coordinator."""
+        now_dt = _datetime(now)
+        expires_dt = _datetime(expires_at)
+        if expires_dt <= now_dt:
+            raise ValueError("auto-compile reservation expiry must be in the future")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            reservation = {}
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+            matched = (
+                reservation.get("token") == token
+                and reservation.get("fingerprint") == fingerprint
+            )
+            try:
+                unexpired = _datetime(reservation["expires_at"]) > now_dt
+            except (KeyError, TypeError, ValueError):
+                unexpired = False
+            if not matched or not unexpired:
+                self._connection.execute("COMMIT")
+                return False
+            reservation["expires_at"] = _stored_time(expires_dt)
+            self._connection.execute(
+                "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                (
+                    json.dumps(
+                        reservation, sort_keys=True, separators=(",", ":")
+                    ),
+                    AUTO_COMPILE_RESERVATION_KEY,
+                ),
+            )
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def launch_reserved_auto_compile(
+        self,
+        token: str,
+        fingerprint: str,
+        launch: Callable[[], object],
+        *,
+        now: datetime | str | int | float,
+    ) -> object | None:
+        """Recheck reservation and queue idleness atomically with process launch.
+
+        The immediate transaction serializes enqueues until ``launch`` returns,
+        so work that commits before the child launch suppresses compilation and
+        work that commits afterward belongs to a later drain.
+        """
+        now_dt = _datetime(now)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            reservation = {}
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+            matched = (
+                reservation.get("token") == token
+                and reservation.get("fingerprint") == fingerprint
+            )
+            try:
+                unexpired = _datetime(reservation["expires_at"]) > now_dt
+            except (KeyError, TypeError, ValueError):
+                unexpired = False
+            if not matched or not unexpired or self._active_work_unlocked():
+                if matched:
+                    self._connection.execute(
+                        "DELETE FROM queue_metadata WHERE key = ?",
+                        (AUTO_COMPILE_RESERVATION_KEY,),
+                    )
+                self._connection.execute("COMMIT")
+                return None
+            process = launch()
+            self._connection.execute("COMMIT")
+            return process
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")

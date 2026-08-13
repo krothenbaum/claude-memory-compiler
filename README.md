@@ -23,7 +23,7 @@ Hooks perform local parsing and enqueue work; they never call a model. The worke
 
 All model-driven edits happen in disposable staging directories. Host Python validates each stage and applies approved files under one writer lock with a recovery journal. Models never write directly to the real knowledge base.
 
-After 4 PM local time, a live worker that appended at least one daily entry waits for the queue to become idle, then checks for uncompiled content in today's log. It starts one detached compile only when no interactive Claude Code or Codex session remains. Failed extraction, queued or retrying work, an existing compiled-through marker with no later content, and unavailable process inspection all suppress the automatic compile. The manual `compile.py` command remains available.
+After 4 PM local time, a live worker that appended at least one daily entry waits for the queue to become idle, then checks for uncompiled content in today's log. A SQLite reservation identifies that exact uncompiled content and starts one detached coordinator only when no interactive Claude Code or Codex session remains. The coordinator rechecks the reservation, content fingerprint, and queue idleness in the same transaction that launches `compile.py`. It renews the reservation while compilation runs and releases it on success or failure; an abandoned reservation expires after a crash. The automatic compile child also holds a process lock, which prevents overlap if its coordinator crashes. Failed extraction, queued or retrying work, an existing compiled-through marker with no later content, and unavailable process inspection all suppress the automatic compile. The manual `compile.py` command remains available.
 
 ## Requirements and Authentication
 

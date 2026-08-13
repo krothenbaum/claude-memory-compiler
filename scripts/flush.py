@@ -14,15 +14,18 @@ from __future__ import annotations
 import os
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import secrets
 import shlex
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
@@ -36,6 +39,7 @@ from utils import (  # noqa: E402
     append_daily_entry,
     notify_terminal,
     open_secure_log_stream,
+    read_text_with_baseline,
 )
 from config import load_config  # noqa: E402
 from providers import (  # noqa: E402
@@ -235,6 +239,8 @@ async def run_flush(
 
 
 COMPILE_AFTER_HOUR = 16  # 4 PM local time
+AUTO_COMPILE_LEASE_SECONDS = 120
+AUTO_COMPILE_HEARTBEAT_SECONDS = 30
 
 
 def count_interactive_agent_sessions() -> int:
@@ -276,10 +282,82 @@ def count_interactive_agent_sessions() -> int:
             arguments = shlex.split(args)
         except ValueError:
             return -1
-        if "exec" in arguments[1:]:
+        try:
+            exec_index = arguments.index("exec", 1)
+        except ValueError:
+            exec_index = -1
+        provider_shape = (
+            exec_index > 0
+            and arguments[exec_index - 2 : exec_index] == [
+                "--ask-for-approval",
+                "never",
+            ]
+            and "--ephemeral" in arguments[exec_index + 1 :]
+            and "--output-last-message" in arguments[exec_index + 1 :]
+        )
+        if provider_shape:
             continue
         count += 1
     return count
+
+
+def _uncompiled_fingerprint(path: Path) -> str | None:
+    try:
+        content, _baseline = read_text_with_baseline(path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    marker_re = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
+    last_end = 0
+    for marker in marker_re.finditer(content):
+        last_end = marker.end()
+    uncompiled = content[last_end:].strip()
+    if not uncompiled:
+        return None
+    material = f"{path.name}\0{uncompiled}".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def _release_auto_compile(root: Path, token: str, fingerprint: str) -> None:
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        repository.release_auto_compile(token, fingerprint)
+
+
+def _compile_process_options(root: Path, log_handle: object) -> dict[str, object]:
+    options: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "cwd": str(root),
+        "env": _auto_compile_environment(root),
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        options["start_new_session"] = True
+    return options
+
+
+def _auto_compile_environment(root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment["AI_MEMORY_INTERNAL_JOB"] = "1"
+    environment["AI_MEMORY_AUTO_COMPILE"] = "1"
+    tty_path = _resolve_tty_path()
+    if tty_path:
+        environment["CLAUDE_MEMORY_TTY"] = tty_path
+    return environment
 
 
 def maybe_trigger_compilation(
@@ -318,61 +396,139 @@ def maybe_trigger_compilation(
     # processing only the new sessions each time.
     today_log = f"{local_now.strftime('%Y-%m-%d')}.md"
     log_path = daily_dir / today_log
-    try:
-        content = log_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return False
-    marker_re = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
-    last_end = 0
-    for marker in marker_re.finditer(content):
-        last_end = marker.end()
-    if not content[last_end:].strip():
+    fingerprint = _uncompiled_fingerprint(log_path)
+    if fingerprint is None:
         return False
 
     compile_script = scripts_dir / "compile.py"
     if not compile_script.is_file() or compile_script.is_symlink():
         return False
+    coordinator_script = scripts_dir / "auto-compile.py"
+    if not coordinator_script.is_file() or coordinator_script.is_symlink():
+        return False
 
-    logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
+    from scripts.queue import QueueRepository
 
-    cmd = ["uv", "run", "--directory", str(root), "python", str(compile_script)]
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    token = secrets.token_hex(32)
+    lease_now = datetime.now(timezone.utc)
+    lease_expires = lease_now + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        if not repository.reserve_auto_compile(
+            token,
+            fingerprint,
+            now=lease_now,
+            expires_at=lease_expires,
+        ):
+            return False
 
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-        )
-    else:
-        kwargs["start_new_session"] = True
-
-    # Hand the controlling-TTY path to the detached compile.py subprocess so
-    # it can write progress messages even though `start_new_session=True`
-    # severs /dev/tty access.
-    env = os.environ.copy()
-    env["AI_MEMORY_HOME"] = str(root)
-    env.pop("CLAUDE_MEMORY_HOME", None)
-    env["AI_MEMORY_INTERNAL_JOB"] = "1"
-    tty_path = _resolve_tty_path()
-    if tty_path:
-        env["CLAUDE_MEMORY_TTY"] = tty_path
+    logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
+    command = [
+        sys.executable,
+        str(coordinator_script),
+        str(root),
+        token,
+        fingerprint,
+    ]
 
     try:
         with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
-            subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                cwd=str(root),
-                env=env,
-                close_fds=True,
-                **kwargs,
-            )
-        notify_terminal("end-of-day compile triggered")
+            subprocess.Popen(command, **_compile_process_options(root, log_handle))
+        notify_terminal("end-of-day compile scheduled")
         return True
     except Exception as exc:
-        logging.error("Failed to spawn compile.py: %s", exc)
+        _release_auto_compile(root, token, fingerprint)
+        logging.error("Failed to spawn auto-compile coordinator: %s", exc)
         return False
+
+
+def run_auto_compile_coordinator(
+    memory_home: Path | str,
+    token: str,
+    fingerprint: str,
+    *,
+    compile_launcher: Callable[..., Any] = subprocess.Popen,
+) -> bool:
+    """Revalidate an idle reservation, run compile, and release the lease."""
+    from scripts.queue import QueueRepository
+
+    root = Path(memory_home).expanduser().resolve()
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        return False
+    matching_logs = [
+        path
+        for path in sorted((root / "daily").glob("*.md"))
+        if _uncompiled_fingerprint(path) == fingerprint
+    ]
+    if len(matching_logs) != 1 or count_interactive_agent_sessions() != 0:
+        _release_auto_compile(root, token, fingerprint)
+        return False
+    compile_script = root / "scripts" / "compile.py"
+    if not compile_script.is_file() or compile_script.is_symlink():
+        _release_auto_compile(root, token, fingerprint)
+        return False
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    command = ["uv", "run", "--directory", str(root), "python", str(compile_script)]
+    launched = None
+    try:
+        with QueueRepository(
+            config.queue_path, memory_home=root, sync_usage=False
+        ) as repository:
+            def launch() -> object:
+                if _uncompiled_fingerprint(matching_logs[0]) != fingerprint:
+                    raise RuntimeError("daily content changed before compile launch")
+                with open_secure_log_stream(root / "scripts" / "compile.log") as log_handle:
+                    return compile_launcher(
+                        command, **_compile_process_options(root, log_handle)
+                    )
+
+            launched = repository.launch_reserved_auto_compile(
+                token,
+                fingerprint,
+                launch,
+                now=datetime.now(timezone.utc),
+            )
+        if launched is None:
+            return False
+        while True:
+            try:
+                return launched.wait(timeout=AUTO_COMPILE_HEARTBEAT_SECONDS) == 0
+            except subprocess.TimeoutExpired:
+                renewed_at = datetime.now(timezone.utc)
+                with QueueRepository(
+                    config.queue_path, memory_home=root, sync_usage=False
+                ) as repository:
+                    renewed = repository.renew_auto_compile(
+                        token,
+                        fingerprint,
+                        now=renewed_at,
+                        expires_at=renewed_at
+                        + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                    )
+                if not renewed:
+                    launched.terminate()
+                    try:
+                        launched.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        launched.kill()
+                        launched.wait()
+                    return False
+    except Exception as exc:
+        logging.error("Automatic compile failed: %s", exc)
+        return False
+    finally:
+        _release_auto_compile(root, token, fingerprint)
 
 
 def main():

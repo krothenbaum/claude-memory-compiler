@@ -17,7 +17,7 @@ import lint
 import query
 from providers import ProviderResult, RoutedResult, TaskKind, TextRequest, WorkspaceRequest
 from staging import RetryableApplyError
-from utils import capture_file_baseline
+from utils import ExclusiveFileLock, capture_file_baseline
 from worker import MemoryWorker
 
 
@@ -91,6 +91,29 @@ def test_live_extraction_uses_extract_text_request_and_pure_prompt(memory_home: 
     assert request.prompt == flush.build_flush_prompt(
         "User: Keep this decision", "memory", "/tmp/memory"
     )
+
+
+def test_automatic_compile_refuses_overlap_while_previous_child_holds_lock(
+    tmp_path, monkeypatch
+):
+    config = SimpleNamespace(root_dir=tmp_path)
+    lock = ExclusiveFileLock(
+        tmp_path / "scripts/memory-auto-compile.lock", blocking=False
+    )
+    assert lock.acquire()
+    monkeypatch.setenv("AI_MEMORY_AUTO_COMPILE", "1")
+    monkeypatch.setattr(compile_module, "load_config", lambda _env: config)
+    monkeypatch.setattr(
+        compile_module,
+        "recover_incomplete_apply",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("must stop before compile recovery")
+        ),
+    )
+    try:
+        assert compile_module.main([]) == 75
+    finally:
+        lock.release()
 
 
 def test_batch_extraction_uses_extract_text_request_and_pure_prompt(
