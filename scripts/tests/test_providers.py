@@ -207,7 +207,48 @@ def test_codex_preflight_uses_small_dedicated_timeouts(fake_runner, tmp_path):
     assert runner.calls[1][0] == ["codex", "login", "status"]
     assert runner.calls[1][1]["timeout_seconds"] == 5
     assert runner.calls[1][1]["terminate_process_group_on_timeout"] is True
-    assert runner.calls[2][1]["timeout_seconds"] == request.timeout_seconds
+    assert 0 < runner.calls[2][1]["timeout_seconds"] <= request.timeout_seconds
+
+
+def test_codex_attempt_uses_one_aggregate_deadline(tmp_path):
+    clock = [0.0]
+
+    class TimedRunner(FakeRunner):
+        async def __call__(self, command, **kwargs):
+            result = await super().__call__(command, **kwargs)
+            clock[0] += 0.4
+            return result
+
+    request = TextRequest(TaskKind.QUERY, "answer", tmp_path, 1)
+    runner = TimedRunner(_chatgpt_login(), _write_codex_output("answer"))
+
+    result = _run(
+        _codex_provider(runner, monotonic=lambda: clock[0]).generate_text(request)
+    )
+
+    assert result.outcome == "success"
+    budgets = [call[1]["timeout_seconds"] for call in runner.calls]
+    assert budgets == pytest.approx([1.0, 0.6, 0.2])
+    assert sum(budgets) < 2
+
+
+def test_codex_attempt_does_not_start_command_after_deadline(tmp_path):
+    clock = [0.0]
+
+    def expire(_command, _kwargs):
+        clock[0] = 1.0
+        return FakeCommandResult(stdout="codex-cli 0.146.1")
+
+    runner = FakeRunner(version_response=expire)
+    request = TextRequest(TaskKind.QUERY, "answer", tmp_path, 1)
+
+    result = _run(
+        _codex_provider(runner, monotonic=lambda: clock[0]).generate_text(request)
+    )
+
+    assert result.outcome == "timeout"
+    assert result.reason == "codex login status timed out"
+    assert len(runner.calls) == 1
 
 
 def _run(awaitable):

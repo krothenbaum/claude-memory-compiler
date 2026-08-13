@@ -410,10 +410,12 @@ class CodexProvider:
         runner: Any | None = None,
         task_models: Mapping[TaskKind, str] | None = None,
         env: Mapping[str, str] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._runner = runner or AsyncCommandRunner()
         self._source_env = dict(os.environ if env is None else env)
         self._task_models = dict(task_models or _default_task_models(self._source_env))
+        self._monotonic = monotonic
 
     async def generate_text(self, request: TextRequest) -> ProviderResult:
         return await self._generate(request, workspace=False)
@@ -473,7 +475,7 @@ class CodexProvider:
         )
 
     async def _preflight(
-        self, request: TextRequest, started: float
+        self, request: TextRequest, started: float, deadline: float
     ) -> ProviderResult | None:
         try:
             try:
@@ -481,7 +483,9 @@ class CodexProvider:
                     ["codex", "--version"],
                     request,
                     max_output_bytes=_CODEX_VERSION_MAX_OUTPUT_BYTES,
-                    timeout_seconds=_CODEX_PREFLIGHT_TIMEOUT_SECONDS,
+                    timeout_seconds=self._remaining_timeout(
+                        deadline, _CODEX_PREFLIGHT_TIMEOUT_SECONDS
+                    ),
                 )
             except TimeoutError:
                 return self._result(
@@ -535,7 +539,9 @@ class CodexProvider:
                     ["codex", "login", "status"],
                     request,
                     max_output_bytes=_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES,
-                    timeout_seconds=_CODEX_PREFLIGHT_TIMEOUT_SECONDS,
+                    timeout_seconds=self._remaining_timeout(
+                        deadline, _CODEX_PREFLIGHT_TIMEOUT_SECONDS
+                    ),
                 )
             except TimeoutError:
                 return self._result(
@@ -594,8 +600,9 @@ class CodexProvider:
     async def _generate(
         self, request: TextRequest, *, workspace: bool
     ) -> ProviderResult:
-        started = time.monotonic()
-        preflight_failure = await self._preflight(request, started)
+        started = self._monotonic()
+        deadline = started + request.timeout_seconds
+        preflight_failure = await self._preflight(request, started, deadline)
         if preflight_failure is not None:
             return preflight_failure
         output_schema, schema_error = _load_output_schema(request.output_schema)
@@ -633,7 +640,12 @@ class CodexProvider:
         command.append("-")
 
         try:
-            completed = await self._run_command(command, request, request.prompt)
+            completed = await self._run_command(
+                command,
+                request,
+                request.prompt,
+                timeout_seconds=self._remaining_timeout(deadline),
+            )
             combined = "\n".join((completed.stderr, completed.stdout)).strip()
             if completed.returncode != 0:
                 outcome = _failure_outcome(combined)
@@ -676,6 +688,14 @@ class CodexProvider:
             output_path.unlink(missing_ok=True)
             if temporary_directory is not None:
                 temporary_directory.cleanup()
+
+    def _remaining_timeout(
+        self, deadline: float, maximum: float | None = None
+    ) -> float:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Codex attempt timed out")
+        return remaining if maximum is None else min(maximum, remaining)
 
 def _load_output_schema(
     output_schema: Path | None,
