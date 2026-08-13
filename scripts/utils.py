@@ -386,7 +386,11 @@ def open_secure_runtime_file(
     root = Path(os.path.abspath(Path(memory_root).expanduser()))
     expected = root / "scripts" / "runtime"
     runtime = (
-        prepare_secure_runtime_directory(root)
+        (
+            prepare_secure_runtime_directory(root)
+            if _runtime_dir_fd_supported()
+            else expected
+        )
         if runtime_directory is None
         else Path(os.path.abspath(Path(runtime_directory).expanduser()))
     )

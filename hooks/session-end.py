@@ -31,7 +31,6 @@ from scripts.hook_logging import configure_hook_logger
 from scripts.transcripts import parse_claude_transcript, render_turns
 from scripts.utils import (
     open_secure_runtime_file,
-    prepare_secure_runtime_directory,
     validate_secure_runtime_file,
 )
 
@@ -915,11 +914,7 @@ def bounded_transcript_slice(
             b"\r\n"
         )
     metadata_prefix = _metadata_prefix(first_record)
-    runtime_dir = prepare_secure_runtime_directory(memory_root)
-    with open_secure_runtime_file(
-        memory_root,
-        runtime_directory=runtime_dir,
-    ) as (temporary, descriptor):
+    with open_secure_runtime_file(memory_root) as (temporary, descriptor):
         semantic_records: list[tuple[int, dict[str, object]]] = []
         candidate_bytes = 0
         selection_complete = False

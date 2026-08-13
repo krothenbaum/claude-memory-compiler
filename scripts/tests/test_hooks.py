@@ -1538,6 +1538,9 @@ def test_private_slice_works_when_windows_has_no_fchmod(tmp_path, monkeypatch):
         + "\n",
         encoding="utf-8",
     )
+    runtime = tmp_path / "memory" / "scripts" / "runtime"
+    runtime.mkdir(parents=True)
+    runtime.chmod(0o700)
     monkeypatch.delattr(hook.os, "fchmod")
 
     with hook.bounded_transcript_slice(
@@ -1690,7 +1693,9 @@ def test_live_slice_directory_swap_never_creates_in_external_target(
     sentinel = external / "sentinel"
     sentinel.write_text("unchanged", encoding="utf-8")
     observed: list[Path] = []
-    real_prepare = hook.prepare_secure_runtime_directory
+    import scripts.utils as memory_utils
+
+    real_prepare = memory_utils.prepare_secure_runtime_directory
 
     def swap_after_validation(root):
         runtime = real_prepare(root)
@@ -1698,7 +1703,7 @@ def test_live_slice_directory_swap_never_creates_in_external_target(
         runtime.symlink_to(external, target_is_directory=True)
         return runtime
 
-    monkeypatch.setattr(hook, "prepare_secure_runtime_directory", swap_after_validation)
+    monkeypatch.setattr(memory_utils, "prepare_secure_runtime_directory", swap_after_validation)
     before = _tree_manifest(external)
 
     with pytest.raises((OSError, ValueError)):
@@ -1837,6 +1842,21 @@ def test_live_slice_cross_platform_fallback_uses_existing_private_runtime(
         assert "FALLBACK_SIGNAL" in preview
 
     assert list(runtime.iterdir()) == []
+
+
+def test_cross_platform_fallback_does_not_create_missing_runtime_tree(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+
+    with pytest.raises(FileNotFoundError):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert not memory_home.exists()
 
 
 def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
