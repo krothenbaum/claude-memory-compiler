@@ -35,6 +35,7 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 from utils import (  # noqa: E402
+    ExclusiveFileLock,
     _resolve_tty_path,
     append_daily_entry,
     notify_terminal,
@@ -241,6 +242,7 @@ async def run_flush(
 COMPILE_AFTER_HOUR = 16  # 4 PM local time
 AUTO_COMPILE_LEASE_SECONDS = 120
 AUTO_COMPILE_HEARTBEAT_SECONDS = 30
+AUTO_COMPILE_WATCHER_POLL_SECONDS = 5
 
 
 class _AutoCompileContentChanged(RuntimeError):
@@ -373,6 +375,46 @@ def _release_auto_compile(root: Path, token: str, fingerprint: str) -> None:
         repository.release_auto_compile(token, fingerprint)
 
 
+def _clear_auto_compile_watcher(root: Path, token: str) -> None:
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        repository.clear_auto_compile_watcher(token)
+
+
+def _fail_auto_compile_owner_spawn(
+    root: Path, token: str, fingerprint: str
+) -> None:
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        repository.fail_auto_compile_owner_spawn(
+            token, fingerprint, now=datetime.now(timezone.utc)
+        )
+
+
+def _auto_compile_lock_is_held(root: Path) -> bool:
+    lock = ExclusiveFileLock(
+        root / "scripts" / "memory-auto-compile.lock", blocking=False
+    )
+    acquired = lock.acquire()
+    if acquired:
+        lock.release()
+    return not acquired
+
+
 def _compile_process_options(root: Path, log_handle: object) -> dict[str, object]:
     options: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
@@ -462,22 +504,26 @@ def maybe_trigger_compilation(
     with QueueRepository(
         config.queue_path, memory_home=root, sync_usage=False
     ) as repository:
-        if not repository.reserve_auto_compile(
+        role = repository.request_auto_compile(
             token,
             fingerprint,
+            log_name=today_log,
             now=lease_now,
             expires_at=lease_expires,
-        ):
+        )
+        if role is None:
             return False
 
     logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
     command = [
         sys.executable,
         str(coordinator_script),
+        role,
         str(root),
         token,
-        fingerprint,
     ]
+    if role == "owner":
+        command.append(fingerprint)
 
     try:
         with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
@@ -485,7 +531,10 @@ def maybe_trigger_compilation(
         notify_terminal("end-of-day compile scheduled")
         return True
     except Exception as exc:
-        _release_auto_compile(root, token, fingerprint)
+        if role == "owner":
+            _fail_auto_compile_owner_spawn(root, token, fingerprint)
+        else:
+            _clear_auto_compile_watcher(root, token)
         logging.error("Failed to spawn auto-compile coordinator: %s", exc)
         return False
 
@@ -496,6 +545,8 @@ def run_auto_compile_coordinator(
     fingerprint: str,
     *,
     compile_launcher: Callable[..., Any] = subprocess.Popen,
+    sleeper: Callable[[float], None] = time.sleep,
+    lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
 ) -> bool:
     """Run reserved generations serially until all observed content is covered."""
     from scripts.queue import QueueRepository
@@ -614,6 +665,33 @@ def run_auto_compile_coordinator(
                         launched.wait()
                     return False
 
+            if return_code == 75:
+                while True:
+                    deferred_at = datetime.now(timezone.utc)
+                    previous_fingerprint = active_fingerprint
+                    with QueueRepository(
+                        config.queue_path, memory_home=root, sync_usage=False
+                    ) as repository:
+                        deferred_fingerprint = (
+                            repository.defer_auto_compile_generation(
+                                token,
+                                active_fingerprint,
+                                lambda: _uncompiled_fingerprint(log_path),
+                                now=deferred_at,
+                                expires_at=deferred_at
+                                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                            )
+                        )
+                    if deferred_fingerprint is None:
+                        return True
+                    active_fingerprint = deferred_fingerprint
+                    if deferred_fingerprint != previous_fingerprint:
+                        break
+                    if not lock_probe(root):
+                        break
+                    sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
+                continue
+
             handoff_at = datetime.now(timezone.utc)
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
@@ -634,6 +712,78 @@ def run_auto_compile_coordinator(
         return False
     finally:
         _release_auto_compile(root, token, active_fingerprint)
+
+
+def _observe_auto_compile_content(
+    root: Path, reservation: dict[str, object]
+) -> dict[str, str] | None:
+    def current(name: object) -> tuple[str, str] | None:
+        if not isinstance(name, str) or Path(name).name != name:
+            return None
+        path = root / "daily" / name
+        fingerprint = _uncompiled_fingerprint(path)
+        return (fingerprint, name) if fingerprint is not None else None
+
+    active = current(reservation.get("log_name"))
+    pending = current(reservation.get("pending_log_name"))
+    if active is None:
+        if pending is None:
+            return None
+        return {"fingerprint": pending[0], "log_name": pending[1]}
+    observed = {"fingerprint": active[0], "log_name": active[1]}
+    if pending is not None and pending[1] != active[1]:
+        observed["pending_fingerprint"] = pending[0]
+        observed["pending_log_name"] = pending[1]
+    return observed
+
+
+def run_auto_compile_watcher(
+    memory_home: Path | str,
+    token: str,
+    *,
+    coordinator: Callable[[Path, str, str], bool] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
+) -> bool:
+    """Wait for one owner lease and durably take over after it expires."""
+    from scripts.queue import QueueRepository
+
+    root = Path(memory_home).expanduser().resolve()
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    run_coordinator = coordinator or (
+        lambda target, owner_token, fingerprint: run_auto_compile_coordinator(
+            target, owner_token, fingerprint
+        )
+    )
+    while True:
+        observed_at = datetime.now(timezone.utc)
+        if lock_probe(root):
+            logging.debug("Automatic compile watcher observed a live child lock")
+        with QueueRepository(
+            config.queue_path, memory_home=root, sync_usage=False
+        ) as repository:
+            status, fingerprint = repository.poll_auto_compile_watcher(
+                token,
+                lambda reservation: _observe_auto_compile_content(
+                    root, dict(reservation)
+                ),
+                now=observed_at,
+                watcher_expires_at=observed_at
+                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                owner_expires_at=observed_at
+                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+            )
+        if status == "done":
+            return True
+        if status == "claimed":
+            assert fingerprint is not None
+            return run_coordinator(root, token, fingerprint)
+        sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
 
 
 def main():

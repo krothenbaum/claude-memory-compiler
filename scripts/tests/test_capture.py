@@ -1612,15 +1612,16 @@ def test_end_of_day_scheduler_requires_uncompiled_content_after_four_pm(
     assert len(launches) == 1
     command, options = launches[0]
     assert command[:2] == [sys.executable, str(scripts / "auto-compile.py")]
-    assert command[2] == str(root.resolve())
-    assert len(command[3]) == 64
+    assert command[2] == "owner"
+    assert command[3] == str(root.resolve())
     assert len(command[4]) == 64
+    assert len(command[5]) == 64
     assert options["env"]["AI_MEMORY_HOME"] == str(root.resolve())
     assert options["env"]["AI_MEMORY_INTERNAL_JOB"] == "1"
     assert options["env"]["AI_MEMORY_AUTO_COMPILE"] == "1"
 
 
-def test_end_of_day_scheduler_reserves_same_content_once_across_callers(
+def test_end_of_day_scheduler_adds_one_watcher_across_repeated_callers(
     tmp_path, monkeypatch
 ):
     root = tmp_path / "memory"
@@ -1641,9 +1642,10 @@ def test_end_of_day_scheduler_reserves_same_content_once_across_callers(
     now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
 
     assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
+    assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
     assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is False
 
-    assert len(launches) == 1
+    assert [launch[0][2] for launch in launches] == ["owner", "watcher"]
 
 
 def test_end_of_day_scheduler_releases_reservation_when_coordinator_spawn_fails(
@@ -1736,7 +1738,7 @@ def test_auto_compile_reservation_fingerprint_changes_with_uncompiled_content(
     )
     now = datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc)
     assert flush_module.maybe_trigger_compilation(memory_home=root, now=now) is True
-    first_token, first_fingerprint = commands[-1][3:5]
+    first_token, first_fingerprint = commands[-1][-2:]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         assert repository.release_auto_compile(first_token, first_fingerprint) is True
     daily.write_text("First content.\nSecond content.\n", encoding="utf-8")
@@ -1945,19 +1947,17 @@ def test_active_reservation_persists_latest_pending_fingerprint(
 
     daily.write_text("A\nB\n", encoding="utf-8")
     second = flush_module._uncompiled_fingerprint(daily)
-    assert _schedule_auto_compile(root) is False
+    assert _schedule_auto_compile(root) is True
     daily.write_text("A\nB\nC\n", encoding="utf-8")
     latest = flush_module._uncompiled_fingerprint(daily)
     assert _schedule_auto_compile(root) is False
 
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         reservation = _reservation(repository)
-    assert reservation == {
-        "expires_at": reservation["expires_at"],
-        "fingerprint": first,
-        "pending_fingerprint": latest,
-        "token": token,
-    }
+    assert reservation["fingerprint"] == first
+    assert reservation["pending_fingerprint"] == latest
+    assert reservation["token"] == token
+    assert reservation["watcher_token"] == commands[1][-1]
     assert latest != second != first
 
 
@@ -1970,7 +1970,7 @@ def test_coordinator_promotes_pending_when_baseline_changes_before_launch(
     assert _schedule_auto_compile(root) is True
     token, fingerprint = commands[0][-2:]
     daily.write_text("A\nB\n", encoding="utf-8")
-    assert _schedule_auto_compile(root) is False
+    assert _schedule_auto_compile(root) is True
     launches = []
 
     class SuccessfulCompile:
@@ -2008,7 +2008,7 @@ def test_coordinator_coalesces_multiple_appends_into_one_follow_up_compile(
         def wait(self, timeout=None):
             if self.generation == 1:
                 daily.write_text("A\nB\n", encoding="utf-8")
-                assert _schedule_auto_compile(root) is False
+                assert _schedule_auto_compile(root) is True
                 daily.write_text("A\nB\nC\n", encoding="utf-8")
                 assert _schedule_auto_compile(root) is False
                 daily.write_text(
@@ -2046,7 +2046,7 @@ def test_coordinator_does_not_follow_up_when_first_compile_covers_pending(
     class SuccessfulCompile:
         def wait(self, timeout=None):
             daily.write_text("A\nB\n", encoding="utf-8")
-            assert _schedule_auto_compile(root) is False
+            assert _schedule_auto_compile(root) is True
             daily.write_text(
                 "A\nB\n<!-- @compiled-through:all -->\n", encoding="utf-8"
             )
@@ -2080,7 +2080,7 @@ def test_coordinator_retries_new_generation_after_first_compile_failure(
         def wait(self, timeout=None):
             if self.generation == 1:
                 daily.write_text("A\nB\n", encoding="utf-8")
-                assert _schedule_auto_compile(root) is False
+                assert _schedule_auto_compile(root) is True
             return 1
 
     def launch(*_args, **_kwargs):
@@ -2107,7 +2107,7 @@ def test_coordinator_stops_handoff_when_new_queue_job_arrives(
     class SuccessfulCompile:
         def wait(self, timeout=None):
             daily.write_text("A\nB\n", encoding="utf-8")
-            assert _schedule_auto_compile(root) is False
+            assert _schedule_auto_compile(root) is True
             with QueueRepository(
                 root / "scripts/jobs.sqlite3", sync_usage=False
             ) as repository:
@@ -2191,6 +2191,544 @@ def test_auto_compile_handoff_reads_current_fingerprint_inside_transaction(tmp_p
             now=NOW + timedelta(seconds=1),
             expires_at=NOW + timedelta(seconds=6),
         ) == latest
+
+
+def test_completed_owner_promotes_pending_fingerprint_from_a_different_log(tmp_path):
+    token = "1" * 64
+    first = "a" * 64
+    pending = "b" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.request_auto_compile(
+            token,
+            first,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            "2" * 64,
+            pending,
+            log_name="2026-08-12.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == "watcher"
+
+        assert repository.finish_auto_compile_generation(
+            token,
+            first,
+            lambda: None,
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(seconds=7),
+        ) == pending
+        state = _reservation(repository)
+    assert state["fingerprint"] == pending
+    assert state["log_name"] == "2026-08-12.md"
+    assert "pending_fingerprint" not in state
+
+
+def test_residual_active_content_preserves_pending_fingerprint_for_next_log(tmp_path):
+    token = "1" * 64
+    first = "a" * 64
+    residual = "c" * 64
+    pending = "b" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.request_auto_compile(
+            token,
+            first,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            "2" * 64,
+            pending,
+            log_name="2026-08-12.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == "watcher"
+
+        assert repository.finish_auto_compile_generation(
+            token,
+            first,
+            lambda: residual,
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(seconds=7),
+        ) == residual
+        state = _reservation(repository)
+        assert state["pending_fingerprint"] == pending
+        assert state["pending_log_name"] == "2026-08-12.md"
+
+        assert repository.finish_auto_compile_generation(
+            token,
+            residual,
+            lambda: None,
+            now=NOW + timedelta(seconds=3),
+            expires_at=NOW + timedelta(seconds=8),
+        ) == pending
+
+
+def test_deferred_owner_promotes_pending_fingerprint_from_a_different_log(tmp_path):
+    token = "1" * 64
+    first = "a" * 64
+    pending = "b" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.request_auto_compile(
+            token,
+            first,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            "2" * 64,
+            pending,
+            log_name="2026-08-12.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == "watcher"
+
+        assert repository.defer_auto_compile_generation(
+            token,
+            first,
+            lambda: None,
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(seconds=7),
+        ) == pending
+        state = _reservation(repository)
+    assert state["fingerprint"] == pending
+    assert state["log_name"] == "2026-08-12.md"
+
+
+def test_exit_75_continues_with_promoted_pending_log_from_next_day(
+    tmp_path, monkeypatch
+):
+    root, first_log = _auto_compile_test_root(tmp_path)
+    second_log = root / "daily/2026-08-12.md"
+    second_log.write_text("B\n", encoding="utf-8")
+    first = flush_module._uncompiled_fingerprint(first_log)
+    pending = flush_module._uncompiled_fingerprint(second_log)
+    token = "1" * 64
+    lease_now = datetime.now(timezone.utc)
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert repository.request_auto_compile(
+            token,
+            first,
+            log_name=first_log.name,
+            now=lease_now,
+            expires_at=lease_now + timedelta(minutes=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            "2" * 64,
+            pending,
+            log_name=second_log.name,
+            now=lease_now + timedelta(seconds=1),
+            expires_at=lease_now + timedelta(minutes=5),
+        ) == "watcher"
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    launches = []
+
+    class CompileProcess:
+        def wait(self, timeout=None):
+            return 75
+
+    def defer(_seconds):
+        if len(launches) == 1:
+            first_log.write_text(
+                "A\n<!-- @compiled-through:first -->\n", encoding="utf-8"
+            )
+        else:
+            second_log.write_text(
+                "B\n<!-- @compiled-through:second -->\n", encoding="utf-8"
+            )
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        first,
+        compile_launcher=lambda *_args, **_kwargs: (
+            launches.append(True) or CompileProcess()
+        ),
+        sleeper=defer,
+        lock_probe=lambda _root: True,
+    )
+    assert launches == [True, True]
+
+
+def test_later_idle_drain_spawns_exactly_one_durable_watcher(tmp_path, monkeypatch):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\nC\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is False
+
+    assert [command[2] for command in commands] == ["owner", "watcher"]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        reservation = _reservation(repository)
+    assert reservation["pending_fingerprint"] == flush_module._uncompiled_fingerprint(
+        daily
+    )
+    assert reservation["watcher_token"] == commands[1][-1]
+
+
+def test_owner_or_watcher_role_is_selected_in_one_queue_transaction(tmp_path):
+    first = "a" * 64
+    latest = "b" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.request_auto_compile(
+            "1" * 64,
+            first,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            "2" * 64,
+            latest,
+            log_name="2026-08-11.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == "watcher"
+        assert repository.request_auto_compile(
+            "3" * 64,
+            latest,
+            log_name="2026-08-11.md",
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(seconds=7),
+        ) is None
+        state = _reservation(repository)
+    assert state["token"] == "1" * 64
+    assert state["watcher_token"] == "2" * 64
+    assert state["pending_fingerprint"] == latest
+
+
+def test_owner_spawn_failure_preserves_an_already_registered_watcher(tmp_path):
+    owner = "1" * 64
+    watcher = "2" * 64
+    fingerprint = "a" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.request_auto_compile(
+            owner,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        ) == "owner"
+        assert repository.request_auto_compile(
+            watcher,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == "watcher"
+
+        assert repository.fail_auto_compile_owner_spawn(
+            owner, fingerprint, now=NOW + timedelta(seconds=2)
+        )
+        state = _reservation(repository)
+    assert state["watcher_token"] == watcher
+    assert datetime.fromisoformat(state["expires_at"]) <= NOW + timedelta(seconds=2)
+
+
+def test_watcher_spawn_failure_clears_lease_but_keeps_pending_retryable(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    failures = [False, True, False]
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+
+    def spawn(command, **_options):
+        if failures.pop(0):
+            raise OSError("watcher spawn failed")
+        commands.append(command)
+
+    monkeypatch.setattr(flush_module.subprocess, "Popen", spawn)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is False
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        failed_state = _reservation(repository)
+    assert failed_state["pending_fingerprint"] == flush_module._uncompiled_fingerprint(
+        daily
+    )
+    assert "watcher_token" not in failed_state
+
+    assert _schedule_auto_compile(root) is True
+    assert [command[2] for command in commands] == ["owner", "watcher"]
+
+
+def test_expired_watcher_can_be_replaced_by_subsequent_idle_drain(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    first_watcher = commands[-1][-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["watcher_expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+    assert _schedule_auto_compile(root) is True
+    assert commands[-1][2] == "watcher"
+    assert commands[-1][-1] != first_watcher
+
+
+def test_watcher_takes_over_expired_owner_without_another_session(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    watcher_token = commands[-1][-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        state["watcher_expires_at"] = "2999-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+    takeovers = []
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watcher_token,
+        coordinator=lambda _root, token, fingerprint: (
+            takeovers.append((token, fingerprint)) or True
+        ),
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("expired owner should be claimed immediately")
+        ),
+        lock_probe=lambda _root: False,
+    )
+    assert takeovers == [(watcher_token, flush_module._uncompiled_fingerprint(daily))]
+
+
+def test_delayed_live_watcher_can_renew_if_its_token_was_not_replaced(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    watcher_token = commands[-1][-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        state["watcher_expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+    takeovers = []
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watcher_token,
+        coordinator=lambda _root, token, fingerprint: (
+            takeovers.append((token, fingerprint)) or True
+        ),
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("unreplaced watcher should reclaim immediately")
+        ),
+        lock_probe=lambda _root: False,
+    )
+    assert takeovers == [(watcher_token, flush_module._uncompiled_fingerprint(daily))]
+
+
+@pytest.mark.parametrize("resolution", ["marker", "lock_release"])
+def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resolution):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    launches = []
+    lock_held = [True]
+
+    class CompileProcess:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    def launch(*_args, **_kwargs):
+        launches.append(len(launches))
+        return CompileProcess(75 if len(launches) == 1 else 0)
+
+    def defer(_seconds):
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            state = _reservation(repository)
+        assert state["token"] == token
+        assert state["fingerprint"] == fingerprint
+        if resolution == "marker":
+            daily.write_text(
+                "A\n<!-- @compiled-through:orphan -->\n", encoding="utf-8"
+            )
+        else:
+            lock_held[0] = False
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=launch,
+        sleeper=defer,
+        lock_probe=lambda _root: lock_held[0],
+    )
+    assert launches == ([0] if resolution == "marker" else [0, 1])
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_watcher_exits_cleanly_when_owner_finishes_and_clears_reservation(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    watcher_token = commands[-1][-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        assert repository.release_auto_compile(
+            state["token"], state["fingerprint"]
+        )
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watcher_token,
+        coordinator=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("cleared watcher must not take over")
+        ),
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("cleared watcher must exit without polling")
+        ),
+        lock_probe=lambda _root: False,
+    )
+
+
+def test_watcher_exits_when_marker_covers_content_before_owner_lease_expires(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    watcher_token = commands[-1][-1]
+    daily.write_text(
+        "A\nB\n<!-- @compiled-through:owner -->\n", encoding="utf-8"
+    )
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watcher_token,
+        coordinator=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("covered content must not be taken over")
+        ),
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("covered watcher must exit immediately")
+        ),
+        lock_probe=lambda _root: True,
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is True
+    watcher_token = commands[-1][-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        state["watcher_expires_at"] = "2999-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+    launches = []
+
+    class LockedCompile:
+        def wait(self, timeout=None):
+            return 75
+
+    def deferred(_seconds):
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            assert _reservation(repository)["token"] == watcher_token
+        daily.write_text(
+            "A\nB\n<!-- @compiled-through:orphan -->\n", encoding="utf-8"
+        )
+
+    def takeover(target, token, fingerprint):
+        return flush_module.run_auto_compile_coordinator(
+            target,
+            token,
+            fingerprint,
+            compile_launcher=lambda *_args, **_kwargs: (
+                launches.append(True) or LockedCompile()
+            ),
+            sleeper=deferred,
+            lock_probe=lambda _root: True,
+        )
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watcher_token,
+        coordinator=takeover,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("expired owner should be claimed immediately")
+        ),
+        lock_probe=lambda _root: True,
+    )
+    assert launches == [True]
 
 
 def test_end_of_day_scheduler_rejects_symlinked_daily_log(tmp_path, monkeypatch):
