@@ -184,6 +184,7 @@ class QueueRepository:
         clock: Callable[[], datetime] = _utc_now,
         redaction_env: Mapping[str, str] | None = None,
         memory_home: Path | str | None = None,
+        sync_usage: bool = True,
     ) -> None:
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
@@ -218,7 +219,8 @@ class QueueRepository:
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._migrate()
             self._secure_database_files()
-            self._sync_usage_records()
+            if sync_usage:
+                self._sync_usage_records()
         except BaseException:
             self._connection.close()
             raise

@@ -511,6 +511,7 @@ def capture_transcript(
                     repository = QueueRepository(
                         queue_config.queue_path,
                         memory_home=queue_config.root_dir,
+                        sync_usage=False,
                         **repository_options,
                     )
                     break

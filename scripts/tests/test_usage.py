@@ -1038,6 +1038,58 @@ def test_custom_queue_projects_usage_only_to_canonical_memory_home(tmp_path):
     assert not (custom.parent / "logs").exists()
 
 
+def test_capture_safe_queue_open_defers_authoritative_attempt_projection(tmp_path):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(
+        queue_path, memory_home=home, clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository._append_attempt_usage = lambda _attempt_id: None
+        repository.record_attempt(job.job_id, _attempt())
+
+    usage_path = home / "scripts/logs/usage.jsonl"
+    assert not usage_path.exists()
+    with QueueRepository(
+        queue_path, memory_home=home, clock=lambda: NOW, sync_usage=False
+    ):
+        pass
+    assert not usage_path.exists()
+
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+
+    records = [json.loads(line) for line in usage_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["provider_attempt_id"] == 1
+
+
+def test_capture_safe_queue_open_defers_corrupt_usage_recovery(tmp_path):
+    home = tmp_path / "memory"
+    queue_path = home / "scripts/jobs.sqlite3"
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW) as repository:
+        job = repository.enqueue_capture(_session(home))
+        repository.record_attempt(job.job_id, _attempt())
+    usage_path = home / "scripts/logs/usage.jsonl"
+    usage_path.write_bytes(usage_path.read_bytes() + b'{"truncated":')
+
+    with QueueRepository(
+        queue_path, memory_home=home, clock=lambda: NOW, sync_usage=False
+    ):
+        pass
+
+    assert usage_path.read_bytes().endswith(b'{"truncated":')
+    assert list(usage_path.parent.glob("usage.corrupt-*.jsonl")) == []
+
+    with QueueRepository(queue_path, memory_home=home, clock=lambda: NOW):
+        pass
+
+    assert not usage_path.read_bytes().endswith(b'{"truncated":')
+    assert len(list(usage_path.parent.glob("usage.corrupt-*.jsonl"))) == 1
+
+
 @pytest.mark.parametrize("corruption", [b'{"broken":', b'{bad}\n'])
 def test_queue_reopen_quarantines_corrupt_usage_and_reprojects_once(tmp_path, corruption):
     home = tmp_path / "memory"

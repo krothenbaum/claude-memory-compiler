@@ -348,7 +348,11 @@ class MemoryWorker:
 def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     config = load_config(os.environ)
     recover_incomplete_apply(config.root_dir)
-    repository = QueueRepository(config.queue_path, memory_home=config.root_dir)
+    repository = QueueRepository(
+        config.queue_path,
+        memory_home=config.root_dir,
+        sync_usage=True,
+    )
     codex = CodexProvider(task_models=config.task_models)
     claude = ClaudeProvider(model=config.claude_model)
     worker = MemoryWorker(

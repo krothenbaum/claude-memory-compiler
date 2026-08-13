@@ -8,6 +8,7 @@ try:
 except ImportError:  # pragma: no cover - Windows exercises the msvcrt branch.
     fcntl = None
 import json
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -28,6 +29,8 @@ from capture import (
 )
 from providers import ProviderResult, ProviderRouter, RoutedResult, TaskKind
 from scripts.queue import QueueRepository
+from scripts.utils import ExclusiveFileLock
+import scripts.usage as usage_module
 from worker import MemoryWorker, SingletonDrainLock
 
 
@@ -1013,7 +1016,13 @@ def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypat
     repository = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(worker_module, "load_config", lambda _env: config)
     monkeypatch.setattr(worker_module, "recover_incomplete_apply", lambda _root: None)
-    monkeypatch.setattr(worker_module, "QueueRepository", lambda *_args, **_kwargs: repository)
+    repository_options = {}
+
+    def open_repository(*_args, **kwargs):
+        repository_options.update(kwargs)
+        return repository
+
+    monkeypatch.setattr(worker_module, "QueueRepository", open_repository)
     monkeypatch.setattr(worker_module, "CodexProvider", lambda **_kwargs: SimpleNamespace())
     monkeypatch.setattr(worker_module, "ClaudeProvider", lambda **_kwargs: SimpleNamespace())
 
@@ -1021,6 +1030,79 @@ def test_default_worker_consumes_configured_live_concurrency(tmp_path, monkeypat
 
     assert configured.concurrency == 3
     assert returned_repository is repository
+    assert repository_options["sync_usage"] is True
+
+
+def test_live_capture_queue_open_does_not_wait_for_usage_writer_lock(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    logs = home / "scripts" / "logs"
+    logs.mkdir(parents=True)
+    archive_payload = b'{}\n'
+    archive_digest = hashlib.sha256(archive_payload).hexdigest()
+    archive = logs / f"usage.archive-{archive_digest}.jsonl"
+    archive.write_bytes(archive_payload)
+    archive.chmod(0o600)
+    lock = ExclusiveFileLock(home / "scripts" / "memory-writer.lock")
+    assert lock.acquire()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        capture_transcript,
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        launcher=lambda _root: None,
+        env={},
+        deadline=time.monotonic() + 2.0,
+        monotonic=time.monotonic,
+        capture_token="writer-lock",
+    )
+    try:
+        result = future.result(timeout=0.5)
+    finally:
+        lock.release()
+        executor.shutdown(wait=True)
+
+    assert result.created is True
+
+
+def test_live_capture_queue_open_does_not_read_usage_archives(tmp_path, monkeypatch):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    home = tmp_path / "memory"
+    logs = home / "scripts" / "logs"
+    logs.mkdir(parents=True)
+    for index in range(3):
+        payload = json.dumps({"archive": index}, separators=(",", ":")).encode() + b"\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        archive = logs / f"usage.archive-{digest}.jsonl"
+        archive.write_bytes(payload)
+        archive.chmod(0o600)
+    observed: list[Path] = []
+    real_read = usage_module._read_private_log
+
+    def observe_read(path):
+        observed.append(Path(path))
+        return real_read(path)
+
+    monkeypatch.setattr(usage_module, "_read_private_log", observe_read)
+
+    result = capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=home,
+        launcher=lambda _root: None,
+        env={},
+        deadline=time.monotonic() + 2.0,
+        monotonic=time.monotonic,
+        capture_token="archive-scan",
+    )
+
+    assert result.created is True
+    assert not [path for path in observed if path.name.startswith("usage.archive-")]
 
 
 def test_cancelling_concurrent_drain_cancels_every_inflight_provider(tmp_path):
