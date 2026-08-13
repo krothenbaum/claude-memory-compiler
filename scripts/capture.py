@@ -300,12 +300,10 @@ def _publish_snapshot(temporary: Path, destination: Path) -> None:
 def _retain_failed_snapshot(
     temporary: Path,
     source_agent: str,
-    capture_token: str | None = None,
 ) -> None:
     digest = _snapshot_digest(temporary)
-    owner = f"-{capture_token}" if capture_token else ""
     destination = temporary.with_name(
-        f"failed-{source_agent}{owner}-{digest}.jsonl"
+        f"failed-{source_agent}-{digest}.jsonl"
     )
     _publish_snapshot(temporary, destination)
 
@@ -573,7 +571,7 @@ def capture_transcript(
         # A private snapshot is the recovery boundary even when parsing fails.
         if temporary.exists():
             try:
-                _retain_failed_snapshot(temporary, source_agent, capture_token)
+                _retain_failed_snapshot(temporary, source_agent)
             except Exception:
                 # Keep the already-private random temporary file when publishing fails.
                 pass

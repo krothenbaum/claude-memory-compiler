@@ -642,6 +642,79 @@ def test_parser_failure_retains_private_safe_snapshot_without_queue_or_launch(tm
     assert launched == []
 
 
+def test_identical_failed_captures_from_two_tokens_deduplicate(tmp_path):
+    source = tmp_path / "invalid.jsonl"
+    source.write_bytes(b'\xff{"private":"content"}\n')
+    home = tmp_path / "memory"
+
+    for token in ("first-token", "second-token"):
+        with pytest.raises(UnicodeDecodeError):
+            capture_transcript(
+                source,
+                source_agent="claude",
+                metadata={"trigger": "session_end"},
+                memory_home=home,
+                launcher=lambda _root: None,
+                env={},
+                capture_token=token,
+            )
+
+    retained = list((home / "scripts" / "spool").glob("failed-*.jsonl"))
+    assert len(retained) == 1
+    assert retained[0].name == (
+        f"failed-claude-{hashlib.sha256(source.read_bytes()).hexdigest()}.jsonl"
+    )
+    assert retained[0].stat().st_nlink == 1
+    assert stat.S_IMODE(retained[0].stat().st_mode) == 0o600
+
+
+def test_distinct_failed_capture_content_is_preserved(tmp_path):
+    home = tmp_path / "memory"
+    for index in range(2):
+        source = tmp_path / f"invalid-{index}.jsonl"
+        source.write_bytes(bytes([0xFF, index]))
+        with pytest.raises(UnicodeDecodeError):
+            capture_transcript(
+                source,
+                source_agent="claude",
+                metadata={"trigger": "session_end"},
+                memory_home=home,
+                launcher=lambda _root: None,
+                env={},
+                capture_token=f"token-{index}",
+            )
+
+    assert len(list((home / "scripts" / "spool").glob("failed-*.jsonl"))) == 2
+
+
+def test_failed_snapshot_collision_with_tampered_content_fails_safely(tmp_path):
+    source = tmp_path / "invalid.jsonl"
+    source.write_bytes(b"\xffprivate")
+    home = tmp_path / "memory"
+    spool = home / "scripts" / "spool"
+    spool.mkdir(parents=True)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    collision = spool / f"failed-claude-{digest}.jsonl"
+    collision.write_bytes(b"tampered")
+    collision.chmod(0o600)
+
+    with pytest.raises(UnicodeDecodeError):
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=home,
+            launcher=lambda _root: None,
+            env={},
+            capture_token="ordinary-failure",
+        )
+
+    assert collision.read_bytes() == b"tampered"
+    random_recovery = list(spool.glob("capture-ordinary-failure-*.jsonl"))
+    assert len(random_recovery) == 1
+    assert random_recovery[0].read_bytes() == source.read_bytes()
+
+
 def test_private_spool_copy_does_not_close_reused_descriptor(tmp_path, monkeypatch):
     source = tmp_path / "source.jsonl"
     write_claude_transcript(source)
