@@ -1480,9 +1480,17 @@ def test_agent_session_counter_includes_interactive_claude_and_codex_only(
             "102 claude /opt/sdk/_bundled/claude --print",
             "103 codex /usr/local/bin/codex",
             "104 codex /usr/local/bin/codex --ask-for-approval never exec "
-            "--ephemeral --output-last-message /tmp/output -",
+            "--skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules "
+            "--model gpt-5.6-luna --sandbox read-only --cd /tmp/project "
+            "--output-last-message /tmp/ai-memory-codex-abc/last-message.txt -",
             "105 codex /usr/local/bin/codex --prompt 'please exec this command'",
             "106 python /usr/bin/python worker.py --drain",
+            "107 codex /usr/local/bin/codex --ask-for-approval never exec "
+            "--skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules "
+            "--model gpt-5.6-terra --sandbox workspace-write --cd /tmp/project "
+            "--output-last-message "
+            "/tmp/project/.ai-memory-last-message-0123456789abcdef0123456789abcdef.txt "
+            "--output-schema /tmp/schema.json -",
         )
     )
     monkeypatch.setattr(
@@ -1494,6 +1502,49 @@ def test_agent_session_counter_includes_interactive_claude_and_codex_only(
     )
 
     assert flush_module.count_interactive_agent_sessions() == 3
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "--ask-for-approval never exec --ephemeral --output-last-message "
+        "/tmp/ai-memory-codex-abc/last-message.txt -",
+        "--ask-for-approval never exec --skip-git-repo-check --ephemeral "
+        "--ignore-user-config --ignore-rules --model gpt-5.6-luna "
+        "--sandbox read-only --cd /tmp/project --output-last-message /tmp/output -",
+        "--ask-for-approval never exec --skip-git-repo-check --ephemeral "
+        "--ignore-user-config --model gpt-5.6-luna --sandbox read-only "
+        "--cd /tmp/project --output-last-message "
+        "/tmp/ai-memory-codex-abc/last-message.txt -",
+        "--ask-for-approval never exec --skip-git-repo-check --ephemeral "
+        "--ignore-user-config --ignore-rules --model gpt-5.6-luna "
+        "--sandbox read-only --cd /tmp/project --output-last-message "
+        "/tmp/ai-memory-codex-abc/last-message.txt",
+        "--prompt 'imitate --ask-for-approval never exec --skip-git-repo-check "
+        "--ephemeral --ignore-user-config --ignore-rules --model gpt-5.6-luna "
+        "--sandbox read-only --cd /tmp/project --output-last-message "
+        "/tmp/ai-memory-codex-abc/last-message.txt -'",
+        "--ask-for-approval never exec --skip-git-repo-check --ephemeral "
+        "--ignore-user-config --ignore-rules --model gpt-5.6-terra "
+        "--sandbox workspace-write --cd /tmp/project --output-last-message "
+        "/tmp/elsewhere/.ai-memory-last-message-0123456789abcdef0123456789abcdef.txt -",
+    ],
+)
+def test_agent_session_counter_treats_partial_provider_shapes_as_interactive(
+    monkeypatch, arguments
+):
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"101 codex /usr/local/bin/codex {arguments}\n",
+            stderr="",
+        ),
+    )
+
+    assert flush_module.count_interactive_agent_sessions() == 1
 
 
 @pytest.mark.parametrize(
@@ -1843,6 +1894,303 @@ def test_auto_compile_reservation_renewal_prevents_overlap_and_expiry_recovers(
             now=NOW + timedelta(seconds=10),
             expires_at=NOW + timedelta(seconds=15),
         )
+
+
+def _auto_compile_test_root(tmp_path):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "scripts/auto-compile.py").write_text(
+        "# coordinator\n", encoding="utf-8"
+    )
+    daily = root / "daily/2026-08-11.md"
+    daily.write_text("A\n", encoding="utf-8")
+    return root, daily
+
+
+def _configure_auto_compile_test(monkeypatch, commands):
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: commands.append(command),
+    )
+
+
+def _schedule_auto_compile(root):
+    return flush_module.maybe_trigger_compilation(
+        memory_home=root,
+        now=datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc),
+    )
+
+
+def _reservation(repository):
+    row = repository._connection.execute(
+        "SELECT value FROM queue_metadata WHERE key = 'auto_compile_reservation'"
+    ).fetchone()
+    return json.loads(row["value"]) if row is not None else None
+
+
+def test_active_reservation_persists_latest_pending_fingerprint(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, first = commands[0][-2:]
+
+    daily.write_text("A\nB\n", encoding="utf-8")
+    second = flush_module._uncompiled_fingerprint(daily)
+    assert _schedule_auto_compile(root) is False
+    daily.write_text("A\nB\nC\n", encoding="utf-8")
+    latest = flush_module._uncompiled_fingerprint(daily)
+    assert _schedule_auto_compile(root) is False
+
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        reservation = _reservation(repository)
+    assert reservation == {
+        "expires_at": reservation["expires_at"],
+        "fingerprint": first,
+        "pending_fingerprint": latest,
+        "token": token,
+    }
+    assert latest != second != first
+
+
+def test_coordinator_promotes_pending_when_baseline_changes_before_launch(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    daily.write_text("A\nB\n", encoding="utf-8")
+    assert _schedule_auto_compile(root) is False
+    launches = []
+
+    class SuccessfulCompile:
+        def wait(self, timeout=None):
+            daily.write_text(
+                "A\nB\n<!-- @compiled-through:done -->\n", encoding="utf-8"
+            )
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: (
+            launches.append(True) or SuccessfulCompile()
+        ),
+    )
+    assert launches == [True]
+
+
+def test_coordinator_coalesces_multiple_appends_into_one_follow_up_compile(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    launches = []
+
+    class CompileProcess:
+        def __init__(self, generation):
+            self.generation = generation
+
+        def wait(self, timeout=None):
+            if self.generation == 1:
+                daily.write_text("A\nB\n", encoding="utf-8")
+                assert _schedule_auto_compile(root) is False
+                daily.write_text("A\nB\nC\n", encoding="utf-8")
+                assert _schedule_auto_compile(root) is False
+                daily.write_text(
+                    "A\n<!-- @compiled-through:first -->\nB\nC\n",
+                    encoding="utf-8",
+                )
+            else:
+                daily.write_text(
+                    "A\n<!-- @compiled-through:first -->\nB\nC\n"
+                    "<!-- @compiled-through:second -->\n",
+                    encoding="utf-8",
+                )
+            return 0
+
+    def launch(*_args, **_kwargs):
+        launches.append(len(launches) + 1)
+        return CompileProcess(launches[-1])
+
+    assert flush_module.run_auto_compile_coordinator(
+        root, token, fingerprint, compile_launcher=launch
+    )
+    assert launches == [1, 2]
+
+
+def test_coordinator_does_not_follow_up_when_first_compile_covers_pending(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    launches = []
+
+    class SuccessfulCompile:
+        def wait(self, timeout=None):
+            daily.write_text("A\nB\n", encoding="utf-8")
+            assert _schedule_auto_compile(root) is False
+            daily.write_text(
+                "A\nB\n<!-- @compiled-through:all -->\n", encoding="utf-8"
+            )
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: (
+            launches.append(True) or SuccessfulCompile()
+        ),
+    )
+    assert launches == [True]
+
+
+def test_coordinator_retries_new_generation_after_first_compile_failure(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    launches = []
+
+    class FailedCompile:
+        def __init__(self, generation):
+            self.generation = generation
+
+        def wait(self, timeout=None):
+            if self.generation == 1:
+                daily.write_text("A\nB\n", encoding="utf-8")
+                assert _schedule_auto_compile(root) is False
+            return 1
+
+    def launch(*_args, **_kwargs):
+        launches.append(len(launches) + 1)
+        return FailedCompile(launches[-1])
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root, token, fingerprint, compile_launcher=launch
+    )
+    assert launches == [1, 2]
+    assert _schedule_auto_compile(root) is True
+
+
+def test_coordinator_stops_handoff_when_new_queue_job_arrives(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = commands[0][-2:]
+    launches = []
+
+    class SuccessfulCompile:
+        def wait(self, timeout=None):
+            daily.write_text("A\nB\n", encoding="utf-8")
+            assert _schedule_auto_compile(root) is False
+            with QueueRepository(
+                root / "scripts/jobs.sqlite3", sync_usage=False
+            ) as repository:
+                enqueue_capture_job(
+                    repository, root, session_id="arrived-during-handoff"
+                )
+            daily.write_text(
+                "A\n<!-- @compiled-through:first -->\nB\n", encoding="utf-8"
+            )
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: (
+            launches.append(True) or SuccessfulCompile()
+        ),
+    )
+    assert launches == [True]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_expired_coordinator_with_pending_is_replaced_by_latest_reservation(tmp_path):
+    first_token = "1" * 64
+    replacement_token = "2" * 64
+    first = "a" * 64
+    pending = "b" * 64
+    latest = "c" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.reserve_auto_compile(
+            first_token,
+            first,
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        )
+        assert not repository.reserve_auto_compile(
+            "3" * 64,
+            pending,
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        )
+        assert repository.reserve_auto_compile(
+            replacement_token,
+            latest,
+            now=NOW + timedelta(seconds=6),
+            expires_at=NOW + timedelta(seconds=11),
+        )
+        assert _reservation(repository) == {
+            "expires_at": "2026-08-11T12:00:11.000000+00:00",
+            "fingerprint": latest,
+            "token": replacement_token,
+        }
+
+
+def test_auto_compile_handoff_reads_current_fingerprint_inside_transaction(tmp_path):
+    token = "1" * 64
+    first = "a" * 64
+    latest = "b" * 64
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        assert repository.reserve_auto_compile(
+            token,
+            first,
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=5),
+        )
+
+        def observe_current():
+            assert repository._connection.in_transaction
+            return latest
+
+        assert repository.finish_auto_compile_generation(
+            token,
+            first,
+            observe_current,
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=6),
+        ) == latest
 
 
 def test_end_of_day_scheduler_rejects_symlinked_daily_log(tmp_path, monkeypatch):

@@ -789,6 +789,22 @@ class QueueRepository:
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     existing_expiry = now_dt
                 if existing_expiry > now_dt:
+                    if (
+                        existing.get("fingerprint") != fingerprint
+                        and existing.get("pending_fingerprint") != fingerprint
+                    ):
+                        existing["pending_fingerprint"] = fingerprint
+                        self._connection.execute(
+                            "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                            (
+                                json.dumps(
+                                    existing,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                AUTO_COMPILE_RESERVATION_KEY,
+                            ),
+                        )
                     self._connection.execute("COMMIT")
                     return False
             reservation = json.dumps(
@@ -809,6 +825,183 @@ class QueueRepository:
             )
             self._connection.execute("COMMIT")
             return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def auto_compile_reservation(
+        self,
+        token: str,
+        *,
+        now: datetime | str | int | float,
+    ) -> tuple[str, str | None] | None:
+        """Return an owned, unexpired active and pending fingerprint pair."""
+        now_dt = _datetime(now)
+        row = self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            reservation = json.loads(row["value"])
+            unexpired = _datetime(reservation["expires_at"]) > now_dt
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        fingerprint = reservation.get("fingerprint")
+        pending = reservation.get("pending_fingerprint")
+        if (
+            reservation.get("token") != token
+            or not unexpired
+            or not isinstance(fingerprint, str)
+            or not self._valid_reservation_component(fingerprint)
+            or (
+                pending is not None
+                and (
+                    not isinstance(pending, str)
+                    or not self._valid_reservation_component(pending)
+                )
+            )
+        ):
+            return None
+        return fingerprint, pending
+
+    def promote_pending_auto_compile(
+        self,
+        token: str,
+        fingerprint: str,
+        pending_fingerprint: str,
+        *,
+        now: datetime | str | int | float,
+        expires_at: datetime | str | int | float,
+    ) -> bool:
+        """Promote the exact pending generation while the queue remains idle."""
+        now_dt = _datetime(now)
+        expires_dt = _datetime(expires_at)
+        if expires_dt <= now_dt:
+            raise ValueError("auto-compile reservation expiry must be in the future")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            reservation = {}
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+            try:
+                unexpired = _datetime(reservation["expires_at"]) > now_dt
+            except (KeyError, TypeError, ValueError):
+                unexpired = False
+            matched = (
+                reservation.get("token") == token
+                and reservation.get("fingerprint") == fingerprint
+                and reservation.get("pending_fingerprint") == pending_fingerprint
+            )
+            if not matched or not unexpired:
+                self._connection.execute("COMMIT")
+                return False
+            if self._active_work_unlocked():
+                self._connection.execute(
+                    "DELETE FROM queue_metadata WHERE key = ?",
+                    (AUTO_COMPILE_RESERVATION_KEY,),
+                )
+                self._connection.execute("COMMIT")
+                return False
+            reservation["fingerprint"] = pending_fingerprint
+            reservation.pop("pending_fingerprint", None)
+            reservation["expires_at"] = _stored_time(expires_dt)
+            self._connection.execute(
+                "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                (
+                    json.dumps(reservation, sort_keys=True, separators=(",", ":")),
+                    AUTO_COMPILE_RESERVATION_KEY,
+                ),
+            )
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def finish_auto_compile_generation(
+        self,
+        token: str,
+        fingerprint: str,
+        current_fingerprint: Callable[[], str | None],
+        *,
+        now: datetime | str | int | float,
+        expires_at: datetime | str | int | float,
+    ) -> str | None:
+        """Release a finished generation or atomically promote later content.
+
+        A pending fingerprint records that a later idle drain observed new
+        content. The compiler's marker changes the actual fingerprint, so the
+        post-compile fingerprint, rather than the stale pending value, becomes
+        the next generation. The callback reads that fingerprint while the
+        immediate transaction serializes the scheduler's reservation update.
+        """
+        now_dt = _datetime(now)
+        expires_dt = _datetime(expires_at)
+        if expires_dt <= now_dt:
+            raise ValueError("auto-compile reservation expiry must be in the future")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            reservation = {}
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+            matched = (
+                reservation.get("token") == token
+                and reservation.get("fingerprint") == fingerprint
+            )
+            if not matched:
+                self._connection.execute("COMMIT")
+                return None
+            if self._active_work_unlocked():
+                self._connection.execute(
+                    "DELETE FROM queue_metadata WHERE key = ?",
+                    (AUTO_COMPILE_RESERVATION_KEY,),
+                )
+                self._connection.execute("COMMIT")
+                return None
+            observed_fingerprint = current_fingerprint()
+            should_promote = (
+                observed_fingerprint is not None
+                and observed_fingerprint != fingerprint
+            )
+            if should_promote:
+                reservation["fingerprint"] = observed_fingerprint
+                reservation.pop("pending_fingerprint", None)
+                reservation["expires_at"] = _stored_time(expires_dt)
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return observed_fingerprint
+            self._connection.execute(
+                "DELETE FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            )
+            self._connection.execute("COMMIT")
+            return None
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")

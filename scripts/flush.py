@@ -243,6 +243,62 @@ AUTO_COMPILE_LEASE_SECONDS = 120
 AUTO_COMPILE_HEARTBEAT_SECONDS = 30
 
 
+class _AutoCompileContentChanged(RuntimeError):
+    pass
+
+
+def _is_memory_codex_provider_command(arguments: list[str]) -> bool:
+    """Recognize only the complete command emitted by ``CodexProvider``."""
+    if len(arguments) < 17:
+        return False
+    if arguments[1:8] != [
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+    ]:
+        return False
+    cursor = 8
+    values: dict[str, str] = {}
+    for option in ("--model", "--sandbox", "--cd", "--output-last-message"):
+        if arguments[cursor : cursor + 1] != [option] or cursor + 1 >= len(arguments):
+            return False
+        values[option] = arguments[cursor + 1]
+        cursor += 2
+    if arguments[cursor : cursor + 1] == ["--output-schema"]:
+        if cursor + 1 >= len(arguments):
+            return False
+        schema = Path(arguments[cursor + 1])
+        if not schema.is_absolute():
+            return False
+        cursor += 2
+    if arguments[cursor:] != ["-"]:
+        return False
+
+    workspace = Path(values["--cd"])
+    output = Path(values["--output-last-message"])
+    if not workspace.is_absolute() or not output.is_absolute() or not values["--model"]:
+        return False
+    if values["--sandbox"] == "read-only":
+        return (
+            output.name == "last-message.txt"
+            and output.parent.name.startswith("ai-memory-codex-")
+            and len(output.parent.name) > len("ai-memory-codex-")
+        )
+    if values["--sandbox"] == "workspace-write":
+        return (
+            output.parent == workspace
+            and re.fullmatch(
+                r"\.ai-memory-last-message-[0-9a-f]{32}\.txt", output.name
+            )
+            is not None
+        )
+    return False
+
+
 def count_interactive_agent_sessions() -> int:
     """Count interactive Claude Code and Codex CLI processes.
 
@@ -282,20 +338,7 @@ def count_interactive_agent_sessions() -> int:
             arguments = shlex.split(args)
         except ValueError:
             return -1
-        try:
-            exec_index = arguments.index("exec", 1)
-        except ValueError:
-            exec_index = -1
-        provider_shape = (
-            exec_index > 0
-            and arguments[exec_index - 2 : exec_index] == [
-                "--ask-for-approval",
-                "never",
-            ]
-            and "--ephemeral" in arguments[exec_index + 1 :]
-            and "--output-last-message" in arguments[exec_index + 1 :]
-        )
-        if provider_shape:
+        if _is_memory_codex_provider_command(arguments):
             continue
         count += 1
     return count
@@ -454,21 +497,13 @@ def run_auto_compile_coordinator(
     *,
     compile_launcher: Callable[..., Any] = subprocess.Popen,
 ) -> bool:
-    """Revalidate an idle reservation, run compile, and release the lease."""
+    """Run reserved generations serially until all observed content is covered."""
     from scripts.queue import QueueRepository
 
     root = Path(memory_home).expanduser().resolve()
     if not re.fullmatch(r"[0-9a-f]{64}", token):
         return False
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
-        return False
-    matching_logs = [
-        path
-        for path in sorted((root / "daily").glob("*.md"))
-        if _uncompiled_fingerprint(path) == fingerprint
-    ]
-    if len(matching_logs) != 1 or count_interactive_agent_sessions() != 0:
-        _release_auto_compile(root, token, fingerprint)
         return False
     compile_script = root / "scripts" / "compile.py"
     if not compile_script.is_file() or compile_script.is_symlink():
@@ -480,43 +515,97 @@ def run_auto_compile_coordinator(
     environment.pop("CLAUDE_MEMORY_HOME", None)
     config = load_config(environment)
     command = ["uv", "run", "--directory", str(root), "python", str(compile_script)]
-    launched = None
-    try:
-        with QueueRepository(
-            config.queue_path, memory_home=root, sync_usage=False
-        ) as repository:
-            def launch() -> object:
-                if _uncompiled_fingerprint(matching_logs[0]) != fingerprint:
-                    raise RuntimeError("daily content changed before compile launch")
-                with open_secure_log_stream(root / "scripts" / "compile.log") as log_handle:
-                    return compile_launcher(
-                        command, **_compile_process_options(root, log_handle)
-                    )
+    active_fingerprint = fingerprint
 
-            launched = repository.launch_reserved_auto_compile(
-                token,
-                fingerprint,
-                launch,
-                now=datetime.now(timezone.utc),
-            )
-        if launched is None:
-            return False
+    def matching_log(candidate: str) -> Path | None:
+        matches = [
+            path
+            for path in sorted((root / "daily").glob("*.md"))
+            if _uncompiled_fingerprint(path) == candidate
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    try:
         while True:
-            try:
-                return launched.wait(timeout=AUTO_COMPILE_HEARTBEAT_SECONDS) == 0
-            except subprocess.TimeoutExpired:
-                renewed_at = datetime.now(timezone.utc)
+            log_path = matching_log(active_fingerprint)
+            while log_path is None:
+                reservation_now = datetime.now(timezone.utc)
                 with QueueRepository(
                     config.queue_path, memory_home=root, sync_usage=False
                 ) as repository:
-                    renewed = repository.renew_auto_compile(
+                    reservation = repository.auto_compile_reservation(
+                        token, now=reservation_now
+                    )
+                    if reservation is None or reservation[0] != active_fingerprint:
+                        return False
+                    pending_fingerprint = reservation[1]
+                    if pending_fingerprint is None:
+                        return False
+                    pending_log = matching_log(pending_fingerprint)
+                    if pending_log is None:
+                        return False
+                    promoted = repository.promote_pending_auto_compile(
                         token,
-                        fingerprint,
-                        now=renewed_at,
-                        expires_at=renewed_at
+                        active_fingerprint,
+                        pending_fingerprint,
+                        now=reservation_now,
+                        expires_at=reservation_now
                         + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
                     )
-                if not renewed:
+                if promoted:
+                    active_fingerprint = pending_fingerprint
+                    log_path = pending_log
+
+            if count_interactive_agent_sessions() != 0:
+                return False
+
+            with QueueRepository(
+                config.queue_path, memory_home=root, sync_usage=False
+            ) as repository:
+                def launch() -> object:
+                    if _uncompiled_fingerprint(log_path) != active_fingerprint:
+                        raise _AutoCompileContentChanged(
+                            "daily content changed before compile launch"
+                        )
+                    with open_secure_log_stream(
+                        root / "scripts" / "compile.log"
+                    ) as log_handle:
+                        return compile_launcher(
+                            command, **_compile_process_options(root, log_handle)
+                        )
+
+                try:
+                    launched = repository.launch_reserved_auto_compile(
+                        token,
+                        active_fingerprint,
+                        launch,
+                        now=datetime.now(timezone.utc),
+                    )
+                except _AutoCompileContentChanged:
+                    continue
+            if launched is None:
+                return False
+
+            while True:
+                try:
+                    return_code = launched.wait(
+                        timeout=AUTO_COMPILE_HEARTBEAT_SECONDS
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    renewed_at = datetime.now(timezone.utc)
+                    with QueueRepository(
+                        config.queue_path, memory_home=root, sync_usage=False
+                    ) as repository:
+                        renewed = repository.renew_auto_compile(
+                            token,
+                            active_fingerprint,
+                            now=renewed_at,
+                            expires_at=renewed_at
+                            + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                        )
+                    if renewed:
+                        continue
                     launched.terminate()
                     try:
                         launched.wait(timeout=5)
@@ -524,11 +613,27 @@ def run_auto_compile_coordinator(
                         launched.kill()
                         launched.wait()
                     return False
+
+            handoff_at = datetime.now(timezone.utc)
+            with QueueRepository(
+                config.queue_path, memory_home=root, sync_usage=False
+            ) as repository:
+                next_fingerprint = repository.finish_auto_compile_generation(
+                    token,
+                    active_fingerprint,
+                    lambda: _uncompiled_fingerprint(log_path),
+                    now=handoff_at,
+                    expires_at=handoff_at
+                    + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                )
+            if next_fingerprint is None:
+                return return_code == 0
+            active_fingerprint = next_fingerprint
     except Exception as exc:
         logging.error("Automatic compile failed: %s", exc)
         return False
     finally:
-        _release_auto_compile(root, token, fingerprint)
+        _release_auto_compile(root, token, active_fingerprint)
 
 
 def main():
