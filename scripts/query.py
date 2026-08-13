@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from usage import record_routed_usage, routed_invalid_output
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _STATE_UPDATE_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
 
 
 def _state_with_baseline(home: Path) -> tuple[dict, FileBaseline]:
@@ -308,8 +310,11 @@ async def run_query(
     if not file_back:
         try:
             _apply_query_state(home)
-        except RetryableApplyError as exc:
-            return f"Error querying knowledge base: {exc}"
+        except RetryableApplyError:
+            logger.warning(
+                "query count bookkeeping conflicted after %d attempts",
+                _STATE_UPDATE_ATTEMPTS,
+            )
     return answer
 
 

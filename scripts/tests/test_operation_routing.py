@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -205,17 +206,30 @@ def test_query_state_cas_retries_without_losing_concurrent_update(memory_home: P
     assert calls == 2
 
 
-def test_query_state_cas_exhaustion_preserves_root(memory_home: Path, monkeypatch):
-    router = RecordingTextRouter("answer")
+def test_query_state_cas_exhaustion_preserves_root(
+    memory_home: Path, monkeypatch, caplog
+):
+    answer = "PRIVATE_PROVIDER_ANSWER"
+    question = "PRIVATE_USER_QUESTION"
+    router = RecordingTextRouter(answer)
     before = (memory_home / "scripts/state.json").read_bytes()
     monkeypatch.setattr(
         query,
         "apply_host_bookkeeping",
         lambda *_args: (_ for _ in ()).throw(RetryableApplyError("race")),
     )
-    result = asyncio.run(query.run_query("race?", router=router, memory_home=memory_home))
-    assert result.startswith("Error querying knowledge base:")
+    with caplog.at_level(logging.WARNING, logger=query.__name__):
+        result = asyncio.run(
+            query.run_query(question, router=router, memory_home=memory_home)
+        )
+
+    assert result == answer
     assert (memory_home / "scripts/state.json").read_bytes() == before
+    assert len(caplog.records) == 1
+    warning = caplog.records[0].getMessage()
+    assert warning == "query count bookkeeping conflicted after 3 attempts"
+    assert question not in warning
+    assert answer not in warning
 
 
 @pytest.mark.parametrize("file_back", [False, True])
