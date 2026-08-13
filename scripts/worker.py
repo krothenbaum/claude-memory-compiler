@@ -8,6 +8,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
+import logging
 import os
 from pathlib import Path
 import random
@@ -33,7 +34,7 @@ from scripts.providers import (
 from scripts.queue import Job, QueueRepository
 from scripts.staging import recover_incomplete_apply
 from scripts.utils import ExclusiveFileLock, append_daily_entry
-from scripts.flush import build_flush_prompt
+from scripts.flush import build_flush_prompt, maybe_trigger_compilation
 
 
 def _utc_now() -> datetime:
@@ -96,6 +97,7 @@ class MemoryWorker:
         heartbeat_sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         concurrency: int = 1,
         startup_recovery: Callable[[], object] | None = None,
+        end_of_day_scheduler: Callable[[], object] | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -126,6 +128,7 @@ class MemoryWorker:
         self.heartbeat_sleeper = heartbeat_sleeper
         self.concurrency = concurrency
         self.startup_recovery = startup_recovery
+        self.end_of_day_scheduler = end_of_day_scheduler
         self._writer_lock = asyncio.Lock()
 
     def _now(self) -> datetime:
@@ -257,7 +260,7 @@ class MemoryWorker:
 
         await self._run_serialized_with_lease(job.id, retry)
 
-    async def process(self, job: Job) -> None:
+    async def process(self, job: Job) -> bool:
         try:
             request = TextRequest(
                 task=TaskKind.EXTRACT,
@@ -280,10 +283,11 @@ class MemoryWorker:
                 await self._retry_failure(
                     job, self._failure_reason(result), attempts
                 )
-                return
+                return False
             await self._complete_success(job, result.text, attempts)
+            return True
         except LeaseLostError:
-            return
+            return False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -294,11 +298,15 @@ class MemoryWorker:
                         current, str(exc) or type(exc).__name__
                     )
                 except LeaseLostError:
-                    return
+                    return False
+            return False
 
-    async def _drain(self, release_if_idle: Callable[[], None] | None) -> int:
+    async def _drain(
+        self, release_if_idle: Callable[[], None] | None
+    ) -> tuple[int, bool]:
         processed = 0
-        active: set[asyncio.Task[None]] = set()
+        wrote_daily_entry = False
+        active: set[asyncio.Task[bool]] = set()
         try:
             while True:
                 self.queue.recover_stale(self._now())
@@ -314,16 +322,16 @@ class MemoryWorker:
                         active, return_when=asyncio.FIRST_COMPLETED
                     )
                     for task in done:
-                        await task
+                        wrote_daily_entry = await task or wrote_daily_entry
                         processed += 1
                     continue
 
                 wake_at = self.queue.next_wake_at()
                 if wake_at is None:
                     if release_if_idle is None:
-                        return processed
+                        return processed, wrote_daily_entry
                     if self.queue.release_worker_lock_if_idle(release_if_idle):
-                        return processed
+                        return processed, wrote_daily_entry
                     continue
                 delay = max(0.0, (wake_at - self._now()).total_seconds())
                 await self.sleeper(min(delay, self.max_idle_sleep_seconds))
@@ -335,7 +343,8 @@ class MemoryWorker:
                     await task
 
     async def drain(self) -> int:
-        return await self._drain(None)
+        processed, _ = await self._drain(None)
+        return processed
 
     async def run_drain(self) -> int:
         lock = SingletonDrainLock(self.lock_path)
@@ -345,7 +354,17 @@ class MemoryWorker:
             if self.startup_recovery is not None:
                 self.startup_recovery()
             self.queue.sync_usage_records()
-            return await self._drain(lock.release)
+            processed, wrote_daily_entry = await self._drain(lock.release)
+            if wrote_daily_entry and self.end_of_day_scheduler is not None:
+                try:
+                    outcome = self.end_of_day_scheduler()
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                except Exception:
+                    # Extraction is already durable. Scheduling is best effort
+                    # and must not turn a successful queue job into a failure.
+                    logging.exception("End-of-day compilation scheduling failed")
+            return processed
         finally:
             lock.release()
 
@@ -369,6 +388,9 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
         provider_timeout_seconds=config.job_timeout_seconds,
         concurrency=config.worker_concurrency,
         startup_recovery=lambda: recover_incomplete_apply(config.root_dir),
+        end_of_day_scheduler=lambda: maybe_trigger_compilation(
+            memory_home=config.root_dir
+        ),
     )
     return worker, repository
 

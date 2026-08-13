@@ -21,6 +21,7 @@ import time
 import pytest
 
 import capture as capture_module
+import flush as flush_module
 from capture import (
     CaptureDeadlineExceeded,
     capture_transcript,
@@ -1365,6 +1366,273 @@ def test_worker_dispatches_success_and_records_every_attempt(tmp_path):
         assert writes == [(queued.job_id, "daily")]
         assert repository.get_job(queued.job_id).status == "succeeded"
         assert [a.provider for a in repository.attempts_for(queued.job_id)] == ["codex", "claude"]
+
+
+def test_worker_triggers_end_of_day_scheduler_once_after_successful_idle_drain(
+    tmp_path,
+):
+    lock_path = tmp_path / "memory-worker.lock"
+    scheduled = []
+
+    def schedule_after_release():
+        contender = SingletonDrainLock(lock_path)
+        acquired = contender.acquire()
+        scheduled.append(acquired)
+        if acquired:
+            contender.release()
+
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        enqueue_capture_job(repository, tmp_path)
+        success = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+        )
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(success)),
+            daily_writer=lambda *_: None,
+            clock=lambda: NOW,
+            owner="worker",
+            lock_path=lock_path,
+            end_of_day_scheduler=schedule_after_release,
+        )
+
+        assert asyncio.run(worker.run_drain()) == 1
+
+    assert scheduled == [True]
+
+
+def test_worker_does_not_trigger_end_of_day_scheduler_without_successful_write(
+    tmp_path,
+):
+    scheduled = []
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3",
+        clock=lambda: NOW,
+        max_attempts=1,
+        sync_usage=False,
+    ) as repository:
+        enqueue_capture_job(repository, tmp_path)
+        failure = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "capacity", reason="full"
+        )
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(failure)),
+            daily_writer=lambda *_: (_ for _ in ()).throw(
+                AssertionError("must not write")
+            ),
+            clock=lambda: NOW,
+            owner="worker",
+            lock_path=tmp_path / "memory-worker.lock",
+            end_of_day_scheduler=lambda: scheduled.append(True),
+        )
+
+        assert asyncio.run(worker.run_drain()) == 1
+
+    assert scheduled == []
+
+
+def test_worker_does_not_schedule_while_retry_work_remains(tmp_path):
+    async def exercise(repository):
+        enqueue_capture_job(repository, tmp_path)
+        failure = ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "capacity", reason="full"
+        )
+        waiting = asyncio.Event()
+        keep_waiting = asyncio.Event()
+        scheduled = []
+
+        async def blocked_retry_sleep(_seconds):
+            waiting.set()
+            await keep_waiting.wait()
+
+        worker = MemoryWorker(
+            repository,
+            FakeRouter(routed(failure)),
+            daily_writer=lambda *_: None,
+            clock=lambda: NOW,
+            owner="worker",
+            lock_path=tmp_path / "memory-worker.lock",
+            sleeper=blocked_retry_sleep,
+            end_of_day_scheduler=lambda: scheduled.append(True),
+        )
+        draining = asyncio.create_task(worker.run_drain())
+        await asyncio.wait_for(waiting.wait(), timeout=0.5)
+        assert scheduled == []
+        draining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        asyncio.run(exercise(repository))
+
+
+def test_agent_session_counter_includes_interactive_claude_and_codex_only(
+    monkeypatch,
+):
+    process_table = "\n".join(
+        (
+            "101 claude /usr/local/bin/claude --resume session-1",
+            "102 claude /opt/sdk/_bundled/claude --print",
+            "103 codex /usr/local/bin/codex",
+            "104 codex /usr/local/bin/codex exec --ephemeral -",
+            "105 python /usr/bin/python worker.py --drain",
+        )
+    )
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=process_table, stderr=""
+        ),
+    )
+
+    assert flush_module.count_interactive_agent_sessions() == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("missing"),
+        subprocess.TimeoutExpired(["ps"], 5),
+        OSError("unavailable"),
+    ],
+)
+def test_agent_session_counter_fails_closed_when_process_inspection_fails(
+    monkeypatch, failure
+):
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(flush_module.subprocess, "run", fail)
+
+    assert flush_module.count_interactive_agent_sessions() == -1
+
+
+def test_end_of_day_scheduler_requires_uncompiled_content_after_four_pm(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "memory"
+    scripts = root / "scripts"
+    daily = root / "daily"
+    scripts.mkdir(parents=True)
+    daily.mkdir()
+    (scripts / "compile.py").write_text("# compiler\n", encoding="utf-8")
+    log_path = daily / "2026-08-11.md"
+    log_path.write_text(
+        "# Daily\n\n<!-- @compiled-through:2026-08-11T16:01:00-07:00 -->\n",
+        encoding="utf-8",
+    )
+    launches = []
+    monkeypatch.setattr(
+        flush_module, "count_interactive_agent_sessions", lambda: 0
+    )
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **options: launches.append((command, options)),
+    )
+
+    assert (
+        flush_module.maybe_trigger_compilation(
+            memory_home=root,
+            now=datetime(2026, 8, 11, 16, 30, tzinfo=timezone.utc),
+        )
+        is False
+    )
+    log_path.write_text(log_path.read_text() + "New session content.\n", encoding="utf-8")
+    assert (
+        flush_module.maybe_trigger_compilation(
+            memory_home=root,
+            now=datetime(2026, 8, 11, 16, 31, tzinfo=timezone.utc),
+        )
+        is True
+    )
+
+    assert len(launches) == 1
+    command, options = launches[0]
+    assert command == [
+        "uv",
+        "run",
+        "--directory",
+        str(root.resolve()),
+        "python",
+        str(scripts / "compile.py"),
+    ]
+    assert options["env"]["AI_MEMORY_HOME"] == str(root.resolve())
+    assert options["env"]["AI_MEMORY_INTERNAL_JOB"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("hour", "sessions"),
+    [(15, 0), (16, 1), (16, -1)],
+)
+def test_end_of_day_scheduler_skips_before_four_or_with_active_or_unknown_sessions(
+    tmp_path, monkeypatch, hour, sessions
+):
+    root = tmp_path / "memory"
+    (root / "scripts").mkdir(parents=True)
+    (root / "daily").mkdir()
+    (root / "scripts/compile.py").write_text("# compiler\n", encoding="utf-8")
+    (root / "daily/2026-08-11.md").write_text("Uncompiled content.\n", encoding="utf-8")
+    monkeypatch.setattr(
+        flush_module, "count_interactive_agent_sessions", lambda: sessions
+    )
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not launch")
+        ),
+    )
+
+    assert (
+        flush_module.maybe_trigger_compilation(
+            memory_home=root,
+            now=datetime(2026, 8, 11, hour, 30, tzinfo=timezone.utc),
+        )
+        is False
+    )
+
+
+def test_legacy_flush_does_not_schedule_after_failed_extraction(
+    tmp_path, monkeypatch
+):
+    context = tmp_path / "context.md"
+    context.write_text("User: remember this", encoding="utf-8")
+    scheduled = []
+
+    async def failed_flush(*_args, **_kwargs):
+        return "FLUSH_ERROR: provider unavailable"
+
+    monkeypatch.setenv("AI_MEMORY_INTERNAL_JOB", "1")
+    monkeypatch.setenv("CLAUDE_INVOKED_BY", "test")
+    monkeypatch.setattr(flush_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(flush_module, "load_flush_state", lambda: {})
+    monkeypatch.setattr(flush_module, "run_flush", failed_flush)
+    monkeypatch.setattr(flush_module, "append_to_daily_log", lambda *_args: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(
+        flush_module,
+        "maybe_trigger_compilation",
+        lambda **_kwargs: scheduled.append(True),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["flush.py", str(context), "session-1", "project", str(tmp_path)],
+    )
+
+    flush_module.main()
+
+    assert scheduled == []
+    assert context.exists()
 
 
 def test_worker_retries_after_both_providers_fail_and_retains_spool(tmp_path):

@@ -14,7 +14,7 @@ Codex SessionEnd --------------------/                           |
                                            Codex (ChatGPT login) --> Claude fallback
                                                                  |
                                                                  v
-                                        daily/ --> staged compile --> knowledge/
+                          daily/ --> end-of-day staged compile --> knowledge/
 
 Claude Code / Codex SessionStart --> local index and recent-log context
 ```
@@ -22,6 +22,8 @@ Claude Code / Codex SessionStart --> local index and recent-log context
 Hooks perform local parsing and enqueue work; they never call a model. The worker prefers Codex, uses `gpt-5.6-luna` for extraction and semantic lint, and uses `gpt-5.6-terra` for synthesis and staged edits. If Codex authentication, capacity, timeout, command execution, output validation, or staged validation fails, the same job falls back to the subscription-backed Claude Agent SDK. Provider attempts and fallback reasons remain available in the queue and usage log.
 
 All model-driven edits happen in disposable staging directories. Host Python validates each stage and applies approved files under one writer lock with a recovery journal. Models never write directly to the real knowledge base.
+
+After 4 PM local time, a live worker that appended at least one daily entry waits for the queue to become idle, then checks for uncompiled content in today's log. It starts one detached compile only when no interactive Claude Code or Codex session remains. Failed extraction, queued or retrying work, an existing compiled-through marker with no later content, and unavailable process inspection all suppress the automatic compile. The manual `compile.py` command remains available.
 
 ## Requirements and Authentication
 

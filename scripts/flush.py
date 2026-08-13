@@ -16,6 +16,9 @@ import os
 import asyncio
 import json
 import logging
+import re
+import shlex
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -42,6 +45,7 @@ from providers import (  # noqa: E402
     TaskKind,
     TextRequest,
 )
+
 
 class _SecureLogHandler(logging.StreamHandler):
     def flush(self) -> None:
@@ -233,31 +237,22 @@ async def run_flush(
 COMPILE_AFTER_HOUR = 16  # 4 PM local time
 
 
-def count_claude_instances() -> int:
-    """Count running Claude Code CLI processes, excluding the bundled `claude`
-    binary that flush.py itself spawns via the Agent SDK.
+def count_interactive_agent_sessions() -> int:
+    """Count interactive Claude Code and Codex CLI processes.
 
-    Concurrent flush.py runs each launch
-    a private bundled `claude` binary as a child during the LLM
-    call. `pgrep -x claude` cannot distinguish that from a real Claude Code
-    session — and on macOS `pgrep -a` does not emit the full command line —
-    so we shell out to `ps` and inspect each process's argv for the bundled
-    path.
-
-    Returns -1 if `ps` is unavailable or fails (caller should treat as
-    unknown and skip, to avoid running compile while other sessions are
-    still active).
+    Provider children are not interactive sessions. Claude's Agent SDK uses a
+    bundled ``claude`` binary, while Codex provider calls use the ``exec``
+    subcommand. Return ``-1`` when process inspection is unavailable or cannot
+    be parsed safely so callers can fail closed.
     """
-    import subprocess as _sp
-
     try:
-        result = _sp.run(
+        result = subprocess.run(
             ["ps", "-A", "-o", "pid=,comm=,args="],
             capture_output=True,
             text=True,
             timeout=5,
         )
-    except (FileNotFoundError, _sp.TimeoutExpired, OSError):
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return -1
     if result.returncode != 0:
         return -1
@@ -269,67 +264,84 @@ def count_claude_instances() -> int:
             continue
         comm = parts[1]
         args = parts[2] if len(parts) > 2 else ""
-        if comm.rsplit("/", 1)[-1] != "claude":
+        command = comm.rsplit("/", 1)[-1].lower()
+        if command == "claude":
+            if "/_bundled/claude" in args.replace("\\", "/"):
+                continue
+            count += 1
             continue
-        if "/_bundled/claude" in args:
+        if command != "codex":
+            continue
+        try:
+            arguments = shlex.split(args)
+        except ValueError:
+            return -1
+        if "exec" in arguments[1:]:
             continue
         count += 1
     return count
 
 
-def maybe_trigger_compilation() -> None:
-    """If it's past the compile hour, no other Claude instances are open, and
-    today's log hasn't been compiled, run compile.py."""
-    import subprocess as _sp
+def maybe_trigger_compilation(
+    *,
+    memory_home: Path | str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Start one detached compile when the local end-of-day gates pass."""
+    root = (
+        Path(memory_home).expanduser().resolve()
+        if memory_home is not None
+        else ROOT
+    )
+    scripts_dir = root / "scripts"
+    daily_dir = root / "daily"
+    local_now = now or datetime.now(timezone.utc).astimezone()
+    if local_now.hour < COMPILE_AFTER_HOUR:
+        return False
 
-    now = datetime.now(timezone.utc).astimezone()
-    if now.hour < COMPILE_AFTER_HOUR:
-        return
-
-    # Only compile when no Claude Code instances are still open. flush.py is a
-    # detached background subprocess, so the session that triggered it has
-    # typically exited by now; any remaining `claude` processes are other
-    # active sessions we should not interrupt.
-    instances = count_claude_instances()
+    instances = count_interactive_agent_sessions()
     if instances != 0:
         if instances < 0:
-            logging.info("Skipping compile: pgrep unavailable, cannot verify no Claude instances open")
+            logging.info(
+                "Skipping compile: cannot verify that Claude and Codex sessions are closed"
+            )
         else:
-            logging.info("Skipping compile: %d Claude instance(s) still open", instances)
-        return
+            logging.info(
+                "Skipping compile: %d interactive Claude/Codex session(s) still open",
+                instances,
+            )
+        return False
 
     # Skip if today's log has no unprocessed content past its last
     # `@compiled-through` marker. This is the source of truth — state.json
     # hash is incidental. Lets us auto-fire any number of times per day,
     # processing only the new sessions each time.
-    today_log = f"{now.strftime('%Y-%m-%d')}.md"
-    log_path = DAILY_DIR / today_log
-    if log_path.exists():
-        try:
-            content = log_path.read_text(encoding="utf-8")
-        except OSError:
-            content = ""
-        if content:
-            # Inline regex to avoid importing compile.py (which loads the Agent SDK).
-            import re as _re
-            marker_re = _re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
-            last_end = 0
-            for m in marker_re.finditer(content):
-                last_end = m.end()
-            if not content[last_end:].strip():
-                return  # nothing new since the last compile marker
+    today_log = f"{local_now.strftime('%Y-%m-%d')}.md"
+    log_path = daily_dir / today_log
+    try:
+        content = log_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    marker_re = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
+    last_end = 0
+    for marker in marker_re.finditer(content):
+        last_end = marker.end()
+    if not content[last_end:].strip():
+        return False
 
-    compile_script = SCRIPTS_DIR / "compile.py"
-    if not compile_script.exists():
-        return
+    compile_script = scripts_dir / "compile.py"
+    if not compile_script.is_file() or compile_script.is_symlink():
+        return False
 
     logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
 
-    cmd = ["uv", "run", "--directory", str(ROOT), "python", str(compile_script)]
+    cmd = ["uv", "run", "--directory", str(root), "python", str(compile_script)]
 
     kwargs: dict = {}
     if sys.platform == "win32":
-        kwargs["creationflags"] = _sp.CREATE_NEW_PROCESS_GROUP | _sp.DETACHED_PROCESS
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
     else:
         kwargs["start_new_session"] = True
 
@@ -337,23 +349,30 @@ def maybe_trigger_compilation() -> None:
     # it can write progress messages even though `start_new_session=True`
     # severs /dev/tty access.
     env = os.environ.copy()
+    env["AI_MEMORY_HOME"] = str(root)
+    env.pop("CLAUDE_MEMORY_HOME", None)
+    env["AI_MEMORY_INTERNAL_JOB"] = "1"
     tty_path = _resolve_tty_path()
     if tty_path:
         env["CLAUDE_MEMORY_TTY"] = tty_path
 
     try:
-        log_handle = open(str(SCRIPTS_DIR / "compile.log"), "a")
-        _sp.Popen(
-            cmd,
-            stdout=log_handle,
-            stderr=_sp.STDOUT,
-            cwd=str(ROOT),
-            env=env,
-            **kwargs,
-        )
+        with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                cwd=str(root),
+                env=env,
+                close_fds=True,
+                **kwargs,
+            )
         notify_terminal("end-of-day compile triggered")
-    except Exception as e:
-        logging.error("Failed to spawn compile.py: %s", e)
+        return True
+    except Exception as exc:
+        logging.error("Failed to spawn compile.py: %s", exc)
+        return False
 
 
 def main():
@@ -426,7 +445,6 @@ def main():
         # file, which would defeat an immediate retry.
         logging.error("Context file preserved for retry: %s", context_file)
         notify_terminal(f"flush FAILED — context preserved at {context_file.name}")
-        maybe_trigger_compilation()
         return
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
