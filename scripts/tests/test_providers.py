@@ -227,6 +227,7 @@ def test_codex_attempt_uses_one_aggregate_deadline(tmp_path):
     )
 
     assert result.outcome == "success"
+    assert result.elapsed_ms == 1200
     budgets = [call[1]["timeout_seconds"] for call in runner.calls]
     assert budgets == pytest.approx([1.0, 0.6, 0.2])
     assert sum(budgets) < 2

@@ -470,7 +470,7 @@ class CodexProvider:
             task=request.task,
             outcome=outcome,
             text=text,
-            elapsed_ms=max(0, round((time.monotonic() - started) * 1000)),
+            elapsed_ms=max(0, round((self._monotonic() - started) * 1000)),
             reason=reason,
         )
 
