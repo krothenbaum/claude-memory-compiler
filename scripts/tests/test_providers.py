@@ -194,6 +194,22 @@ def test_codex_preflight_timeout_reason_identifies_operation(
     assert len(runner.calls) == call_count
 
 
+def test_codex_preflight_uses_small_dedicated_timeouts(fake_runner, tmp_path):
+    request = TextRequest(TaskKind.QUERY, "answer this", tmp_path, 60)
+    runner = fake_runner(_chatgpt_login(), _write_codex_output("answer"))
+
+    result = _run(_codex_provider(runner).generate_text(request))
+
+    assert result.outcome == "success"
+    assert runner.calls[0][0] == ["codex", "--version"]
+    assert runner.calls[0][1]["timeout_seconds"] == 5
+    assert runner.calls[0][1]["terminate_process_group_on_timeout"] is True
+    assert runner.calls[1][0] == ["codex", "login", "status"]
+    assert runner.calls[1][1]["timeout_seconds"] == 5
+    assert runner.calls[1][1]["terminate_process_group_on_timeout"] is True
+    assert runner.calls[2][1]["timeout_seconds"] == request.timeout_seconds
+
+
 def _run(awaitable):
     return asyncio.run(awaitable)
 

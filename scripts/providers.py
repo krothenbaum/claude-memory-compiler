@@ -332,6 +332,7 @@ _CODEX_LOGIN_STATUS_MARKER = "Logged in using"
 _CODEX_CHATGPT_LOGIN_STATUS = "Logged in using ChatGPT"
 _CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES = 64 * 1024
 _CODEX_VERSION_MAX_OUTPUT_BYTES = 64 * 1024
+_CODEX_PREFLIGHT_TIMEOUT_SECONDS = 5
 _MINIMUM_CODEX_VERSION = (0, 146, 1)
 _CODEX_VERSION_PATTERN = re.compile(
     r"(?:codex-cli|codex) ([0-9]+)\.([0-9]+)\.([0-9]+)\Z"
@@ -427,13 +428,16 @@ class CodexProvider:
         stdin: str = "",
         *,
         max_output_bytes: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> CommandResult:
         runner = self._runner.run if hasattr(self._runner, "run") else self._runner
         kwargs = {
             "cwd": request.cwd,
             "env": subscription_child_env(self._source_env),
             "stdin": stdin,
-            "timeout_seconds": request.timeout_seconds,
+            "timeout_seconds": (
+                request.timeout_seconds if timeout_seconds is None else timeout_seconds
+            ),
             "start_new_session": True,
             "terminate_process_group_on_timeout": True,
         }
@@ -477,6 +481,7 @@ class CodexProvider:
                     ["codex", "--version"],
                     request,
                     max_output_bytes=_CODEX_VERSION_MAX_OUTPUT_BYTES,
+                    timeout_seconds=_CODEX_PREFLIGHT_TIMEOUT_SECONDS,
                 )
             except TimeoutError:
                 return self._result(
@@ -530,6 +535,7 @@ class CodexProvider:
                     ["codex", "login", "status"],
                     request,
                     max_output_bytes=_CODEX_LOGIN_STATUS_MAX_OUTPUT_BYTES,
+                    timeout_seconds=_CODEX_PREFLIGHT_TIMEOUT_SECONDS,
                 )
             except TimeoutError:
                 return self._result(
