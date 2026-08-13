@@ -487,6 +487,8 @@ class CodexProvider:
                         deadline, _CODEX_PREFLIGHT_TIMEOUT_SECONDS
                     ),
                 )
+                if self._monotonic() >= deadline:
+                    raise TimeoutError("Codex CLI version check timed out")
             except TimeoutError:
                 return self._result(
                     request,
@@ -543,6 +545,8 @@ class CodexProvider:
                         deadline, _CODEX_PREFLIGHT_TIMEOUT_SECONDS
                     ),
                 )
+                if self._monotonic() >= deadline:
+                    raise TimeoutError("codex login status timed out")
             except TimeoutError:
                 return self._result(
                     request,
@@ -646,6 +650,8 @@ class CodexProvider:
                 request.prompt,
                 timeout_seconds=self._remaining_timeout(deadline),
             )
+            if self._monotonic() >= deadline:
+                raise TimeoutError("codex execution timed out")
             combined = "\n".join((completed.stderr, completed.stdout)).strip()
             if completed.returncode != 0:
                 outcome = _failure_outcome(combined)

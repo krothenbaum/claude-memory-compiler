@@ -226,7 +226,9 @@ def test_codex_attempt_uses_one_aggregate_deadline(tmp_path):
         _codex_provider(runner, monotonic=lambda: clock[0]).generate_text(request)
     )
 
-    assert result.outcome == "success"
+    assert result.outcome == "timeout"
+    assert result.reason == "codex execution timed out"
+    assert result.text == ""
     assert result.elapsed_ms == 1200
     budgets = [call[1]["timeout_seconds"] for call in runner.calls]
     assert budgets == pytest.approx([1.0, 0.6, 0.2])
@@ -248,8 +250,27 @@ def test_codex_attempt_does_not_start_command_after_deadline(tmp_path):
     )
 
     assert result.outcome == "timeout"
-    assert result.reason == "codex login status timed out"
+    assert result.reason == "Codex CLI version check timed out"
     assert len(runner.calls) == 1
+
+
+def test_codex_attempt_rejects_login_result_returned_after_deadline(tmp_path):
+    clock = [0.0]
+
+    def late_login(_command, _kwargs):
+        clock[0] = 1.0
+        return _chatgpt_login()
+
+    runner = FakeRunner(late_login)
+    request = TextRequest(TaskKind.QUERY, "answer", tmp_path, 1)
+
+    result = _run(
+        _codex_provider(runner, monotonic=lambda: clock[0]).generate_text(request)
+    )
+
+    assert result.outcome == "timeout"
+    assert result.reason == "codex login status timed out"
+    assert len(runner.calls) == 2
 
 
 def _run(awaitable):
