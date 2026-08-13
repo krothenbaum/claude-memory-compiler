@@ -1654,6 +1654,33 @@ def test_live_slice_rejects_linked_memory_root_parents(tmp_path, linked_componen
     assert _tree_manifest(external) == before
 
 
+def test_cross_platform_fallback_rejects_reparse_runtime_component(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    runtime = memory_home / "scripts" / "runtime"
+    runtime.mkdir(parents=True)
+    runtime_info = runtime.lstat()
+    real_link_or_reparse = memory_utils._link_or_reparse
+
+    def mark_runtime_reparse(info):
+        return (
+            (info.st_dev, info.st_ino) == (runtime_info.st_dev, runtime_info.st_ino)
+            or real_link_or_reparse(info)
+        )
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils, "_link_or_reparse", mark_runtime_reparse)
+
+    with pytest.raises(ValueError, match="non-reparse"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert list(runtime.iterdir()) == []
+
+
 def test_live_slice_fails_closed_when_runtime_chmod_fails(tmp_path, monkeypatch):
     import scripts.utils as memory_utils
 
@@ -1825,8 +1852,6 @@ def test_live_slice_cross_platform_fallback_uses_existing_private_runtime(
     )
     memory_home = tmp_path / "memory"
     runtime = memory_home / "scripts" / "runtime"
-    runtime.mkdir(parents=True)
-    runtime.chmod(0o700)
     monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
 
     with hook.bounded_transcript_slice(
@@ -1842,9 +1867,10 @@ def test_live_slice_cross_platform_fallback_uses_existing_private_runtime(
         assert "FALLBACK_SIGNAL" in preview
 
     assert list(runtime.iterdir()) == []
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
 
 
-def test_cross_platform_fallback_does_not_create_missing_runtime_tree(
+def test_cross_platform_fallback_creates_fresh_private_runtime_tree(
     tmp_path, monkeypatch
 ):
     import scripts.utils as memory_utils
@@ -1852,11 +1878,188 @@ def test_cross_platform_fallback_does_not_create_missing_runtime_tree(
     memory_home = tmp_path / "memory"
     monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
 
-    with pytest.raises(FileNotFoundError):
+    with memory_utils.open_secure_runtime_file(memory_home) as (path, descriptor):
+        assert path.parent == memory_home / "scripts" / "runtime"
+        assert os.fstat(descriptor).st_nlink == 1
+        assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o600
+
+    assert stat.S_IMODE((memory_home / "scripts" / "runtime").stat().st_mode) == 0o700
+    assert list((memory_home / "scripts" / "runtime").iterdir()) == []
+
+
+def test_cross_platform_fallback_creates_fresh_tree_without_directory_handles(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+
+    def unsupported_chmod(*_args, **_kwargs):
+        raise AssertionError("descriptorless fallback must not use path chmod")
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils, "_open_runtime_directory_nofollow", lambda _path: None)
+    monkeypatch.setattr(memory_utils.os, "chmod", unsupported_chmod)
+
+    with memory_utils.open_secure_runtime_file(memory_home) as (path, descriptor):
+        assert path.parent == memory_home / "scripts" / "runtime"
+        assert os.fstat(descriptor).st_nlink == 1
+
+    assert list((memory_home / "scripts" / "runtime").iterdir()) == []
+
+
+def test_cross_platform_fallback_rejects_unsafe_owner_before_creation(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    real_uid = os.getuid()
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils.os, "getuid", lambda: real_uid + 1)
+
+    with pytest.raises(ValueError, match="unsafe owner"):
         with memory_utils.open_secure_runtime_file(memory_home):
             pass
 
     assert not memory_home.exists()
+
+
+def test_cross_platform_fallback_rejects_group_writable_scripts(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    scripts = memory_home / "scripts"
+    scripts.mkdir(parents=True)
+    scripts.chmod(0o777)
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+
+    with pytest.raises(ValueError, match="unsafe permissions"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert not (scripts / "runtime").exists()
+
+
+@pytest.mark.parametrize("component", ["root", "scripts", "runtime"])
+def test_cross_platform_fallback_rejects_linked_ancestry(
+    tmp_path, monkeypatch, component
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    if component == "root":
+        memory_home.symlink_to(external, target_is_directory=True)
+    else:
+        memory_home.mkdir()
+        scripts = memory_home / "scripts"
+        if component == "scripts":
+            scripts.symlink_to(external, target_is_directory=True)
+        else:
+            scripts.mkdir()
+            (scripts / "runtime").symlink_to(external, target_is_directory=True)
+    before = _tree_manifest(external)
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+
+    with pytest.raises((OSError, ValueError)):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert _tree_manifest(external) == before
+
+
+def test_cross_platform_fallback_detects_parent_swap_without_outside_artifact(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    memory_home.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    before_names = sorted(path.relative_to(external) for path in external.rglob("*"))
+    real_mkdir = memory_utils.os.mkdir
+
+    def swap_then_mkdir(path, mode=0o777, *, dir_fd=None):
+        candidate = Path(path)
+        if candidate == memory_home / "scripts":
+            memory_home.rename(tmp_path / "memory-pinned")
+            memory_home.symlink_to(external, target_is_directory=True)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils.os, "mkdir", swap_then_mkdir)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.relative_to(external) for path in external.rglob("*")) == before_names
+
+
+def test_cross_platform_fallback_detects_slice_parent_swap_and_cleans_artifact(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    runtime = memory_home / "scripts" / "runtime"
+    runtime.mkdir(parents=True)
+    runtime.chmod(0o700)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    before_names = sorted(path.relative_to(external) for path in external.rglob("*"))
+    real_mkstemp = memory_utils.tempfile.mkstemp
+
+    def swap_then_mkstemp(*, prefix, suffix, dir):
+        runtime.rename(runtime.with_name("runtime-pinned"))
+        runtime.symlink_to(external, target_is_directory=True)
+        return real_mkstemp(prefix=prefix, suffix=suffix, dir=dir)
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils.tempfile, "mkstemp", swap_then_mkstemp)
+
+    with pytest.raises(ValueError, match="identity changed|non-symlink"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.relative_to(external) for path in external.rglob("*")) == before_names
+
+
+def test_cross_platform_fallback_creation_chmod_failure_is_closed(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    memory_home = tmp_path / "memory"
+    real_fchmod = memory_utils.os.fchmod
+
+    def deny_runtime_chmod(descriptor, mode):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise PermissionError("fallback runtime chmod denied")
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+    monkeypatch.setattr(memory_utils.os, "fchmod", deny_runtime_chmod)
+
+    with pytest.raises(PermissionError, match="fallback runtime chmod denied"):
+        with memory_utils.open_secure_runtime_file(memory_home):
+            pass
+
+    runtime = memory_home / "scripts" / "runtime"
+    assert not runtime.exists() or list(runtime.iterdir()) == []
 
 
 def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(

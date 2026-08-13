@@ -6,15 +6,15 @@ Fix review findings 1–4 and 6–11. Leave malformed apply journals fail-closed
 
 ## Capture safety
 
-The hook parent cleans token-owned uncommitted snapshots only when its child exceeds the deadline. A normal nonzero child exit preserves the child's owner-only `failed-<agent>-<token>-<digest>.jsonl` recovery snapshot.
+The hook parent cleans token-owned uncommitted `capture-<token>-*.jsonl` snapshots only when its child exceeds the deadline. A normal nonzero child exit preserves an owner-only, content-addressed `failed-<agent>-<digest>.jsonl` recovery snapshot. Identical ordinary failures deduplicate atomically; distinct content remains distinct; timeout cleanup never targets ordinary failed snapshots.
 
-Temporary live transcript slices live under an owner-only directory inside the configured memory root, not the system temporary directory. File-descriptor ownership is explicit: after `os.fdopen` or `os.close` takes or releases ownership, code sets the integer descriptor to `-1`; exception cleanup closes only a still-owned descriptor.
+Temporary live transcript slices live under an owner-only directory inside the configured memory root, not the system temporary directory. On platforms with secure directory-relative operations, creation and cleanup use pinned no-follow directory descriptors. The slice descriptor remains open for every write, and the preview path must match its device/inode, type, ownership, link count, and mode before and after the callback. On platforms without secure `dir_fd` support, the implementation creates `memory_root/scripts/runtime` one component at a time with no-link/reparse, owner, mode, and pre/post identity checks, then applies the same pre/post parent and file checks around slice creation. Unsafe ancestry, swaps, or permission-establishment failures fail closed without leaving an outside artifact.
 
 Codex hook commands use `uv run --no-sync`. The three-second host timeout and 2.25-second internal budget remain unchanged. Tests cover cold private-cache startup and ensure the command remains below the host limit without dependency resolution.
 
 ## Provider and foreground correctness
 
-Codex version and login probes each receive a small, dedicated timeout rather than the generation timeout. The generation command retains `AI_MEMORY_JOB_TIMEOUT_SECONDS`. Probe timeout, truncation, failure classification, process-group cleanup, and fallback behavior remain unchanged.
+Each Codex attempt has one monotonic deadline equal to `AI_MEMORY_JOB_TIMEOUT_SECONDS`. Version and login probes each receive `min(5 seconds, remaining)`, and generation receives only the remaining attempt budget. No later command starts after exhaustion. Probe timeout, truncation, failure classification, process-group cleanup, fallback behavior, and safe elapsed-time accounting remain unchanged.
 
 A successful query answer survives query-count contention. Query-count bookkeeping remains bounded and atomic, but exhaustion becomes a logged best-effort bookkeeping failure instead of replacing the provider payload.
 
@@ -22,7 +22,7 @@ Injected flush routers load configuration from the current environment with only
 
 ## Usage recovery
 
-Deadline-bound live capture queue opens do not run usage-log recovery or projection. SQLite `provider_attempts` remains authoritative. The detached worker performs recovery and projection outside the hook deadline before it processes jobs. Other foreground and maintenance queue opens retain recovery unless they explicitly choose the capture-safe mode.
+Deadline-bound live capture queue opens do not run usage-log recovery or projection. SQLite `provider_attempts` remains authoritative. The detached worker also opens the queue without recovery, acquires the singleton drain lock, and only the winning worker performs recovery and projection once before stale-lease recovery or job claims. A losing worker reads and hashes no usage archives and never waits on the writer lock. Other foreground and maintenance queue opens retain recovery unless they explicitly choose the capture-safe mode.
 
 This design removes the global writer-lock wait and archive scan from the live hook critical path without adding a new persistent index or weakening archive verification.
 

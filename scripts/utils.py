@@ -207,8 +207,12 @@ def _validate_runtime_directory(
     info: os.stat_result, path: Path, *, private: bool = False
 ) -> None:
     _validate_log_directory(info, path)
-    if private and os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError(f"runtime directory must have mode 0700: {path}")
+    if os.name != "nt":
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            raise ValueError(f"runtime directory has unsafe permissions: {path}")
+        if private and mode != 0o700:
+            raise ValueError(f"runtime directory must have mode 0700: {path}")
 
 
 def _validate_runtime_file(info: os.stat_result, path: Path) -> None:
@@ -258,6 +262,112 @@ def _runtime_dir_fd_supported() -> bool:
         and os.open in getattr(os, "supports_dir_fd", set())
         and os.unlink in getattr(os, "supports_dir_fd", set())
     )
+
+
+def _open_runtime_directory_nofollow(path: Path) -> int | None:
+    """Pin a directory by full path when relative ``dir_fd`` calls are absent."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags)
+    except OSError:
+        if os.name == "nt":  # Windows cannot open directory handles with os.open.
+            return None
+        raise
+
+
+def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
+    """Create one directory while proving its parent and final identity."""
+    parent = path.parent
+    parent_before = parent.lstat()
+    _validate_runtime_directory(parent_before, parent)
+    parent_descriptor = _open_runtime_directory_nofollow(parent)
+    created = False
+    directory_descriptor: int | None = None
+    try:
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            os.mkdir(path, 0o700)
+            created = True
+            before = path.lstat()
+        _validate_runtime_directory(before, path)
+        directory_descriptor = _open_runtime_directory_nofollow(path)
+        opened = (
+            os.fstat(directory_descriptor)
+            if directory_descriptor is not None
+            else before
+        )
+        _validate_runtime_directory(opened, path)
+        if not _same_file_identity(before, opened):
+            raise ValueError(f"runtime directory identity changed: {path}")
+
+        if private or created:
+            if directory_descriptor is not None and hasattr(os, "fchmod"):
+                os.fchmod(directory_descriptor, 0o700)
+            # A descriptorless platform cannot safely chmod this pathname: the
+            # component could be replaced between validation and chmod.  Fresh
+            # components were requested as 0700 and are checked again below.
+
+        parent_after = parent.lstat()
+        parent_opened = (
+            os.fstat(parent_descriptor)
+            if parent_descriptor is not None
+            else parent_before
+        )
+        if not (
+            _same_file_identity(parent_before, parent_after)
+            and _same_file_identity(parent_before, parent_opened)
+        ):
+            if created:
+                try:
+                    visible = path.lstat()
+                    current = (
+                        os.fstat(directory_descriptor)
+                        if directory_descriptor is not None
+                        else before
+                    )
+                    if _same_file_identity(visible, current):
+                        path.rmdir()
+                except OSError:
+                    pass
+            raise ValueError(f"runtime parent identity changed: {parent}")
+        _validate_runtime_directory(parent_after, parent)
+        _validate_runtime_directory(parent_opened, parent)
+
+        after = path.lstat()
+        opened_after = (
+            os.fstat(directory_descriptor)
+            if directory_descriptor is not None
+            else opened
+        )
+        _validate_runtime_directory(
+            after, path, private=(private or created)
+        )
+        _validate_runtime_directory(
+            opened_after, path, private=(private or created)
+        )
+        if not (
+            _same_file_identity(before, after)
+            and _same_file_identity(before, opened_after)
+        ):
+            raise ValueError(f"runtime directory identity changed: {path}")
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def prepare_secure_runtime_directory_fallback(memory_root: Path | str) -> Path:
+    """Safely bootstrap ``scripts/runtime`` without relative directory opens."""
+    root = Path(os.path.abspath(Path(memory_root).expanduser()))
+    if root.parent == root:
+        raise ValueError("memory root must not be a filesystem root")
+    _ensure_fallback_runtime_component(root, private=False)
+    _ensure_fallback_runtime_component(root / "scripts", private=False)
+    runtime = root / "scripts" / "runtime"
+    _ensure_fallback_runtime_component(runtime, private=True)
+    return runtime
 
 
 @contextmanager
@@ -339,7 +449,6 @@ def _open_secure_runtime_file_fallback(
 ) -> Iterator[tuple[Path, int]]:
     """Use identity checks when directory-relative no-follow APIs are absent."""
     scripts = root / "scripts"
-    runtime.chmod(0o700)
     before = (root.lstat(), scripts.lstat(), runtime.lstat())
     for path, info, private in zip(
         (root, scripts, runtime), before, (False, False, True), strict=True
@@ -389,7 +498,7 @@ def open_secure_runtime_file(
         (
             prepare_secure_runtime_directory(root)
             if _runtime_dir_fd_supported()
-            else expected
+            else prepare_secure_runtime_directory_fallback(root)
         )
         if runtime_directory is None
         else Path(os.path.abspath(Path(runtime_directory).expanduser()))

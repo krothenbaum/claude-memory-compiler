@@ -23,7 +23,8 @@
 Add tests that prove:
 
 - a timeout invokes `on_timeout` and removes only an uncommitted token-owned capture;
-- a child exit 1 does not invoke `on_timeout` and preserves `failed-<agent>-<token>-<digest>.jsonl`;
+- a child exit 1 does not invoke `on_timeout` and preserves content-addressed `failed-<agent>-<digest>.jsonl`;
+- identical ordinary failures from different capture tokens deduplicate safely, distinct content remains distinct, and true-timeout cleanup remains token-scoped to uncommitted capture paths;
 - both `_private_spool_copy` and `bounded_transcript_slice` leave an unrelated descriptor open when the original descriptor number is reused after ownership transfer;
 - the failed snapshot is owner-only and remains absent from the queue.
 
@@ -81,7 +82,7 @@ Expected: the observed path is the system temporary directory.
 
 **Step 3: Implement the minimum fix**
 
-Create or reuse a no-follow, owner-only runtime directory under `AI_MEMORY_HOME/scripts/`, then pass it as `dir=` to `mkstemp`. Preserve standalone hook imports and the internal deadline.
+Create or reuse a no-follow, owner-only runtime directory under `AI_MEMORY_HOME/scripts/`. Retain a descriptor for every slice write and validate that the preview path still names that descriptor before and after preview. Use pinned directory-relative creation when available. Without secure `dir_fd`, safely create a fresh root/scripts/runtime one component at a time with no-link/reparse, owner, mode, and pre/post identity checks; fail closed on unsafe ancestry, swaps, or chmod failure. Preserve standalone hook imports and the internal deadline.
 
 **Step 4: Run GREEN tests**
 
@@ -104,7 +105,7 @@ git commit -m "fix: confine live transcript slices"
 
 **Step 1: Write failing tests**
 
-Cover version and login probes independently. Assert each receives a dedicated small timeout, generation retains the request timeout, timeout kills the process group, the recorded reason identifies the correct probe, and fallback occurs once.
+Cover version and login probes independently. Assert the complete Codex attempt uses one monotonic request deadline: each probe receives `min(5 seconds, remaining)`, generation receives the remaining budget, an exhausted deadline starts no later command, timeout kills the process group, the recorded reason identifies the correct probe, and fallback occurs once.
 
 **Step 2: Run RED tests**
 
@@ -116,7 +117,7 @@ Expected: probes receive the full request timeout.
 
 **Step 3: Implement the minimum fix**
 
-Add one named preflight timeout constant. Extend `_run_command` with an optional timeout override and use it for `codex --version` and `codex login status` only.
+Add one named preflight timeout constant and one monotonic deadline per attempt. Extend `_run_command` with an optional timeout override, pass `min(preflight timeout, remaining)` to version and login, and pass the remaining deadline to generation.
 
 **Step 4: Run GREEN tests**
 
@@ -148,7 +149,8 @@ Add tests that:
 
 - hold `scripts/memory-writer.lock` while a live capture opens the queue and prove enqueue does not wait on usage recovery;
 - install several valid archives and prove capture queue construction does not read or hash them;
-- prove the worker performs recovery/projection before processing;
+- prove only the singleton-winning worker performs recovery/projection, exactly once and before stale recovery or processing;
+- prove a losing worker reads/hashes no archives and does not wait for the writer lock;
 - prove corrupted active logs and tampered archives still recover or quarantine when the worker opens;
 - prove authoritative provider attempts project exactly once after capture skipped projection.
 
@@ -162,7 +164,7 @@ Expected: capture blocks or reads archives during `QueueRepository` construction
 
 **Step 3: Implement the minimum fix**
 
-Add an explicit repository option such as `sync_usage=True`. Live capture passes `False`. Worker startup uses the default recovery path before claiming jobs. Do not change archive formats, integrity checks, or corrupt-log quarantine rules.
+Add an explicit repository option such as `sync_usage=True` and a narrow explicit synchronization method. Live capture and detached-worker construction pass `False`. After acquiring singleton ownership, the winning worker invokes synchronization once before stale recovery or claiming jobs. Do not change archive formats, integrity checks, or corrupt-log quarantine rules.
 
 **Step 4: Run GREEN tests**
 
