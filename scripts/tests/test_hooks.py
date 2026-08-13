@@ -1722,7 +1722,7 @@ def test_live_slice_directory_swap_never_creates_in_external_target(
     observed: list[Path] = []
     import scripts.utils as memory_utils
 
-    real_prepare = memory_utils.prepare_secure_runtime_directory
+    real_prepare = memory_utils._bootstrap_secure_runtime_directory_posix
 
     def swap_after_validation(root):
         runtime = real_prepare(root)
@@ -1730,7 +1730,11 @@ def test_live_slice_directory_swap_never_creates_in_external_target(
         runtime.symlink_to(external, target_is_directory=True)
         return runtime
 
-    monkeypatch.setattr(memory_utils, "prepare_secure_runtime_directory", swap_after_validation)
+    monkeypatch.setattr(
+        memory_utils,
+        "_bootstrap_secure_runtime_directory_posix",
+        swap_after_validation,
+    )
     before = _tree_manifest(external)
 
     with pytest.raises((OSError, ValueError)):
@@ -1746,6 +1750,13 @@ def test_live_slice_directory_swap_never_creates_in_external_target(
 
     assert observed == []
     assert _tree_manifest(external) == before
+
+
+def test_runtime_bootstrap_helpers_are_private_implementation_details():
+    import scripts.utils as memory_utils
+
+    assert not hasattr(memory_utils, "prepare_secure_runtime_directory")
+    assert not hasattr(memory_utils, "prepare_secure_runtime_directory_fallback")
 
 
 def test_live_slice_rejects_previewer_symlink_without_overwriting_target(tmp_path):

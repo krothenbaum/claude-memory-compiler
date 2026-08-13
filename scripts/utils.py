@@ -176,8 +176,8 @@ def prepare_secure_log_directory(memory_root: Path | str) -> Path:
     return current
 
 
-def prepare_secure_runtime_directory(memory_root: Path | str) -> Path:
-    """Create and validate the private live-hook scratch directory."""
+def _bootstrap_secure_runtime_directory_posix(memory_root: Path | str) -> Path:
+    """Bootstrap paths only; descriptor validation happens during file open."""
     root = Path(os.path.abspath(Path(memory_root).expanduser()))
     if not root.exists() and not root.is_symlink():
         try:
@@ -374,8 +374,8 @@ def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
             os.close(parent_descriptor)
 
 
-def prepare_secure_runtime_directory_fallback(memory_root: Path | str) -> Path:
-    """Safely bootstrap ``scripts/runtime`` without relative directory opens."""
+def _bootstrap_secure_runtime_directory_fallback(memory_root: Path | str) -> Path:
+    """Bootstrap paths for the identity-checking no-``dir_fd`` opener."""
     root = Path(os.path.abspath(Path(memory_root).expanduser()))
     if root.parent == root:
         raise ValueError("memory root must not be a filesystem root")
@@ -512,9 +512,9 @@ def open_secure_runtime_file(
     expected = root / "scripts" / "runtime"
     runtime = (
         (
-            prepare_secure_runtime_directory(root)
+            _bootstrap_secure_runtime_directory_posix(root)
             if _runtime_dir_fd_supported()
-            else prepare_secure_runtime_directory_fallback(root)
+            else _bootstrap_secure_runtime_directory_fallback(root)
         )
         if runtime_directory is None
         else Path(os.path.abspath(Path(runtime_directory).expanduser()))
