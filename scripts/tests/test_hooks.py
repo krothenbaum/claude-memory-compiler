@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1650,6 +1651,194 @@ def test_live_slice_rejects_linked_memory_root_parents(tmp_path, linked_componen
     assert _tree_manifest(external) == before
 
 
+def test_live_slice_fails_closed_when_runtime_chmod_fails(tmp_path, monkeypatch):
+    import scripts.utils as memory_utils
+
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    real_fchmod = memory_utils.os.fchmod
+
+    def deny_directory_chmod(descriptor, mode):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise PermissionError("runtime chmod denied")
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(memory_utils.os, "fchmod", deny_directory_chmod)
+
+    with pytest.raises(PermissionError, match="runtime chmod denied"):
+        with hook.bounded_transcript_slice(
+            source,
+            lambda _path: None,
+            source_agent="claude",
+            memory_root=tmp_path / "memory",
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+
+def test_live_slice_directory_swap_never_creates_in_external_target(
+    tmp_path, monkeypatch
+):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    memory_home = tmp_path / "memory"
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    observed: list[Path] = []
+    real_prepare = hook.prepare_secure_runtime_directory
+
+    def swap_after_validation(root):
+        runtime = real_prepare(root)
+        runtime.rename(runtime.with_name("runtime-pinned"))
+        runtime.symlink_to(external, target_is_directory=True)
+        return runtime
+
+    monkeypatch.setattr(hook, "prepare_secure_runtime_directory", swap_after_validation)
+    before = _tree_manifest(external)
+
+    with pytest.raises((OSError, ValueError)):
+        with hook.bounded_transcript_slice(
+            source,
+            lambda path: observed.append(path.resolve()),
+            source_agent="claude",
+            memory_root=memory_home,
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+    assert observed == []
+    assert _tree_manifest(external) == before
+
+
+def test_live_slice_rejects_previewer_symlink_without_overwriting_target(tmp_path):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "SIGNAL"}}) + "\n",
+        encoding="utf-8",
+    )
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("do not overwrite", encoding="utf-8")
+
+    def replace_with_symlink(path):
+        path.unlink()
+        path.symlink_to(sentinel)
+        return None
+
+    with pytest.raises(ValueError, match="identity|link"):
+        with hook.bounded_transcript_slice(
+            source,
+            replace_with_symlink,
+            source_agent="claude",
+            memory_root=tmp_path / "memory",
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+    assert sentinel.read_text(encoding="utf-8") == "do not overwrite"
+
+
+@pytest.mark.parametrize("mutation", ["hardlink", "mode"])
+def test_live_slice_rejects_previewer_file_identity_mutation(
+    tmp_path, mutation
+):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "SIGNAL"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    def mutate(path):
+        if mutation == "hardlink":
+            os.link(path, tmp_path / "outside-link")
+        else:
+            path.chmod(0o666)
+        return None
+
+    with pytest.raises(ValueError, match="link|permission|mode"):
+        with hook.bounded_transcript_slice(
+            source,
+            mutate,
+            source_agent="claude",
+            memory_root=tmp_path / "memory",
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"st_mode": stat.S_IFREG | 0o666},
+        {"st_mode": stat.S_IFREG | 0o600, "st_nlink": 2},
+        {
+            "st_mode": stat.S_IFREG | 0o600,
+            "st_file_attributes": getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+        },
+    ],
+    ids=["mode", "hardlink", "reparse"],
+)
+def test_runtime_file_validator_rejects_unsafe_metadata(tmp_path, overrides):
+    import scripts.utils as memory_utils
+
+    values = {
+        "st_mode": stat.S_IFREG | 0o600,
+        "st_nlink": 1,
+        "st_uid": os.getuid() if hasattr(os, "getuid") else 0,
+        "st_dev": 1,
+        "st_ino": 2,
+        "st_file_attributes": 0,
+    }
+    values.update(overrides)
+    validator = getattr(memory_utils, "_validate_runtime_file", None)
+    assert validator is not None, "secure runtime file validator is missing"
+
+    with pytest.raises(ValueError):
+        validator(SimpleNamespace(**values), tmp_path / "slice.jsonl")
+
+
+def test_live_slice_cross_platform_fallback_uses_existing_private_runtime(
+    tmp_path, monkeypatch
+):
+    import scripts.utils as memory_utils
+
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        json.dumps({"message": {"role": "user", "content": "FALLBACK_SIGNAL"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    memory_home = tmp_path / "memory"
+    runtime = memory_home / "scripts" / "runtime"
+    runtime.mkdir(parents=True)
+    runtime.chmod(0o700)
+    monkeypatch.setattr(memory_utils.os, "supports_dir_fd", set())
+
+    with hook.bounded_transcript_slice(
+        source,
+        lambda path: path.read_text(encoding="utf-8"),
+        source_agent="claude",
+        memory_root=memory_home,
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) as selected:
+        private_slice, preview = selected
+        assert private_slice.parent == runtime
+        assert "FALLBACK_SIGNAL" in preview
+
+    assert list(runtime.iterdir()) == []
+
+
 def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
     tmp_path, monkeypatch
 ):
@@ -1660,13 +1849,10 @@ def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
         encoding="utf-8",
     )
     memory_home = tmp_path / "memory"
-    hook_tmp = tmp_path / "hook-tmp"
-    hook_tmp.mkdir()
     hook = _load_hook("session-end.py")
     ticks = iter([0.0, 0.1, 0.2, 2.5])
     monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
     monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
-    monkeypatch.setattr(hook.tempfile, "tempdir", str(hook_tmp))
     monkeypatch.setattr(
         hook.sys,
         "stdin",
@@ -1692,7 +1878,7 @@ def test_internal_deadline_fails_before_enqueue_and_cleans_artifacts(
 
     assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
     assert not (memory_home / "scripts" / "spool").exists()
-    assert list(hook_tmp.iterdir()) == []
+    assert list((memory_home / "scripts" / "runtime").iterdir()) == []
 
 
 def test_codex_semantic_tail_expansion_preserves_signal_behind_larger_tail(tmp_path):

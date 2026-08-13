@@ -13,7 +13,6 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Callable, Iterator, Literal
 
@@ -30,7 +29,11 @@ if str(ROOT) not in sys.path:
 from scripts.capture import enqueue_hook_input
 from scripts.hook_logging import configure_hook_logger
 from scripts.transcripts import parse_claude_transcript, render_turns
-from scripts.utils import prepare_secure_runtime_directory
+from scripts.utils import (
+    open_secure_runtime_file,
+    prepare_secure_runtime_directory,
+    validate_secure_runtime_file,
+)
 
 
 MAX_TURNS = 30
@@ -875,12 +878,17 @@ def _semantic_compaction(
     return b"".join(entries[offset] for offset in sorted(entries))
 
 
-def _write_private_slice(path: Path, payload: bytes, *, durable: bool) -> None:
-    with path.open("wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        if durable:
-            os.fsync(stream.fileno())
+def _write_private_slice(descriptor: int, payload: bytes, *, durable: bool) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("incomplete live transcript slice write")
+        remaining = remaining[written:]
+    if durable:
+        os.fsync(descriptor)
 
 
 @contextmanager
@@ -908,15 +916,10 @@ def bounded_transcript_slice(
         )
     metadata_prefix = _metadata_prefix(first_record)
     runtime_dir = prepare_secure_runtime_directory(memory_root)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix="ai-memory-live-", suffix=".jsonl", dir=runtime_dir
-    )
-    temporary = Path(temporary_name)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        os.close(descriptor)
-        descriptor = -1
+    with open_secure_runtime_file(
+        memory_root,
+        runtime_directory=runtime_dir,
+    ) as (temporary, descriptor):
         semantic_records: list[tuple[int, dict[str, object]]] = []
         candidate_bytes = 0
         selection_complete = False
@@ -988,25 +991,15 @@ def bounded_transcript_slice(
             raise LiveTranscriptRejected(
                 "compacted semantic snapshot exceeds the 16 MB safety bound"
             )
-        _write_private_slice(temporary, compacted, durable=False)
-        require_time_remaining(
-            deadline, clock, MIN_CAPTURE_REMAINING_SECONDS
-        )
+        _write_private_slice(descriptor, compacted, durable=False)
+        validate_secure_runtime_file(temporary, descriptor)
+        require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
         preview = previewer(temporary)
-        _write_private_slice(temporary, compacted, durable=True)
-        require_time_remaining(
-            deadline, clock, MIN_CAPTURE_REMAINING_SECONDS
-        )
+        validate_secure_runtime_file(temporary, descriptor)
+        _write_private_slice(descriptor, compacted, durable=True)
+        validate_secure_runtime_file(temporary, descriptor)
+        require_time_remaining(deadline, clock, MIN_CAPTURE_REMAINING_SECONDS)
         yield temporary, preview
-    except BaseException:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        raise
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def extract_conversation_context(

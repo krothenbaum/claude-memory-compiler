@@ -1,5 +1,6 @@
 """Shared utilities for the personal knowledge base."""
 
+from contextlib import contextmanager
 import hashlib
 import errno
 import json
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     import fcntl
@@ -200,6 +201,204 @@ def prepare_secure_runtime_directory(memory_root: Path | str) -> Path:
     except OSError:
         pass
     return current
+
+
+def _validate_runtime_directory(
+    info: os.stat_result, path: Path, *, private: bool = False
+) -> None:
+    _validate_log_directory(info, path)
+    if private and os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError(f"runtime directory must have mode 0700: {path}")
+
+
+def _validate_runtime_file(info: os.stat_result, path: Path) -> None:
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"runtime path must be a regular non-reparse file: {path}")
+    if info.st_nlink != 1:
+        raise ValueError(f"runtime path must not be hard-linked: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"runtime path has an unsafe owner: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError(f"runtime path must have mode 0600: {path}")
+
+
+def validate_secure_runtime_file(path: Path | str, descriptor: int) -> None:
+    """Prove that a preview path still names the retained private descriptor."""
+    target = Path(path)
+    opened = os.fstat(descriptor)
+    visible = target.lstat()
+    _validate_runtime_file(opened, target)
+    _validate_runtime_file(visible, target)
+    if not _same_file_identity(opened, visible):
+        raise ValueError(f"runtime path identity changed: {target}")
+
+
+def _validate_runtime_parent_identities(
+    root: Path,
+    scripts: Path,
+    runtime: Path,
+    descriptors: tuple[int, int, int],
+) -> None:
+    for path, descriptor, private in zip(
+        (root, scripts, runtime), descriptors, (False, False, True), strict=True
+    ):
+        opened = os.fstat(descriptor)
+        visible = path.lstat()
+        _validate_runtime_directory(opened, path, private=private)
+        _validate_runtime_directory(visible, path, private=private)
+        if not _same_file_identity(opened, visible):
+            raise ValueError(f"runtime directory identity changed: {path}")
+
+
+def _runtime_dir_fd_supported() -> bool:
+    return bool(
+        getattr(os, "O_NOFOLLOW", 0)
+        and getattr(os, "O_DIRECTORY", 0)
+        and hasattr(os, "fchmod")
+        and os.open in getattr(os, "supports_dir_fd", set())
+        and os.unlink in getattr(os, "supports_dir_fd", set())
+    )
+
+
+@contextmanager
+def _open_secure_runtime_file_posix(
+    root: Path,
+    runtime: Path,
+    *,
+    prefix: str,
+    suffix: str,
+) -> Iterator[tuple[Path, int]]:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_descriptor = os.open(root, directory_flags)
+    scripts_descriptor = -1
+    runtime_descriptor = -1
+    file_descriptor = -1
+    name = ""
+    try:
+        scripts_descriptor = os.open(
+            "scripts", directory_flags, dir_fd=root_descriptor
+        )
+        runtime_descriptor = os.open(
+            "runtime", directory_flags, dir_fd=scripts_descriptor
+        )
+        os.fchmod(runtime_descriptor, 0o700)
+        scripts = root / "scripts"
+        _validate_runtime_parent_identities(
+            root,
+            scripts,
+            runtime,
+            (root_descriptor, scripts_descriptor, runtime_descriptor),
+        )
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        for _attempt in range(100):
+            name = f"{prefix}{uuid.uuid4().hex}{suffix}"
+            try:
+                file_descriptor = os.open(
+                    name,
+                    flags,
+                    0o600,
+                    dir_fd=runtime_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:  # pragma: no cover - collision probability is negligible.
+            raise FileExistsError("could not allocate a unique runtime file")
+        os.fchmod(file_descriptor, 0o600)
+        path = runtime / name
+        _validate_runtime_parent_identities(
+            root,
+            scripts,
+            runtime,
+            (root_descriptor, scripts_descriptor, runtime_descriptor),
+        )
+        validate_secure_runtime_file(path, file_descriptor)
+        yield path, file_descriptor
+    finally:
+        if name and runtime_descriptor >= 0:
+            try:
+                os.unlink(name, dir_fd=runtime_descriptor)
+            except FileNotFoundError:
+                pass
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if runtime_descriptor >= 0:
+            os.close(runtime_descriptor)
+        if scripts_descriptor >= 0:
+            os.close(scripts_descriptor)
+        os.close(root_descriptor)
+
+
+@contextmanager
+def _open_secure_runtime_file_fallback(
+    root: Path,
+    runtime: Path,
+    *,
+    prefix: str,
+    suffix: str,
+) -> Iterator[tuple[Path, int]]:
+    """Use identity checks when directory-relative no-follow APIs are absent."""
+    scripts = root / "scripts"
+    runtime.chmod(0o700)
+    before = (root.lstat(), scripts.lstat(), runtime.lstat())
+    for path, info, private in zip(
+        (root, scripts, runtime), before, (False, False, True), strict=True
+    ):
+        _validate_runtime_directory(info, path, private=private)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=suffix,
+        dir=runtime,
+    )
+    path = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        after = (root.lstat(), scripts.lstat(), runtime.lstat())
+        for path_part, first, second, private in zip(
+            (root, scripts, runtime), before, after, (False, False, True), strict=True
+        ):
+            _validate_runtime_directory(second, path_part, private=private)
+            if not _same_file_identity(first, second):
+                raise ValueError(f"runtime directory identity changed: {path_part}")
+        validate_secure_runtime_file(path, descriptor)
+        yield path, descriptor
+    finally:
+        try:
+            visible = path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if _same_file_identity(visible, os.fstat(descriptor)):
+                path.unlink(missing_ok=True)
+        os.close(descriptor)
+
+
+@contextmanager
+def open_secure_runtime_file(
+    memory_root: Path | str,
+    *,
+    runtime_directory: Path | str | None = None,
+    prefix: str = "ai-memory-live-",
+    suffix: str = ".jsonl",
+) -> Iterator[tuple[Path, int]]:
+    """Create one private scratch file and retain its descriptor until cleanup."""
+    root = Path(os.path.abspath(Path(memory_root).expanduser()))
+    expected = root / "scripts" / "runtime"
+    runtime = (
+        prepare_secure_runtime_directory(root)
+        if runtime_directory is None
+        else Path(os.path.abspath(Path(runtime_directory).expanduser()))
+    )
+    if runtime != expected:
+        raise ValueError("runtime directory must remain inside the memory root")
+    factory = (
+        _open_secure_runtime_file_posix
+        if _runtime_dir_fd_supported()
+        else _open_secure_runtime_file_fallback
+    )
+    with factory(root, runtime, prefix=prefix, suffix=suffix) as opened:
+        yield opened
 
 
 def _open_secure_log_fallback(path: Path):
