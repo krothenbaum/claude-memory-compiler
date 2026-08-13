@@ -279,13 +279,22 @@ def _windows_acl_required() -> bool:
     return os.name == "nt"
 
 
-def _secure_windows_runtime_directory(path: Path, *, correct: bool) -> None:
+def _secure_windows_runtime_directory(path: Path, *, owner_only: bool) -> None:
     try:
-        from scripts.windows_acl import secure_owner_only_directory
+        from scripts.windows_acl import secure_windows_directory
     except ModuleNotFoundError:  # Standalone imports from inside scripts/.
-        from windows_acl import secure_owner_only_directory
+        from windows_acl import secure_windows_directory
 
-    secure_owner_only_directory(path, correct=correct)
+    secure_windows_directory(path, owner_only=owner_only)
+
+
+def _secure_windows_runtime_file(descriptor: int, path: Path) -> None:
+    try:
+        from scripts.windows_acl import secure_windows_file_descriptor
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import secure_windows_file_descriptor
+
+    secure_windows_file_descriptor(descriptor, path)
 
 
 def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
@@ -314,16 +323,6 @@ def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
         if not _same_file_identity(before, opened):
             raise ValueError(f"runtime directory identity changed: {path}")
 
-        if _windows_acl_required():
-            _secure_windows_runtime_directory(path, correct=(private or created))
-
-        if private or created:
-            if directory_descriptor is not None and hasattr(os, "fchmod"):
-                os.fchmod(directory_descriptor, 0o700)
-            # A descriptorless platform cannot safely chmod this pathname: the
-            # component could be replaced between validation and chmod.  Fresh
-            # components were requested as 0700 and are checked again below.
-
         parent_after = parent.lstat()
         parent_opened = (
             os.fstat(parent_descriptor)
@@ -349,6 +348,16 @@ def _ensure_fallback_runtime_component(path: Path, *, private: bool) -> None:
             raise ValueError(f"runtime parent identity changed: {parent}")
         _validate_runtime_directory(parent_after, parent)
         _validate_runtime_directory(parent_opened, parent)
+
+        if _windows_acl_required():
+            _secure_windows_runtime_directory(path, owner_only=private)
+
+        if private or created:
+            if directory_descriptor is not None and hasattr(os, "fchmod"):
+                os.fchmod(directory_descriptor, 0o700)
+            # A descriptorless platform cannot safely chmod this pathname: the
+            # component could be replaced between validation and chmod.  Fresh
+            # components were requested as 0700 and are checked again below.
 
         after = path.lstat()
         opened_after = (
@@ -487,6 +496,22 @@ def _open_secure_runtime_file_fallback(
             if not _same_file_identity(first, second):
                 raise ValueError(f"runtime directory identity changed: {path_part}")
         validate_secure_runtime_file(path, descriptor)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, path)
+            validate_secure_runtime_file(path, descriptor)
+            final_parents = (root.lstat(), scripts.lstat(), runtime.lstat())
+            for path_part, first, final, private in zip(
+                (root, scripts, runtime),
+                before,
+                final_parents,
+                (False, False, True),
+                strict=True,
+            ):
+                _validate_runtime_directory(final, path_part, private=private)
+                if not _same_file_identity(first, final):
+                    raise ValueError(
+                        f"runtime directory identity changed: {path_part}"
+                    )
         yield path, descriptor
     finally:
         try:

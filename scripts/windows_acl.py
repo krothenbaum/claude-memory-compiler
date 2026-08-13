@@ -7,7 +7,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 _ACL_REVISION = 2
@@ -24,6 +24,16 @@ _SE_DACL_PROTECTED = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
 _ACL_SIZE_INFORMATION_CLASS = 2
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_FILE_READ_ATTRIBUTES = 0x00000080
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
+_OPEN_EXISTING = 3
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 
 
 @dataclass(frozen=True)
@@ -48,9 +58,17 @@ class AclState:
 
 
 class _AclApi(Protocol):
-    def inspect(self, path: Path) -> AclState: ...
+    def open_directory(self, path: Path) -> object: ...
 
-    def protect_owner_only(self, path: Path) -> None: ...
+    def close(self, handle: object) -> None: ...
+
+    def identity(self, handle: object) -> tuple[int, int]: ...
+
+    def is_reparse(self, handle: object) -> bool: ...
+
+    def inspect(self, handle: object) -> AclState: ...
+
+    def protect_owner_only(self, handle: object, *, inherit: bool) -> None: ...
 
 
 class _SidAndAttributes(ctypes.Structure):
@@ -77,6 +95,21 @@ class _AceHeader(ctypes.Structure):
     ]
 
 
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", wintypes.DWORD),
+        ("creation_time", wintypes.FILETIME),
+        ("last_access_time", wintypes.FILETIME),
+        ("last_write_time", wintypes.FILETIME),
+        ("volume_serial_number", wintypes.DWORD),
+        ("file_size_high", wintypes.DWORD),
+        ("file_size_low", wintypes.DWORD),
+        ("number_of_links", wintypes.DWORD),
+        ("file_index_high", wintypes.DWORD),
+        ("file_index_low", wintypes.DWORD),
+    ]
+
+
 class _WindowsSecurityApi:
     """Small ctypes boundary over the Win32 security APIs."""
 
@@ -89,6 +122,21 @@ class _WindowsSecurityApi:
 
     def _configure_signatures(self) -> None:
         self.kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        self.kernel.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        self.kernel.CreateFileW.restype = wintypes.HANDLE
+        self.kernel.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        self.kernel.GetFileInformationByHandle.restype = wintypes.BOOL
         self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         self.kernel.CloseHandle.restype = wintypes.BOOL
         self.kernel.LocalFree.argtypes = [wintypes.HLOCAL]
@@ -127,8 +175,8 @@ class _WindowsSecurityApi:
         ]
         self.advapi.AddAccessAllowedAceEx.restype = wintypes.BOOL
         pointer = ctypes.POINTER(ctypes.c_void_p)
-        self.advapi.GetNamedSecurityInfoW.argtypes = [
-            wintypes.LPWSTR,
+        self.advapi.GetSecurityInfo.argtypes = [
+            wintypes.HANDLE,
             ctypes.c_int,
             wintypes.DWORD,
             pointer,
@@ -137,9 +185,9 @@ class _WindowsSecurityApi:
             pointer,
             pointer,
         ]
-        self.advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
-        self.advapi.SetNamedSecurityInfoW.argtypes = [
-            wintypes.LPWSTR,
+        self.advapi.GetSecurityInfo.restype = wintypes.DWORD
+        self.advapi.SetSecurityInfo.argtypes = [
+            wintypes.HANDLE,
             ctypes.c_int,
             wintypes.DWORD,
             ctypes.c_void_p,
@@ -147,7 +195,7 @@ class _WindowsSecurityApi:
             ctypes.c_void_p,
             ctypes.c_void_p,
         ]
-        self.advapi.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        self.advapi.SetSecurityInfo.restype = wintypes.DWORD
         self.advapi.GetSecurityDescriptorControl.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(wintypes.WORD),
@@ -172,6 +220,41 @@ class _WindowsSecurityApi:
     def _error(label: str, code: int | None = None) -> OSError:
         number = ctypes.get_last_error() if code is None else code
         return OSError(number, f"{label} failed")
+
+    def open_directory(self, path: Path) -> wintypes.HANDLE:
+        handle = self.kernel.CreateFileW(
+            str(path),
+            _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == wintypes.HANDLE(-1).value:
+            raise self._error("CreateFileW")
+        return handle
+
+    def close(self, handle: object) -> None:
+        if not self.kernel.CloseHandle(handle):
+            raise self._error("CloseHandle")
+
+    def _file_information(self, handle: object) -> _ByHandleFileInformation:
+        information = _ByHandleFileInformation()
+        if not self.kernel.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            raise self._error("GetFileInformationByHandle")
+        return information
+
+    def identity(self, handle: object) -> tuple[int, int]:
+        information = self._file_information(handle)
+        index = (information.file_index_high << 32) | information.file_index_low
+        return information.volume_serial_number, index
+
+    def is_reparse(self, handle: object) -> bool:
+        information = self._file_information(handle)
+        return bool(information.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
     def _current_user_sid(self) -> tuple[ctypes.Array[ctypes.c_char], ctypes.c_void_p]:
         token = wintypes.HANDLE()
@@ -202,12 +285,12 @@ class _WindowsSecurityApi:
         finally:
             self.kernel.CloseHandle(token)
 
-    def inspect(self, path: Path) -> AclState:
+    def inspect(self, handle: object) -> AclState:
         owner = ctypes.c_void_p()
         dacl = ctypes.c_void_p()
         descriptor = ctypes.c_void_p()
-        code = self.advapi.GetNamedSecurityInfoW(
-            str(path),
+        code = self.advapi.GetSecurityInfo(
+            handle,
             _SE_FILE_OBJECT,
             _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
             ctypes.byref(owner),
@@ -217,7 +300,7 @@ class _WindowsSecurityApi:
             ctypes.byref(descriptor),
         )
         if code:
-            raise self._error("GetNamedSecurityInfoW", code)
+            raise self._error("GetSecurityInfo", code)
         try:
             sid_buffer, current_sid = self._current_user_sid()
             owner_matches = bool(
@@ -278,7 +361,7 @@ class _WindowsSecurityApi:
             if descriptor.value:
                 self.kernel.LocalFree(descriptor)
 
-    def protect_owner_only(self, path: Path) -> None:
+    def protect_owner_only(self, handle: object, *, inherit: bool) -> None:
         sid_buffer, sid = self._current_user_sid()
         sid_length = self.advapi.GetLengthSid(sid)
         if not sid_length:
@@ -290,13 +373,13 @@ class _WindowsSecurityApi:
         if not self.advapi.AddAccessAllowedAceEx(
             acl,
             _ACL_REVISION,
-            _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE,
+            (_OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE) if inherit else 0,
             _FILE_ALL_ACCESS,
             sid,
         ):
             raise self._error("AddAccessAllowedAceEx")
-        code = self.advapi.SetNamedSecurityInfoW(
-            str(path),
+        code = self.advapi.SetSecurityInfo(
+            handle,
             _SE_FILE_OBJECT,
             _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
             None,
@@ -305,37 +388,116 @@ class _WindowsSecurityApi:
             None,
         )
         if code:
-            raise self._error("SetNamedSecurityInfoW", code)
+            raise self._error("SetSecurityInfo", code)
 
 
-def secure_owner_only_directory(
-    path: Path | str,
-    *,
-    correct: bool,
-    api: _AclApi | None = None,
-) -> None:
-    """Establish or verify one protected, current-owner-only directory DACL."""
-    target = Path(path)
+def _active_api(api: _AclApi | None) -> _AclApi:
     try:
-        active_api = _WindowsSecurityApi() if api is None else api
+        return _WindowsSecurityApi() if api is None else api
     except (AttributeError, OSError) as exc:
         raise PermissionError("Windows ACL API is unavailable") from exc
-    try:
-        initial = active_api.inspect(target)
-    except Exception as exc:
-        raise PermissionError(f"could not inspect owner-only ACL: {target}") from exc
+
+
+def _verify_owner_only_handle(
+    api: _AclApi,
+    handle: object,
+    target: Path,
+    *,
+    inherit: bool,
+    initial: AclState | None = None,
+) -> None:
+    if initial is None:
+        try:
+            initial = api.inspect(handle)
+        except Exception as exc:
+            raise PermissionError(f"could not inspect owner ACL: {target}") from exc
     if not initial.owner_matches:
-        raise PermissionError(f"directory does not have an owner-only ACL: {target}")
-    if correct:
-        try:
-            active_api.protect_owner_only(target)
-        except Exception as exc:
-            raise PermissionError(f"could not establish owner-only ACL: {target}") from exc
-        try:
-            final = active_api.inspect(target)
-        except Exception as exc:
-            raise PermissionError(f"could not inspect owner-only ACL: {target}") from exc
-    else:
-        final = initial
+        raise PermissionError(f"directory has an unsafe Windows owner: {target}")
+    try:
+        api.protect_owner_only(handle, inherit=inherit)
+        final = api.inspect(handle)
+    except Exception as exc:
+        raise PermissionError(f"could not establish owner-only ACL: {target}") from exc
     if not final.is_owner_only:
         raise PermissionError(f"directory does not have an owner-only ACL: {target}")
+
+
+def _open_matching_directory(
+    api: _AclApi,
+    target: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        observed = api.open_directory(target)
+    except Exception as exc:
+        raise PermissionError(f"could not reopen Windows directory: {target}") from exc
+    try:
+        if api.is_reparse(observed):
+            raise PermissionError(f"Windows directory is a reparse point: {target}")
+        if api.identity(observed) != expected_identity:
+            raise PermissionError(f"Windows directory identity changed: {target}")
+    finally:
+        api.close(observed)
+
+
+def secure_windows_directory(
+    path: Path | str,
+    *,
+    owner_only: bool,
+    api: _AclApi | None = None,
+) -> None:
+    """Verify one pinned directory and optionally install its private DACL."""
+    target = Path(path)
+    active_api = _active_api(api)
+    try:
+        handle = active_api.open_directory(target)
+    except Exception as exc:
+        raise PermissionError(f"could not open Windows directory: {target}") from exc
+    try:
+        if active_api.is_reparse(handle):
+            raise PermissionError(f"Windows directory is a reparse point: {target}")
+        identity = active_api.identity(handle)
+        _open_matching_directory(active_api, target, identity)
+        try:
+            initial = active_api.inspect(handle)
+        except Exception as exc:
+            raise PermissionError(f"could not inspect owner ACL: {target}") from exc
+        if not initial.owner_matches:
+            raise PermissionError(f"directory has an unsafe Windows owner: {target}")
+        if owner_only:
+            _verify_owner_only_handle(
+                active_api,
+                handle,
+                target,
+                inherit=True,
+                initial=initial,
+            )
+        _open_matching_directory(active_api, target, identity)
+    finally:
+        active_api.close(handle)
+
+
+def secure_windows_file_descriptor(
+    descriptor: int,
+    path: Path | str,
+    *,
+    api: _AclApi | None = None,
+    handle_from_descriptor: Callable[[int], object] | None = None,
+) -> None:
+    """Install and verify a private DACL through an already-retained file handle."""
+    active_api = _active_api(api)
+    if handle_from_descriptor is None:
+        try:
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(descriptor)
+        except (ImportError, OSError) as exc:
+            raise PermissionError("Windows file-handle API is unavailable") from exc
+    else:
+        handle = handle_from_descriptor(descriptor)
+    _verify_owner_only_handle(
+        active_api,
+        handle,
+        Path(path),
+        inherit=False,
+    )
