@@ -26,10 +26,23 @@ class FakeHandleApi:
         self.closed = []
         self.protected = []
         self.open_results = ["target", "target", "target"]
+        self.file_open_results = ["security", "security"]
+        self.file_accesses = []
+        self.file_open_error = None
+        self.protect_error = None
 
     def open_directory(self, path):
         self.opened.append(Path(path))
         return self.open_results.pop(0)
+
+    def open_file(self, path, *, access):
+        self.opened.append(Path(path))
+        self.file_accesses.append(access)
+        if self.file_open_error is not None:
+            raise self.file_open_error
+        if not access & 0x00040000:
+            raise PermissionError("WRITE_DAC was not requested")
+        return self.file_open_results.pop(0)
 
     def close(self, handle):
         self.closed.append(handle)
@@ -45,6 +58,8 @@ class FakeHandleApi:
         return values[0] if len(values) == 1 else values.pop(0)
 
     def protect_owner_only(self, handle, *, inherit):
+        if self.protect_error is not None:
+            raise self.protect_error
         self.protected.append((handle, inherit))
 
 
@@ -66,16 +81,17 @@ def test_private_acl_is_set_and_verified_through_pinned_handle(tmp_path):
     assert api.closed == ["target", "target", "target"]
 
 
-def test_private_slice_acl_uses_borrowed_file_descriptor_handle(tmp_path):
+def test_private_slice_acl_uses_second_write_dac_security_handle(tmp_path):
     from scripts.windows_acl import secure_windows_file_descriptor
 
     api = FakeHandleApi(
         {
-            "target": [
+            "security": [
                 _state(),
                 _state(protected=True, ace_count=1, inherited=0, only=True),
             ]
-        }
+        },
+        identities={"borrowed": (1, 10), "security": (1, 10)},
     )
 
     secure_windows_file_descriptor(
@@ -83,12 +99,133 @@ def test_private_slice_acl_uses_borrowed_file_descriptor_handle(tmp_path):
         tmp_path / "slice.jsonl",
         api=api,
         handle_from_descriptor=lambda descriptor: (
-            "target" if descriptor == 7 else "unexpected"
+            "borrowed" if descriptor == 7 else "unexpected"
         ),
     )
 
-    assert api.protected == [("target", False)]
+    required_access = 0x00020000 | 0x00040000 | 0x00000080
+    assert all(
+        access & required_access == required_access
+        for access in api.file_accesses
+    )
+    assert api.protected == [("security", False)]
+    assert api.closed == ["security", "security"]
+
+
+def test_private_slice_rejects_security_handle_identity_mismatch(tmp_path):
+    from scripts.windows_acl import secure_windows_file_descriptor
+
+    api = FakeHandleApi(
+        {"security": [_state()]},
+        identities={"borrowed": (1, 10), "security": (1, 99)},
+    )
+    api.file_open_results = ["security"]
+
+    with pytest.raises(PermissionError, match="identity changed"):
+        secure_windows_file_descriptor(
+            7,
+            tmp_path / "slice.jsonl",
+            api=api,
+            handle_from_descriptor=lambda _descriptor: "borrowed",
+        )
+
+    assert api.protected == []
+    assert api.closed == ["security"]
+
+
+def test_private_slice_rejects_reparse_security_handle(tmp_path):
+    from scripts.windows_acl import secure_windows_file_descriptor
+
+    api = FakeHandleApi(
+        {"security": [_state()]},
+        identities={"borrowed": (1, 10), "security": (1, 10)},
+        reparse_handles={"security"},
+    )
+    api.file_open_results = ["security"]
+
+    with pytest.raises(PermissionError, match="reparse"):
+        secure_windows_file_descriptor(
+            7,
+            tmp_path / "slice.jsonl",
+            api=api,
+            handle_from_descriptor=lambda _descriptor: "borrowed",
+        )
+
+    assert api.protected == []
+    assert api.closed == ["security"]
+
+
+def test_private_slice_security_handle_open_failure_is_closed(tmp_path):
+    from scripts.windows_acl import secure_windows_file_descriptor
+
+    api = FakeHandleApi(
+        {}, identities={"borrowed": (1, 10)}
+    )
+    api.file_open_error = OSError("CreateFileW denied")
+
+    with pytest.raises(PermissionError, match="could not open Windows file"):
+        secure_windows_file_descriptor(
+            7,
+            tmp_path / "slice.jsonl",
+            api=api,
+            handle_from_descriptor=lambda _descriptor: "borrowed",
+        )
+
+    assert api.protected == []
     assert api.closed == []
+
+
+def test_private_slice_set_failure_closes_security_handle(tmp_path):
+    from scripts.windows_acl import secure_windows_file_descriptor
+
+    api = FakeHandleApi(
+        {"security": [_state()]},
+        identities={"borrowed": (1, 10), "security": (1, 10)},
+    )
+    api.file_open_results = ["security"]
+    api.protect_error = OSError("SetSecurityInfo denied")
+
+    with pytest.raises(PermissionError, match="could not establish owner-only ACL"):
+        secure_windows_file_descriptor(
+            7,
+            tmp_path / "slice.jsonl",
+            api=api,
+            handle_from_descriptor=lambda _descriptor: "borrowed",
+        )
+
+    assert api.closed == ["security"]
+
+
+def test_private_slice_path_swap_does_not_mutate_outside_handle(tmp_path):
+    from scripts.windows_acl import secure_windows_file_descriptor
+
+    api = FakeHandleApi(
+        {
+            "security": [
+                _state(),
+                _state(protected=True, ace_count=1, inherited=0, only=True),
+            ],
+            "outside": [_state(owner=False)],
+        },
+        identities={
+            "borrowed": (1, 10),
+            "security": (1, 10),
+            "outside": (1, 99),
+        },
+    )
+    api.file_open_results = ["security", "outside"]
+
+    with pytest.raises(PermissionError, match="identity changed"):
+        secure_windows_file_descriptor(
+            7,
+            tmp_path / "slice.jsonl",
+            api=api,
+            handle_from_descriptor=lambda _descriptor: "borrowed",
+        )
+
+    assert api.protected == [("security", False)]
+    assert all(handle != "outside" for handle, _inherit in api.protected)
+    assert api.closed == ["outside", "security"]
 
 
 def test_existing_ancestry_accepts_stable_inherited_system_admin_acl(tmp_path):

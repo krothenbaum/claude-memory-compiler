@@ -34,6 +34,7 @@ _OPEN_EXISTING = 3
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_SECURITY_ACCESS = _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ class AclState:
 
 class _AclApi(Protocol):
     def open_directory(self, path: Path) -> object: ...
+
+    def open_file(self, path: Path, *, access: int) -> object: ...
 
     def close(self, handle: object) -> None: ...
 
@@ -221,19 +224,33 @@ class _WindowsSecurityApi:
         number = ctypes.get_last_error() if code is None else code
         return OSError(number, f"{label} failed")
 
-    def open_directory(self, path: Path) -> wintypes.HANDLE:
+    def _open_path(self, path: Path, *, access: int, flags: int) -> wintypes.HANDLE:
         handle = self.kernel.CreateFileW(
             str(path),
-            _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES,
+            access,
             _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
             None,
             _OPEN_EXISTING,
-            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            flags,
             None,
         )
         if handle == wintypes.HANDLE(-1).value:
             raise self._error("CreateFileW")
         return handle
+
+    def open_directory(self, path: Path) -> wintypes.HANDLE:
+        return self._open_path(
+            path,
+            access=_FILE_SECURITY_ACCESS,
+            flags=_FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+
+    def open_file(self, path: Path, *, access: int) -> wintypes.HANDLE:
+        return self._open_path(
+            path,
+            access=access,
+            flags=_FILE_FLAG_OPEN_REPARSE_POINT,
+        )
 
     def close(self, handle: object) -> None:
         if not self.kernel.CloseHandle(handle):
@@ -484,20 +501,59 @@ def secure_windows_file_descriptor(
     api: _AclApi | None = None,
     handle_from_descriptor: Callable[[int], object] | None = None,
 ) -> None:
-    """Install and verify a private DACL through an already-retained file handle."""
+    """Install a private DACL through a second identity-matched security handle."""
     active_api = _active_api(api)
     if handle_from_descriptor is None:
         try:
             import msvcrt
 
-            handle = msvcrt.get_osfhandle(descriptor)
+            borrowed_handle = msvcrt.get_osfhandle(descriptor)
         except (ImportError, OSError) as exc:
             raise PermissionError("Windows file-handle API is unavailable") from exc
     else:
-        handle = handle_from_descriptor(descriptor)
-    _verify_owner_only_handle(
-        active_api,
-        handle,
-        Path(path),
-        inherit=False,
-    )
+        borrowed_handle = handle_from_descriptor(descriptor)
+    target = Path(path)
+    try:
+        borrowed_identity = active_api.identity(borrowed_handle)
+    except Exception as exc:
+        raise PermissionError(
+            f"could not inspect retained Windows file handle: {target}"
+        ) from exc
+    try:
+        security_handle = active_api.open_file(
+            target,
+            access=_FILE_SECURITY_ACCESS,
+        )
+    except Exception as exc:
+        raise PermissionError(
+            f"could not open Windows file security handle: {target}"
+        ) from exc
+    try:
+        if active_api.is_reparse(security_handle):
+            raise PermissionError(f"Windows file is a reparse point: {target}")
+        if active_api.identity(security_handle) != borrowed_identity:
+            raise PermissionError(f"Windows file identity changed: {target}")
+        _verify_owner_only_handle(
+            active_api,
+            security_handle,
+            target,
+            inherit=False,
+        )
+        try:
+            observed = active_api.open_file(
+                target,
+                access=_FILE_SECURITY_ACCESS,
+            )
+        except Exception as exc:
+            raise PermissionError(
+                f"could not reopen Windows file security handle: {target}"
+            ) from exc
+        try:
+            if active_api.is_reparse(observed):
+                raise PermissionError(f"Windows file is a reparse point: {target}")
+            if active_api.identity(observed) != borrowed_identity:
+                raise PermissionError(f"Windows file identity changed: {target}")
+        finally:
+            active_api.close(observed)
+    finally:
+        active_api.close(security_handle)
