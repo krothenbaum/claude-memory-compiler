@@ -8,6 +8,7 @@ try:
 except ImportError:  # pragma: no cover - Windows exercises the msvcrt branch.
     fcntl = None
 import json
+import os
 from pathlib import Path
 import sqlite3
 import stat
@@ -636,6 +637,28 @@ def test_parser_failure_retains_private_safe_snapshot_without_queue_or_launch(tm
     assert stat.S_IMODE(retained[0].stat().st_mode) == 0o600
     assert not (home / "scripts" / "jobs.sqlite3").exists()
     assert launched == []
+
+
+def test_private_spool_copy_does_not_close_reused_descriptor(tmp_path, monkeypatch):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep open", encoding="utf-8")
+    reused: list[int] = []
+
+    def fail_after_descriptor_transfer(_path):
+        reused.append(os.open(unrelated, os.O_RDONLY))
+        raise RuntimeError("fsync failed")
+
+    monkeypatch.setattr(capture_module, "_fsync_file", fail_after_descriptor_transfer)
+
+    with pytest.raises(RuntimeError, match="fsync failed"):
+        capture_module._private_spool_copy(source, spool)
+
+    assert os.fstat(reused[0]).st_size == len("keep open")
+    os.close(reused[0])
 
 
 def test_capture_fails_closed_under_database_contention_before_hook_deadline(tmp_path):

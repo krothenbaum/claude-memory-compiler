@@ -179,16 +179,16 @@ def _private_spool_copy(
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
         _check_deadline(deadline, monotonic)
-        with source.open("rb") as input_stream, os.fdopen(
-            descriptor, "wb"
-        ) as output_stream:
-            while True:
-                _check_deadline(deadline, monotonic)
-                block = input_stream.read(1024 * 1024)
-                if not block:
-                    break
-                output_stream.write(block)
-            output_stream.flush()
+        with os.fdopen(descriptor, "wb") as output_stream:
+            descriptor = -1
+            with source.open("rb") as input_stream:
+                while True:
+                    _check_deadline(deadline, monotonic)
+                    block = input_stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    output_stream.write(block)
+                output_stream.flush()
         _fsync_file(temporary)
         _check_deadline(deadline, monotonic)
         try:
@@ -197,10 +197,11 @@ def _private_spool_copy(
             pass
         return temporary
     except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         temporary.unlink(missing_ok=True)
         raise
 

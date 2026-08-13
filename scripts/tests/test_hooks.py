@@ -1447,6 +1447,54 @@ def test_process_deadline_kills_blocking_enqueue_with_margin(tmp_path):
     assert not owned.exists()
 
 
+def test_process_nonzero_exit_preserves_failed_capture(tmp_path):
+    hook = _load_hook("session-end.py")
+    failed = tmp_path / "failed-claude-owner-digest.jsonl"
+    failed.write_text("{}\n", encoding="utf-8")
+    failed.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="capture child exited 1"):
+        hook.run_process_until_deadline(
+            [sys.executable, "-c", "raise SystemExit(1)"],
+            input_text="",
+            deadline=time.monotonic() + 1.0,
+            clock=time.monotonic,
+            on_timeout=lambda: failed.unlink(missing_ok=True),
+        )
+
+    assert failed.exists()
+    assert stat.S_IMODE(failed.stat().st_mode) == 0o600
+
+
+def test_bounded_slice_does_not_close_reused_descriptor(tmp_path, monkeypatch):
+    hook = _load_hook("session-end.py")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep open", encoding="utf-8")
+    reused: list[int] = []
+
+    def fail_after_descriptor_transfer(*_args, **_kwargs):
+        reused.append(os.open(unrelated, os.O_RDONLY))
+        raise RuntimeError("selection failed")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(hook, "_validated_chunks_backward", fail_after_descriptor_transfer)
+
+    with pytest.raises(RuntimeError, match="selection failed"):
+        with hook.bounded_transcript_slice(
+            source,
+            lambda _path: None,
+            source_agent="claude",
+            deadline=10.0,
+            clock=lambda: 0.0,
+        ):
+            pass
+
+    assert os.fstat(reused[0]).st_size == len("keep open")
+    os.close(reused[0])
+
+
 def test_timeout_cleanup_checks_owner_token_and_queue_reference(tmp_path):
     hook = _load_hook("session-end.py")
     root = tmp_path / "memory"

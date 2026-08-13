@@ -85,8 +85,6 @@ def run_process_until_deadline(
             on_timeout()
         raise HookDeadlineExceeded("capture child exceeded hook deadline") from error
     if process.returncode != 0:
-        if on_timeout is not None:
-            on_timeout()
         raise RuntimeError(f"capture child exited {process.returncode}")
     return stdout
 
@@ -915,6 +913,7 @@ def bounded_transcript_slice(
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
         os.close(descriptor)
+        descriptor = -1
         semantic_records: list[tuple[int, dict[str, object]]] = []
         candidate_bytes = 0
         selection_complete = False
@@ -997,10 +996,11 @@ def bounded_transcript_slice(
         )
         yield temporary, preview
     except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise
     finally:
         temporary.unlink(missing_ok=True)
