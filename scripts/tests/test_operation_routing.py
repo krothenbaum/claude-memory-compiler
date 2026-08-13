@@ -181,6 +181,25 @@ def test_read_only_query_uses_query_text_request(memory_home: Path):
     assert str(memory_home) not in request.prompt
 
 
+def test_injected_flush_router_uses_environment_timeout(
+    memory_home: Path, monkeypatch
+):
+    router = RecordingTextRouter("**Context:** durable")
+    monkeypatch.setenv("AI_MEMORY_JOB_TIMEOUT_SECONDS", "37")
+    monkeypatch.setenv("CLAUDE_MEMORY_HOME", str(memory_home / "conflicting-alias"))
+
+    result = asyncio.run(
+        flush.run_flush(
+            "User: Keep this decision",
+            router=router,
+            memory_home=memory_home,
+        )
+    )
+
+    assert result == "**Context:** durable"
+    assert router.requests[0].timeout_seconds == 37
+
+
 def test_query_state_cas_retries_without_losing_concurrent_update(memory_home: Path, monkeypatch):
     router = RecordingTextRouter("answer")
     real_apply = query.apply_host_bookkeeping
@@ -437,6 +456,29 @@ def test_compile_uses_terra_staged_workspace_and_applies_valid_stage(memory_home
     )
     assert "compile | 2026-08-11.md" in (memory_home / "knowledge/log.md").read_text()
     assert "@compiled-through:" in log_path.read_text()
+
+
+def test_compile_early_bookkeeping_uses_explicit_memory_home(memory_home: Path):
+    log_path = memory_home / "imports" / "daily" / "2026-08-12.md"
+    _write(log_path, "")
+    state_path = memory_home / "scripts/state.json"
+    state = {"ingested": {}, "query_count": 0, "total_cost": 0.0}
+
+    result = asyncio.run(
+        compile_module.compile_daily_log(
+            log_path,
+            state,
+            capture_file_baseline(state_path),
+            router=RecordingTextRouter("unused"),
+            memory_home=memory_home,
+        )
+    )
+
+    assert result == 0.0
+    assert "@compiled-through:" in log_path.read_text(encoding="utf-8")
+    persisted = __import__("json").loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["ingested"][log_path.name]["compiled_at"]
+    assert not (memory_home / "imports" / "scripts" / "state.json").exists()
 
 
 def test_invalid_codex_compile_uses_fresh_clean_claude_stage(

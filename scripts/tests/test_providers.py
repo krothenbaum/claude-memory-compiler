@@ -1821,6 +1821,31 @@ def test_router_rejects_invalid_fallback_workspace(
     assert original.prompt not in result.reason
 
 
+def test_invalid_fallback_workspace_normalizes_falsey_claude_model(tmp_path):
+    import providers
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    request = WorkspaceRequest(TaskKind.COMPILE, "private prompt", stage, 5)
+    failed = ProviderResult(
+        "codex", "codex-model", request.task, "invalid_output", reason="invalid"
+    )
+    codex = FakeProvider(success_result("codex", "unused"))
+    claude = FakeProvider(success_result("claude", "unused"))
+    claude._model = None
+    router = providers.ProviderRouter(
+        codex,
+        claude,
+        fallback_workspace_factory=lambda _request: object(),
+    )
+
+    result = _run(router.edit_workspace(request, codex_attempt=failed))
+
+    assert result.provider == "claude"
+    assert result.outcome == "error"
+    assert result.model == "unknown"
+
+
 def _failed_workspace_fallback(tmp_path):
     stage = tmp_path / "stale"
     stage.mkdir()

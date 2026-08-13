@@ -1188,7 +1188,7 @@ class ProviderRouter:
             if invalid_reason is not None:
                 claude_attempt = ProviderResult(
                     provider="claude",
-                    model=getattr(self._claude, "_model", "unknown"),
+                    model=getattr(self._claude, "_model", None) or "unknown",
                     task=request.task,
                     outcome="error",
                     reason=invalid_reason,

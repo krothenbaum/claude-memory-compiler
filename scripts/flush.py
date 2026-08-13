@@ -210,7 +210,10 @@ async def run_flush(
         router, config = _default_router(home)
         timeout = config.job_timeout_seconds
     else:
-        timeout = load_config({"AI_MEMORY_HOME": str(home)}).job_timeout_seconds
+        environment = dict(os.environ)
+        environment["AI_MEMORY_HOME"] = str(home)
+        environment.pop("CLAUDE_MEMORY_HOME", None)
+        timeout = load_config(environment).job_timeout_seconds
     request = TextRequest(
         task=TaskKind.EXTRACT,
         prompt=build_flush_prompt(context, project_key, cwd),

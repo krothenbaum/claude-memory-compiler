@@ -123,7 +123,12 @@ def main() -> None:
         }
         if needs_marker:
             commit_compiled_bookkeeping(
-                log_path, state, now, state_baseline, log_baseline
+                DAILY_DIR.parent.resolve(),
+                log_path,
+                state,
+                now,
+                state_baseline,
+                log_baseline,
             )
         else:
             relative = (

@@ -132,8 +132,7 @@ conversation-log slice into structured wiki articles.
 All paths are relative to the staged workspace. Do not access files outside it."""
 
 
-def append_compiled_marker(log_path: Path, when: str) -> None:
-    home = log_path.resolve().parents[1]
+def append_compiled_marker(home: Path, log_path: Path, when: str) -> None:
     relative = log_path.resolve().relative_to(home).as_posix()
     _content, baseline = read_text_with_baseline(log_path)
     apply_host_bookkeeping(
@@ -147,13 +146,13 @@ def append_compiled_marker(log_path: Path, when: str) -> None:
 
 
 def commit_compiled_bookkeeping(
+    home: Path,
     log_path: Path,
     state: dict,
     when: str,
     state_baseline: FileBaseline,
     log_baseline: FileBaseline,
 ) -> None:
-    home = log_path.resolve().parents[1]
     apply_host_bookkeeping(
         home,
         ApplyBookkeeping(
@@ -194,7 +193,7 @@ async def compile_daily_log(
                 "compiled_at": compiled_at,
             }
             commit_compiled_bookkeeping(
-                log_path, state, compiled_at, state_baseline, log_baseline
+                home, log_path, state, compiled_at, state_baseline, log_baseline
             )
             return 0.0
     if not new_content:
@@ -206,7 +205,7 @@ async def compile_daily_log(
             "compiled_at": compiled_at,
         }
         commit_compiled_bookkeeping(
-            log_path, state, compiled_at, state_baseline, log_baseline
+            home, log_path, state, compiled_at, state_baseline, log_baseline
         )
         return 0.0
 
