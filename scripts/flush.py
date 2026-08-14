@@ -248,6 +248,7 @@ AUTO_COMPILE_HEARTBEAT_SECONDS = 30
 AUTO_COMPILE_WATCHER_POLL_SECONDS = 5
 AUTO_COMPILE_SPAWN_ATTEMPTS = 3
 AUTO_COMPILE_SPAWN_RETRY_SECONDS = 0.05
+AUTO_COMPILE_STARTUP_WAIT_SECONDS = 5
 AUTO_COMPILE_MAX_ATTEMPTS = 3
 AUTO_COMPILE_RETRY_BASE_SECONDS = 5
 _COMPILED_MARKER_RE = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
@@ -622,11 +623,13 @@ def _spawn_auto_compile_watchdog(
     coordinator_script: Path,
     token: str,
     predecessor_token: str | None = None,
+    *,
+    role: str = "watchdog",
 ) -> None:
     command = [
         sys.executable,
         str(coordinator_script),
-        "watchdog",
+        role,
         str(root),
         token,
     ]
@@ -708,72 +711,120 @@ def maybe_trigger_compilation(
     watchdog_token = secrets.token_hex(32)
     lease_now = datetime.now(timezone.utc)
     lease_expires = lease_now + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS)
-    with QueueRepository(
-        config.queue_path, memory_home=root, sync_usage=False
-    ) as repository:
-        roles = repository.schedule_auto_compile(
-            owner_token,
-            watchdog_token,
-            fingerprint,
-            log_name=today_log,
-            now=lease_now,
-            expires_at=lease_expires,
-        )
-        if not roles:
-            return False
-        contender_predecessor = (
-            repository.auto_compile_contender_predecessor(watchdog_token)
-            if "contender" in roles
-            else None
-        )
 
-    logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
-    if "watchdog" in roles:
-        try:
+    def launch_roles(roles: tuple[str, ...], predecessor: str | None) -> None:
+        if "watchdog" in roles:
             _spawn_auto_compile_watchdog(root, coordinator_script, watchdog_token)
-        except _AutoCompileWatchdogSpawnError as exc:
-            if "owner" in roles:
-                _rollback_auto_compile_schedule(root, owner_token, watchdog_token)
-            else:
-                _clear_auto_compile_watcher(root, watchdog_token)
-            logging.error("Failed to spawn auto-compile watchdog: %s", exc)
-            return False
-
-    if "contender" in roles:
-        if contender_predecessor is None:
-            _clear_auto_compile_contender(root, watchdog_token)
-            return False
-        try:
+        if "contender" in roles:
+            if predecessor is None:
+                raise _AutoCompileWatchdogSpawnError(
+                    "contender registration has no predecessor"
+                )
             _spawn_auto_compile_watchdog(
                 root,
                 coordinator_script,
                 watchdog_token,
-                contender_predecessor,
+                predecessor,
+                role="contender",
             )
-        except _AutoCompileWatchdogSpawnError as exc:
-            _clear_auto_compile_contender(root, watchdog_token)
-            logging.error("Failed to spawn auto-compile contender: %s", exc)
-            return False
-
-    if "owner" in roles:
-        owner_command = [
-            sys.executable,
-            str(coordinator_script),
-            "owner",
-            str(root),
-            owner_token,
-            fingerprint,
-        ]
-        try:
+        if "owner" in roles:
+            owner_command = [
+                sys.executable,
+                str(coordinator_script),
+                "owner",
+                str(root),
+                owner_token,
+                fingerprint,
+            ]
             with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
                 subprocess.Popen(
                     owner_command, **_compile_process_options(root, log_handle)
                 )
-        except Exception as exc:
-            _fail_auto_compile_owner_spawn(root, owner_token, fingerprint)
-            logging.error("Failed to spawn auto-compile owner: %s", exc)
+
+    try:
+        with QueueRepository(
+            config.queue_path, memory_home=root, sync_usage=False
+        ) as repository:
+            roles = repository.schedule_auto_compile(
+                owner_token,
+                watchdog_token,
+                fingerprint,
+                log_name=today_log,
+                now=lease_now,
+                expires_at=lease_expires,
+                launch_roles=launch_roles,
+            )
+    except Exception as exc:
+        logging.error("Failed to provision automatic compile processes: %s", exc)
+        return False
+    if not roles:
+        return False
+
+    logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
     notify_terminal("end-of-day compile scheduled")
     return True
+
+
+def _wait_for_auto_compile_registration(
+    root: Path,
+    token: str,
+    role: str,
+    *,
+    predecessor_token: str | None,
+    sleeper: Callable[[float], None],
+    clock: Callable[[], datetime],
+) -> bool:
+    """Wait briefly for a pre-commit child registration to become visible."""
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    deadline = clock() + timedelta(seconds=AUTO_COMPILE_STARTUP_WAIT_SECONDS)
+    while True:
+        observed_at = clock()
+        try:
+            with QueueRepository(
+                config.queue_path, memory_home=root, sync_usage=False
+            ) as repository:
+                if repository.auto_compile_role_registered(
+                    token, role, predecessor_token=predecessor_token
+                ):
+                    return True
+        except sqlite3.Error:
+            pass
+        if observed_at >= deadline:
+            return False
+        sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
+
+
+def run_auto_compile_owner_startup(
+    memory_home: Path | str,
+    token: str,
+    fingerprint: str,
+    *,
+    coordinator: Callable[[Path, str, str], bool] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> bool:
+    """Wait for the scheduling commit, then enter the ordinary coordinator."""
+    root = Path(memory_home).expanduser().resolve()
+    if not re.fullmatch(r"[0-9a-f]{64}", token) or not re.fullmatch(
+        r"[0-9a-f]{64}", fingerprint
+    ):
+        return False
+    if not _wait_for_auto_compile_registration(
+        root,
+        token,
+        "owner",
+        predecessor_token=None,
+        sleeper=sleeper,
+        clock=clock,
+    ):
+        return False
+    run_coordinator = coordinator or run_auto_compile_coordinator
+    return run_coordinator(root, token, fingerprint)
 
 
 def run_auto_compile_coordinator(
@@ -818,6 +869,7 @@ def run_auto_compile_coordinator(
         error_class: str,
         *,
         reset_on_fingerprint_change: bool = True,
+        required_marker_prefix: tuple[str, ...] | None = None,
     ) -> None:
         failed_at = datetime.now(timezone.utc)
         with QueueRepository(
@@ -834,6 +886,7 @@ def run_auto_compile_coordinator(
                 max_attempts=AUTO_COMPILE_MAX_ATTEMPTS,
                 retry_base_seconds=AUTO_COMPILE_RETRY_BASE_SECONDS,
                 reset_on_fingerprint_change=reset_on_fingerprint_change,
+                required_marker_prefix=required_marker_prefix,
             )
 
     try:
@@ -864,15 +917,32 @@ def run_auto_compile_coordinator(
                             active_read.status == "covered"
                             and pending_fingerprint is None
                         ):
-                            repository.finish_auto_compile_generation(
+                            required_markers = reservation[4]
+                            if required_markers is not None and not (
+                                len(active_read.markers) > len(required_markers)
+                                and active_read.markers[: len(required_markers)]
+                                == required_markers
+                            ):
+                                record_failure(
+                                    active_log,
+                                    "compile_invalid_marker_progress",
+                                    reset_on_fingerprint_change=False,
+                                    required_marker_prefix=required_markers,
+                                )
+                                return False
+                            next_fingerprint = repository.finish_auto_compile_generation(
                                 token,
                                 active_fingerprint,
-                                lambda: ("covered", None),
+                                lambda: _queue_content_read(active_log),
                                 now=reservation_now,
                                 expires_at=reservation_now
                                 + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
                             )
-                            return True
+                            if next_fingerprint is None:
+                                return True
+                            active_fingerprint = next_fingerprint
+                            log_path = active_log
+                            break
                     if pending_fingerprint is None:
                         return False
                     pending_log_name = reservation[3]
@@ -1019,7 +1089,7 @@ def run_auto_compile_coordinator(
             marker_advanced = marker_history_valid and (
                 len(read_after.markers) > len(read_before.markers)
             )
-            if read_after.status != "covered" and not marker_advanced:
+            if not marker_advanced:
                 markers_unchanged = read_after.markers == read_before.markers
                 record_failure(
                     log_path,
@@ -1029,6 +1099,11 @@ def run_auto_compile_coordinator(
                         else "compile_invalid_marker_progress"
                     ),
                     reset_on_fingerprint_change=markers_unchanged,
+                    required_marker_prefix=(
+                        read_before.markers
+                        if read_after.status == "covered"
+                        else None
+                    ),
                 )
                 return False
 
@@ -1039,7 +1114,7 @@ def run_auto_compile_coordinator(
                 next_fingerprint = repository.finish_auto_compile_generation(
                     token,
                     active_fingerprint,
-                    lambda: (read_after.status, read_after.fingerprint),
+                    lambda: _queue_content_read(log_path),
                     now=handoff_at,
                     expires_at=handoff_at
                     + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -1069,6 +1144,26 @@ def _observe_auto_compile_content(
         pending is not None and pending[0].status == "unreadable"
     ):
         return "unreadable", None
+    required_marker_prefix = reservation.get("required_marker_prefix")
+    if (
+        active is not None
+        and active[0].status == "covered"
+        and isinstance(required_marker_prefix, list)
+        and all(isinstance(marker, str) for marker in required_marker_prefix)
+    ):
+        required = tuple(required_marker_prefix)
+        marker_advanced = (
+            len(active[0].markers) > len(required)
+            and active[0].markers[: len(required)] == required
+        )
+        if not marker_advanced:
+            fingerprint = reservation.get("fingerprint")
+            if not isinstance(fingerprint, str):
+                return "unreadable", None
+            return "uncompiled", {
+                "fingerprint": fingerprint,
+                "log_name": active[1],
+            }
     if active is None or active[0].status == "covered":
         if pending is None or pending[0].status == "covered":
             return "covered", None
@@ -1095,6 +1190,7 @@ def run_auto_compile_watcher(
     token: str,
     *,
     predecessor_token: str | None = None,
+    registration_required: bool = False,
     coordinator: Callable[[Path, str, str], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
@@ -1108,6 +1204,15 @@ def run_auto_compile_watcher(
         return False
     if predecessor_token is not None and not re.fullmatch(
         r"[0-9a-f]{64}", predecessor_token
+    ):
+        return False
+    if registration_required and not _wait_for_auto_compile_registration(
+        root,
+        token,
+        "contender" if predecessor_token is not None else "watchdog",
+        predecessor_token=predecessor_token,
+        sleeper=sleeper,
+        clock=clock,
     ):
         return False
     environment = dict(os.environ)
@@ -1141,6 +1246,7 @@ def run_auto_compile_watcher(
                         root, coordinator_script, candidate, token
                     ),
                     predecessor_token=predecessor_token,
+                    registration_required=registration_required,
                     now=observed_at,
                     watcher_expires_at=observed_at
                     + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),

@@ -950,6 +950,7 @@ class QueueRepository:
         log_name: str,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
+        launch_roles: Callable[[tuple[str, ...], str | None], None] | None = None,
     ) -> tuple[str, ...]:
         """Atomically provision an owner and exactly one takeover watchdog."""
         for label, value in (
@@ -979,6 +980,7 @@ class QueueRepository:
                 except (TypeError, json.JSONDecodeError):
                     reservation = {}
             status = reservation.get("status")
+            predecessor_token: str | None = None
             if not reservation or status == "failed":
                 reservation = {
                     "token": owner_token,
@@ -1015,6 +1017,7 @@ class QueueRepository:
                     reservation["contender_predecessor_token"] = reservation[
                         "watcher_token"
                     ]
+                    predecessor_token = str(reservation["watcher_token"])
                     reservation["contender_expires_at"] = _stored_time(expires_dt)
                     roles = ("contender",)
                 elif watcher_live:
@@ -1036,6 +1039,8 @@ class QueueRepository:
                     json.dumps(reservation, sort_keys=True, separators=(",", ":")),
                 ),
             )
+            if roles and launch_roles is not None:
+                launch_roles(roles, predecessor_token)
             self._connection.execute("COMMIT")
             return roles
         except BaseException:
@@ -1150,6 +1155,36 @@ class QueueRepository:
             return None
         return predecessor
 
+    def auto_compile_role_registered(
+        self,
+        token: str,
+        role: str,
+        *,
+        predecessor_token: str | None,
+    ) -> bool:
+        """Return whether one pre-commit child role is now durably registered."""
+        row = self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            reservation = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if role == "owner":
+            return reservation.get("token") == token
+        if role == "watchdog":
+            return reservation.get("watcher_token") == token
+        if role == "contender":
+            return (
+                reservation.get("contender_token") == token
+                and reservation.get("contender_predecessor_token")
+                == predecessor_token
+            )
+        return False
+
     def clear_auto_compile_contender(self, token: str) -> bool:
         """Clear only the matching contender after its process fails to spawn."""
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1243,6 +1278,7 @@ class QueueRepository:
         launch_successor: Callable[[str], None],
         *,
         predecessor_token: str | None,
+        registration_required: bool = False,
         now: datetime | str | int | float,
         watcher_expires_at: datetime | str | int | float,
         owner_expires_at: datetime | str | int | float,
@@ -1275,6 +1311,9 @@ class QueueRepository:
             registered_watcher = reservation.get("watcher_token")
             if registered_watcher != token:
                 registered_contender = reservation.get("contender_token")
+                if registration_required and registered_contender != token:
+                    self._connection.execute("COMMIT")
+                    return "done", None
                 recovering_watcher = (
                     predecessor_token is not None
                     and registered_watcher == predecessor_token
@@ -1413,6 +1452,7 @@ class QueueRepository:
             if changed_generation:
                 reservation.pop("attempt_count", None)
                 reservation.pop("last_error_class", None)
+                reservation.pop("required_marker_prefix", None)
             reservation.pop("next_retry_at", None)
             reservation.pop("status", None)
             self._connection.execute(
@@ -1442,12 +1482,17 @@ class QueueRepository:
         max_attempts: int = 3,
         retry_base_seconds: int = 5,
         reset_on_fingerprint_change: bool = True,
+        required_marker_prefix: tuple[str, ...] | None = None,
     ) -> str:
         """Persist bounded retry state for an ordinary compile failure."""
         now_dt = _datetime(now)
         expires_dt = _datetime(expires_at)
         if max_attempts < 1 or retry_base_seconds < 1 or expires_dt <= now_dt:
             raise ValueError("invalid auto-compile retry policy")
+        if required_marker_prefix is not None and not all(
+            isinstance(marker, str) for marker in required_marker_prefix
+        ):
+            raise ValueError("invalid required marker prefix")
         safe_error = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(error_class))[:64]
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1472,6 +1517,7 @@ class QueueRepository:
             promoted_log_name = reservation.get("log_name")
             if (
                 read_status == "covered"
+                and required_marker_prefix is None
                 and reservation.get("pending_log_name")
                 != reservation.get("log_name")
                 and isinstance(reservation.get("pending_fingerprint"), str)
@@ -1480,15 +1526,21 @@ class QueueRepository:
                 observed = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
                 active_observed = False
-            if read_status == "covered" and observed is None:
+            if (
+                read_status == "covered"
+                and required_marker_prefix is None
+                and observed is None
+            ):
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
                 )
                 self._connection.execute("COMMIT")
                 return "covered"
-            if read_status == "unreadable":
+            if read_status == "unreadable" or required_marker_prefix is not None:
                 observed = fingerprint
+            if required_marker_prefix is not None:
+                reservation["required_marker_prefix"] = list(required_marker_prefix)
             changed = observed != fingerprint
             if changed and reset_on_fingerprint_change:
                 reservation["fingerprint"] = observed
@@ -1646,7 +1698,9 @@ class QueueRepository:
         token: str,
         *,
         now: datetime | str | int | float,
-    ) -> tuple[str, str | None, str | None, str | None] | None:
+    ) -> tuple[
+        str, str | None, str | None, str | None, tuple[str, ...] | None
+    ] | None:
         """Return an owned active/pending fingerprint and source-name pair."""
         now_dt = _datetime(now)
         row = self._connection.execute(
@@ -1687,7 +1741,16 @@ class QueueRepository:
             or Path(pending_log_name).name != pending_log_name
         ):
             return None
-        return fingerprint, pending, log_name, pending_log_name
+        required_marker_prefix = reservation.get("required_marker_prefix")
+        if required_marker_prefix is not None:
+            if not isinstance(required_marker_prefix, list) or not all(
+                isinstance(marker, str) for marker in required_marker_prefix
+            ):
+                return None
+            required_markers = tuple(required_marker_prefix)
+        else:
+            required_markers = None
+        return fingerprint, pending, log_name, pending_log_name, required_markers
 
     def promote_pending_auto_compile(
         self,

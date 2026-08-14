@@ -1800,11 +1800,31 @@ def test_first_auto_compile_request_atomically_spawns_owner_and_watchdog(
 ):
     root, _daily = _auto_compile_test_root(tmp_path)
     commands = []
+    scheduling = [False]
+    spawn_during_transaction = []
+    real_schedule = QueueRepository.schedule_auto_compile
+
+    def observed_schedule(repository, *args, **kwargs):
+        scheduling[0] = True
+        try:
+            return real_schedule(repository, *args, **kwargs)
+        finally:
+            scheduling[0] = False
+
     _configure_auto_compile_test(monkeypatch, commands)
+    monkeypatch.setattr(QueueRepository, "schedule_auto_compile", observed_schedule)
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: (
+            spawn_during_transaction.append(scheduling[0]), commands.append(command)
+        ),
+    )
 
     assert _schedule_auto_compile(root) is True
 
     assert [command[2] for command in commands] == ["watchdog", "owner"]
+    assert spawn_during_transaction == [True, True]
     watchdog_token = commands[0][-1]
     owner_token, fingerprint = commands[1][-2:]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
@@ -1868,7 +1888,7 @@ def test_watchdog_spawn_failure_rolls_back_both_first_roles_for_retry(
         assert _reservation(repository) is None
 
 
-def test_watchdog_spawn_rollback_preserves_concurrent_pending_generation(
+def test_watchdog_spawn_rollback_leaves_latest_generation_retryable(
     tmp_path, monkeypatch
 ):
     root, daily = _auto_compile_test_root(tmp_path)
@@ -1880,24 +1900,26 @@ def test_watchdog_spawn_rollback_preserves_concurrent_pending_generation(
 
     def fail_watchdog(command, **_options):
         attempts.append(command)
-        if len(attempts) == 1:
-            daily.write_text("A\nB\n", encoding="utf-8")
-            assert _schedule_auto_compile(root) is False
         raise OSError("watchdog spawn failed")
 
     monkeypatch.setattr(flush_module.subprocess, "Popen", fail_watchdog)
 
     assert _schedule_auto_compile(root) is False
+    daily.write_text("A\nB\n", encoding="utf-8")
+    monkeypatch.setattr(
+        flush_module.subprocess,
+        "Popen",
+        lambda command, **_options: attempts.append(command),
+    )
+    assert _schedule_auto_compile(root) is True
 
     latest = flush_module._uncompiled_fingerprint(daily)
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         state = _reservation(repository)
-    assert state["pending_fingerprint"] == latest
-    assert state["status"] == "spawn_failed"
-    assert "watcher_token" not in state
+    assert state["fingerprint"] == latest
 
 
-def test_owner_spawn_failure_preserves_watchdog_for_immediate_takeover(
+def test_partial_first_pair_spawn_failure_rolls_back_registration(
     tmp_path, monkeypatch
 ):
     root, _daily = _auto_compile_test_root(tmp_path)
@@ -1913,14 +1935,197 @@ def test_owner_spawn_failure_preserves_watchdog_for_immediate_takeover(
 
     monkeypatch.setattr(flush_module.subprocess, "Popen", spawn)
 
-    assert _schedule_auto_compile(root) is True
+    assert _schedule_auto_compile(root) is False
 
     assert [command[2] for command in launches] == ["watchdog", "owner"]
-    watchdog_token = launches[0][-1]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_schedule_spawn_then_commit_failure_rolls_back_and_children_see_no_role(
+    tmp_path
+):
+    database = tmp_path / "jobs.sqlite3"
+    owner = "1" * 64
+    watchdog = "2" * 64
+    fingerprint = "a" * 64
+    spawned = []
+    with QueueRepository(database, sync_usage=False) as repository:
+
+        def spawn_then_rollback(roles, predecessor):
+            assert repository._connection.in_transaction
+            assert roles == ("owner", "watchdog")
+            assert predecessor is None
+            spawned.extend(roles)
+            repository._connection.execute("ROLLBACK")
+
+        with pytest.raises(sqlite3.OperationalError):
+            repository.schedule_auto_compile(
+                owner,
+                watchdog,
+                fingerprint,
+                log_name="2026-08-11.md",
+                now=NOW,
+                expires_at=NOW + timedelta(minutes=2),
+                launch_roles=spawn_then_rollback,
+            )
+    assert spawned == ["owner", "watchdog"]
+    with QueueRepository(database, sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+@pytest.mark.parametrize("registration", ["replacement", "contender"])
+def test_later_role_is_spawned_inside_its_registration_transaction(
+    tmp_path, registration
+):
+    database = tmp_path / "jobs.sqlite3"
+    owner = "1" * 64
+    predecessor = "2" * 64
+    candidate = "3" * 64
+    fingerprint = "a" * 64
+    later = "b" * 64
+    launched = []
+    with QueueRepository(database, sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            predecessor,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        ) == ("owner", "watchdog")
         state = _reservation(repository)
-    assert state["watcher_token"] == watchdog_token
-    assert datetime.fromisoformat(state["expires_at"]) <= datetime.now(timezone.utc)
+        if registration == "replacement":
+            state["watcher_expires_at"] = (NOW - timedelta(seconds=1)).isoformat()
+        else:
+            state["status"] = "queue_wait"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+        def launch(roles, predecessor_token):
+            assert repository._connection.in_transaction
+            current = _reservation(repository)
+            if registration == "replacement":
+                assert roles == ("watchdog",)
+                assert current["watcher_token"] == candidate
+                assert predecessor_token is None
+            else:
+                assert roles == ("contender",)
+                assert current["contender_token"] == candidate
+                assert predecessor_token == predecessor
+            launched.append(roles)
+
+        roles = repository.schedule_auto_compile(
+            "4" * 64,
+            candidate,
+            later,
+            log_name="2026-08-11.md",
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=3),
+            launch_roles=launch,
+        )
+    assert launched == [roles]
+
+
+def test_precommit_owner_starts_after_committed_registration_is_visible(
+    tmp_path
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    owner = "1" * 64
+    watchdog = "2" * 64
+    fingerprint = "a" * 64
+    with QueueRepository(
+        root / "scripts/jobs.sqlite3", memory_home=root, sync_usage=False
+    ) as repository:
+        repository.schedule_auto_compile(
+            owner,
+            watchdog,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        )
+    calls = []
+    assert flush_module.run_auto_compile_owner_startup(
+        root,
+        owner,
+        fingerprint,
+        coordinator=lambda *_args: calls.append(True) or True,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("committed owner should start immediately")
+        ),
+        clock=lambda: NOW,
+    )
+    assert calls == [True]
+
+
+def test_precommit_owner_waits_while_registration_is_not_yet_visible(
+    tmp_path, monkeypatch
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    visible = iter([False, True])
+    checks = []
+
+    def registration(_repository, _token, role, *, predecessor_token):
+        checks.append((role, predecessor_token))
+        return next(visible)
+
+    monkeypatch.setattr(
+        QueueRepository, "auto_compile_role_registered", registration
+    )
+    sleeps = []
+    coordinated = []
+    assert flush_module.run_auto_compile_owner_startup(
+        root,
+        "1" * 64,
+        "a" * 64,
+        coordinator=lambda *_args: coordinated.append(True) or True,
+        sleeper=sleeps.append,
+        clock=lambda: NOW,
+    )
+    assert checks == [("owner", None), ("owner", None)]
+    assert len(sleeps) == 1
+    assert coordinated == [True]
+
+
+def test_precommit_owner_exits_safely_when_registration_rolled_back(tmp_path):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    ticks = iter(
+        [
+            NOW,
+            NOW,
+            NOW + timedelta(seconds=10),
+        ]
+    )
+    assert not flush_module.run_auto_compile_owner_startup(
+        root,
+        "1" * 64,
+        "a" * 64,
+        coordinator=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("rolled-back owner must not coordinate")
+        ),
+        sleeper=lambda _seconds: None,
+        clock=lambda: next(ticks),
+    )
+
+
+def test_precommit_watchdog_exits_safely_when_registration_rolled_back(tmp_path):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    ticks = iter([NOW, NOW, NOW + timedelta(seconds=10)])
+    assert not flush_module.run_auto_compile_watcher(
+        root,
+        "2" * 64,
+        registration_required=True,
+        coordinator=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("rolled-back watchdog must not coordinate")
+        ),
+        sleeper=lambda _seconds: None,
+        lock_probe=lambda _root: False,
+        clock=lambda: next(ticks),
+    )
 
 
 def test_end_of_day_scheduler_adds_one_watcher_across_repeated_callers(
@@ -2436,7 +2641,15 @@ def test_prelaunch_unreadable_daily_log_uses_durable_failure(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(
-    "mutation", ["unreadable", "replacement", "truncation"]
+    "mutation",
+    [
+        "unreadable",
+        "replacement",
+        "truncation",
+        "replacement_covered",
+        "truncation_covered",
+        "no_marker_covered",
+    ],
 )
 def test_exit_zero_invalid_or_unreadable_marker_state_uses_backoff(
     tmp_path, monkeypatch, mutation
@@ -2459,6 +2672,14 @@ def test_exit_zero_invalid_or_unreadable_marker_state_uses_backoff(
                     "<!-- @compiled-through:replacement -->\nA\n",
                     encoding="utf-8",
                 )
+            elif mutation == "replacement_covered":
+                daily.write_text(
+                    "<!-- @compiled-through:replacement -->\n", encoding="utf-8"
+                )
+            elif mutation == "truncation_covered":
+                daily.write_text("\n", encoding="utf-8")
+            elif mutation == "no_marker_covered":
+                daily.write_text("", encoding="utf-8")
             else:
                 daily.write_text("A\n", encoding="utf-8")
             return 0
@@ -2479,36 +2700,173 @@ def test_exit_zero_invalid_or_unreadable_marker_state_uses_backoff(
     }
 
 
-@pytest.mark.parametrize(
-    "covered_content",
-    ["\n", "<!-- @compiled-through:replacement -->\n"],
-)
-def test_exit_zero_readable_covered_state_is_success_without_marker_progress(
-    tmp_path, monkeypatch, covered_content
+def test_finish_rereads_same_log_after_covered_read_and_preserves_later_append(
+    tmp_path, monkeypatch
 ):
     root, daily = _auto_compile_test_root(tmp_path)
-    if "replacement" in covered_content:
-        daily.write_text(
-            "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
-        )
     commands = []
     _configure_auto_compile_test(monkeypatch, commands)
     assert _schedule_auto_compile(root) is True
     token, fingerprint = _owner_command(commands)[-2:]
+    real_finish = QueueRepository.finish_auto_compile_generation
+    launches = []
+    appended = False
 
-    class CoveredCompile:
+    def finish_with_later_append(repository, *args, **kwargs):
+        nonlocal appended
+        if not appended:
+            appended = True
+            daily.write_text(
+                "A\n<!-- @compiled-through:first -->\nB\n", encoding="utf-8"
+            )
+            latest = flush_module._uncompiled_fingerprint(daily)
+            assert latest is not None
+            with QueueRepository(
+                root / "scripts/jobs.sqlite3", sync_usage=False
+            ) as scheduler:
+                scheduler.schedule_auto_compile(
+                    "7" * 64,
+                    "8" * 64,
+                    latest,
+                    log_name=daily.name,
+                    now=NOW,
+                    expires_at=NOW + timedelta(minutes=2),
+                )
+        return real_finish(repository, *args, **kwargs)
+
+    monkeypatch.setattr(
+        QueueRepository, "finish_auto_compile_generation", finish_with_later_append
+    )
+
+    class Compile:
         def wait(self, timeout=None):
-            daily.write_text(covered_content, encoding="utf-8")
+            launches.append(True)
+            marker = "first" if len(launches) == 1 else "second"
+            daily.write_text(
+                daily.read_text(encoding="utf-8")
+                + f"<!-- @compiled-through:{marker} -->\n",
+                encoding="utf-8",
+            )
             return 0
 
     assert flush_module.run_auto_compile_coordinator(
         root,
         token,
         fingerprint,
-        compile_launcher=lambda *_args, **_kwargs: CoveredCompile(),
+        compile_launcher=lambda *_args, **_kwargs: Compile(),
     )
+    assert launches == [True, True]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         assert _reservation(repository) is None
+
+
+def test_covered_recovery_rereads_same_log_inside_finish_transaction(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+    daily.write_text(
+        "A\n<!-- @compiled-through:external -->\n", encoding="utf-8"
+    )
+    real_finish = QueueRepository.finish_auto_compile_generation
+    appended = False
+
+    def finish_with_later_append(repository, *args, **kwargs):
+        nonlocal appended
+        if not appended:
+            appended = True
+            daily.write_text(
+                daily.read_text(encoding="utf-8") + "B\n", encoding="utf-8"
+            )
+            latest = flush_module._uncompiled_fingerprint(daily)
+            assert latest is not None
+            with QueueRepository(
+                root / "scripts/jobs.sqlite3", sync_usage=False
+            ) as scheduler:
+                scheduler.schedule_auto_compile(
+                    "7" * 64,
+                    "8" * 64,
+                    latest,
+                    log_name=daily.name,
+                    now=NOW,
+                    expires_at=NOW + timedelta(minutes=2),
+                )
+        return real_finish(repository, *args, **kwargs)
+
+    monkeypatch.setattr(
+        QueueRepository, "finish_auto_compile_generation", finish_with_later_append
+    )
+    launches = []
+
+    class Compile:
+        def wait(self, timeout=None):
+            launches.append(True)
+            daily.write_text(
+                daily.read_text(encoding="utf-8")
+                + "<!-- @compiled-through:later -->\n",
+                encoding="utf-8",
+            )
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: Compile(),
+    )
+    assert launches == [True]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_invalid_covered_marker_is_retained_for_watcher_retry(tmp_path, monkeypatch):
+    root, daily = _auto_compile_test_root(tmp_path)
+    daily.write_text(
+        "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
+    )
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class InvalidCompile:
+        def wait(self, timeout=None):
+            daily.write_text(
+                "<!-- @compiled-through:replacement -->\n", encoding="utf-8"
+            )
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: InvalidCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        retry_at = datetime.fromisoformat(state["next_retry_at"])
+        state["expires_at"] = retry_at.isoformat(timespec="microseconds")
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+        status, claimed = repository.poll_auto_compile_watcher(
+            state["watcher_token"],
+            "9" * 64,
+            lambda reservation: flush_module._observe_auto_compile_content(
+                root, dict(reservation)
+            ),
+            lambda _token: None,
+            predecessor_token=None,
+            now=retry_at + timedelta(microseconds=1),
+            watcher_expires_at=retry_at + timedelta(minutes=2),
+            owner_expires_at=retry_at + timedelta(minutes=2),
+        )
+    assert (status, claimed) == ("claimed", fingerprint)
 
 
 def test_ordinary_failure_then_watchdog_retry_succeeds_without_new_session(
@@ -3741,7 +4099,7 @@ def test_later_drain_preprovisions_contender_that_survives_watcher_death(
 
     assert _schedule_auto_compile(root) is True
     contender_command = commands[-1]
-    assert contender_command[2] == "watchdog"
+    assert contender_command[2] == "contender"
     contender = contender_command[-2]
     assert contender_command[-1] == predecessor
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:

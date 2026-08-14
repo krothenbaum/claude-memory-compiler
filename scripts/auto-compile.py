@@ -9,23 +9,42 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from flush import run_auto_compile_coordinator, run_auto_compile_watcher  # noqa: E402
+from flush import (  # noqa: E402
+    run_auto_compile_owner_startup,
+    run_auto_compile_watcher,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if len(arguments) == 4 and arguments[0] == "owner":
         _role, root, token, fingerprint = arguments
-        return 0 if run_auto_compile_coordinator(root, token, fingerprint) else 1
+        return 0 if run_auto_compile_owner_startup(root, token, fingerprint) else 1
     if len(arguments) == 3 and arguments[0] in {"watcher", "watchdog"}:
         _role, root, token = arguments
-        return 0 if run_auto_compile_watcher(root, token) else 1
+        return (
+            0
+            if run_auto_compile_watcher(root, token, registration_required=True)
+            else 1
+        )
     if len(arguments) == 4 and arguments[0] in {"watcher", "watchdog"}:
         _role, root, token, predecessor_token = arguments
         return (
             0
             if run_auto_compile_watcher(
                 root, token, predecessor_token=predecessor_token
+            )
+            else 1
+        )
+    if len(arguments) == 4 and arguments[0] == "contender":
+        _role, root, token, predecessor_token = arguments
+        return (
+            0
+            if run_auto_compile_watcher(
+                root,
+                token,
+                predecessor_token=predecessor_token,
+                registration_required=True,
             )
             else 1
         )
