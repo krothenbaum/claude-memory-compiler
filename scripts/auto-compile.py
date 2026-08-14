@@ -20,6 +20,15 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) == 3 and arguments[0] in {"watcher", "watchdog"}:
         _role, root, token = arguments
         return 0 if run_auto_compile_watcher(root, token) else 1
+    if len(arguments) == 4 and arguments[0] in {"watcher", "watchdog"}:
+        _role, root, token, predecessor_token = arguments
+        return (
+            0
+            if run_auto_compile_watcher(
+                root, token, predecessor_token=predecessor_token
+            )
+            else 1
+        )
     return 2
 
 

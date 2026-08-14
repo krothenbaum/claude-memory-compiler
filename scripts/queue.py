@@ -12,7 +12,7 @@ import re
 import sqlite3
 import stat
 import sysconfig
-from typing import Callable, Literal, Mapping
+from typing import Callable, Literal, Mapping, TypeAlias
 
 try:
     from .providers import ProviderResult
@@ -56,6 +56,8 @@ SimpleQueue = _stdlib_queue.SimpleQueue
 
 
 JobStatus = Literal["pending", "leased", "succeeded", "failed", "dead"]
+AutoCompileReadStatus = Literal["unreadable", "covered", "uncompiled"]
+AutoCompileContentRead: TypeAlias = tuple[AutoCompileReadStatus, str | None]
 SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
@@ -748,6 +750,25 @@ class QueueRepository:
             character in "0123456789abcdef" for character in value
         )
 
+    @classmethod
+    def _validate_auto_compile_read(
+        cls, observation: AutoCompileContentRead
+    ) -> AutoCompileContentRead:
+        try:
+            status, fingerprint = observation
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid auto-compile content observation") from exc
+        if status not in {"unreadable", "covered", "uncompiled"}:
+            raise ValueError("invalid auto-compile content status")
+        if status == "uncompiled":
+            if not isinstance(fingerprint, str) or not cls._valid_reservation_component(
+                fingerprint
+            ):
+                raise ValueError("uncompiled observation requires a fingerprint")
+        elif fingerprint is not None:
+            raise ValueError("non-uncompiled observation cannot have a fingerprint")
+        return status, fingerprint
+
     def _active_work_unlocked(self) -> bool:
         return self._connection.execute(
             """
@@ -957,10 +978,6 @@ class QueueRepository:
                     reservation = json.loads(row["value"])
                 except (TypeError, json.JSONDecodeError):
                     reservation = {}
-            try:
-                owner_live = _datetime(reservation["expires_at"]) > now_dt
-            except (KeyError, TypeError, ValueError):
-                owner_live = False
             status = reservation.get("status")
             if not reservation or status == "failed":
                 reservation = {
@@ -972,22 +989,6 @@ class QueueRepository:
                     "watcher_expires_at": _stored_time(expires_dt),
                 }
                 roles = ("owner", "watchdog")
-            elif not owner_live:
-                reservation["pending_fingerprint"] = fingerprint
-                reservation["pending_log_name"] = log_name
-                try:
-                    watcher_live = (
-                        _datetime(reservation["watcher_expires_at"]) > now_dt
-                        and isinstance(reservation.get("watcher_token"), str)
-                    )
-                except (KeyError, TypeError, ValueError):
-                    watcher_live = False
-                if watcher_live:
-                    roles = ()
-                else:
-                    reservation["watcher_token"] = watchdog_token
-                    reservation["watcher_expires_at"] = _stored_time(expires_dt)
-                    roles = ("watchdog",)
             else:
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
@@ -998,9 +999,30 @@ class QueueRepository:
                     )
                 except (KeyError, TypeError, ValueError):
                     watcher_live = False
-                if watcher_live:
+                try:
+                    contender_live = (
+                        _datetime(reservation["contender_expires_at"]) > now_dt
+                        and isinstance(reservation.get("contender_token"), str)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    contender_live = False
+                if (
+                    watcher_live
+                    and status in {"queue_wait", "retry_wait", "read_wait"}
+                    and not contender_live
+                ):
+                    reservation["contender_token"] = watchdog_token
+                    reservation["contender_predecessor_token"] = reservation[
+                        "watcher_token"
+                    ]
+                    reservation["contender_expires_at"] = _stored_time(expires_dt)
+                    roles = ("contender",)
+                elif watcher_live:
                     roles = ()
                 else:
+                    reservation.pop("contender_token", None)
+                    reservation.pop("contender_predecessor_token", None)
+                    reservation.pop("contender_expires_at", None)
                     reservation["watcher_token"] = watchdog_token
                     reservation["watcher_expires_at"] = _stored_time(expires_dt)
                     roles = ("watchdog",)
@@ -1107,6 +1129,62 @@ class QueueRepository:
                 self._connection.execute("ROLLBACK")
             raise
 
+    def auto_compile_contender_predecessor(self, token: str) -> str | None:
+        """Return the registered predecessor for one exact contender token."""
+        row = self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            reservation = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        predecessor = reservation.get("contender_predecessor_token")
+        if (
+            reservation.get("contender_token") != token
+            or not isinstance(predecessor, str)
+            or not self._valid_reservation_component(predecessor)
+        ):
+            return None
+        return predecessor
+
+    def clear_auto_compile_contender(self, token: str) -> bool:
+        """Clear only the matching contender after its process fails to spawn."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            reservation = {}
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+            matched = reservation.get("contender_token") == token
+            if matched:
+                reservation.pop("contender_token", None)
+                reservation.pop("contender_predecessor_token", None)
+                reservation.pop("contender_expires_at", None)
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+            self._connection.execute("COMMIT")
+            return matched
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
     def fail_auto_compile_owner_spawn(
         self,
         token: str,
@@ -1159,9 +1237,12 @@ class QueueRepository:
         self,
         token: str,
         successor_token: str,
-        observe: Callable[[Mapping[str, object]], Mapping[str, str] | None],
+        observe: Callable[
+            [Mapping[str, object]], tuple[AutoCompileReadStatus, Mapping[str, str] | None]
+        ],
         launch_successor: Callable[[str], None],
         *,
+        predecessor_token: str | None,
         now: datetime | str | int | float,
         watcher_expires_at: datetime | str | int | float,
         owner_expires_at: datetime | str | int | float,
@@ -1169,6 +1250,10 @@ class QueueRepository:
         """Heartbeat a watcher or atomically promote it after owner expiry."""
         if not self._valid_reservation_component(successor_token):
             raise ValueError("successor token must be a lowercase SHA-256 value")
+        if predecessor_token is not None and not self._valid_reservation_component(
+            predecessor_token
+        ):
+            raise ValueError("predecessor token must be a lowercase SHA-256 value")
         now_dt = _datetime(now)
         watcher_expiry = _datetime(watcher_expires_at)
         owner_expiry = _datetime(owner_expires_at)
@@ -1187,9 +1272,66 @@ class QueueRepository:
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 self._connection.execute("COMMIT")
                 return "done", None
-            if reservation.get("watcher_token") != token:
-                self._connection.execute("COMMIT")
-                return "done", None
+            registered_watcher = reservation.get("watcher_token")
+            if registered_watcher != token:
+                registered_contender = reservation.get("contender_token")
+                recovering_watcher = (
+                    predecessor_token is not None
+                    and registered_watcher == predecessor_token
+                )
+                recovering_contender = (
+                    predecessor_token is not None
+                    and registered_contender == predecessor_token
+                )
+                if recovering_contender:
+                    try:
+                        contender_expiry = _datetime(
+                            reservation["contender_expires_at"]
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        contender_expiry = now_dt
+                    if contender_expiry > now_dt:
+                        self._connection.execute("COMMIT")
+                        return "wait", None
+                    reservation["contender_token"] = token
+                    reservation["contender_expires_at"] = _stored_time(
+                        watcher_expiry
+                    )
+                    registered_contender = token
+                    recovering_watcher = (
+                        reservation.get("contender_predecessor_token")
+                        == registered_watcher
+                    )
+                if not recovering_watcher or registered_contender not in {None, token}:
+                    self._connection.execute("COMMIT")
+                    return "done", None
+                try:
+                    predecessor_expiry = _datetime(reservation["watcher_expires_at"])
+                except (KeyError, TypeError, ValueError):
+                    predecessor_expiry = now_dt
+                if predecessor_expiry > now_dt:
+                    if registered_contender == token:
+                        reservation["contender_expires_at"] = _stored_time(
+                            watcher_expiry
+                        )
+                        self._connection.execute(
+                            "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                            (
+                                json.dumps(
+                                    reservation,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                AUTO_COMPILE_RESERVATION_KEY,
+                            ),
+                        )
+                    self._connection.execute("COMMIT")
+                    return "wait", None
+                reservation["watcher_token"] = token
+                reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
+                reservation.pop("contender_token", None)
+                reservation.pop("contender_predecessor_token", None)
+                reservation.pop("contender_expires_at", None)
             if reservation.get("status") == "failed":
                 reservation.pop("watcher_token", None)
                 reservation.pop("watcher_expires_at", None)
@@ -1217,14 +1359,30 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return "wait", None
-            observed = observe(reservation)
-            if observed is None:
+            observed_status, observed = observe(reservation)
+            if observed_status == "unreadable":
+                reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
+                reservation["status"] = "read_wait"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return "wait", None
+            if observed_status == "covered":
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
                 )
                 self._connection.execute("COMMIT")
                 return "done", None
+            if observed_status != "uncompiled" or observed is None:
+                raise ValueError("invalid watcher content observation")
             if current_owner_expiry > now_dt:
                 reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
                 self._connection.execute(
@@ -1240,6 +1398,9 @@ class QueueRepository:
                 return "wait", None
             reservation.pop("pending_fingerprint", None)
             reservation.pop("pending_log_name", None)
+            reservation.pop("contender_token", None)
+            reservation.pop("contender_predecessor_token", None)
+            reservation.pop("contender_expires_at", None)
             changed_generation = (
                 observed.get("fingerprint") != reservation.get("fingerprint")
             )
@@ -1274,12 +1435,13 @@ class QueueRepository:
         token: str,
         fingerprint: str,
         error_class: str,
-        current_fingerprint: Callable[[], str | None],
+        current_content: Callable[[], AutoCompileContentRead],
         *,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
         max_attempts: int = 3,
         retry_base_seconds: int = 5,
+        reset_on_fingerprint_change: bool = True,
     ) -> str:
         """Persist bounded retry state for an ordinary compile failure."""
         now_dt = _datetime(now)
@@ -1305,11 +1467,11 @@ class QueueRepository:
             ):
                 self._connection.execute("COMMIT")
                 return "lost"
-            observed = current_fingerprint()
-            active_observed = observed is not None
+            read_status, observed = self._validate_auto_compile_read(current_content())
+            active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
             if (
-                observed is None
+                read_status == "covered"
                 and reservation.get("pending_log_name")
                 != reservation.get("log_name")
                 and isinstance(reservation.get("pending_fingerprint"), str)
@@ -1317,15 +1479,18 @@ class QueueRepository:
             ):
                 observed = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
-            if observed is None:
+                active_observed = False
+            if read_status == "covered" and observed is None:
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
                 )
                 self._connection.execute("COMMIT")
                 return "covered"
+            if read_status == "unreadable":
+                observed = fingerprint
             changed = observed != fingerprint
-            if changed:
+            if changed and reset_on_fingerprint_change:
                 reservation["fingerprint"] = observed
                 reservation["log_name"] = promoted_log_name
                 reservation.pop("attempt_count", None)
@@ -1344,6 +1509,17 @@ class QueueRepository:
                 reservation["watcher_expires_at"] = _stored_time(expires_dt)
                 outcome = "retry_wait"
             else:
+                if changed:
+                    reservation["fingerprint"] = observed
+                    reservation["log_name"] = promoted_log_name
+                    preserve_other_log = (
+                        active_observed
+                        and reservation.get("pending_log_name")
+                        != reservation.get("log_name")
+                    )
+                    if not preserve_other_log:
+                        reservation.pop("pending_fingerprint", None)
+                        reservation.pop("pending_log_name", None)
                 attempt = int(reservation.get("attempt_count", 0)) + 1
                 reservation["attempt_count"] = attempt
                 reservation["last_error_class"] = safe_error or "compile_failure"
@@ -1378,7 +1554,7 @@ class QueueRepository:
         self,
         token: str,
         fingerprint: str,
-        current_fingerprint: Callable[[], str | None],
+        current_content: Callable[[], AutoCompileContentRead],
         *,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
@@ -1406,11 +1582,11 @@ class QueueRepository:
             ):
                 self._connection.execute("COMMIT")
                 return None
-            observed = current_fingerprint()
-            active_observed = observed is not None
+            read_status, observed = self._validate_auto_compile_read(current_content())
+            active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
             if (
-                observed is None
+                read_status == "covered"
                 and reservation.get("pending_log_name")
                 != reservation.get("log_name")
                 and isinstance(reservation.get("pending_fingerprint"), str)
@@ -1418,7 +1594,22 @@ class QueueRepository:
             ):
                 observed = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
-            if observed is None:
+                active_observed = False
+            if read_status == "unreadable":
+                reservation["expires_at"] = _stored_time(expires_dt)
+                reservation["status"] = "read_wait"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return fingerprint
+            if read_status == "covered" and observed is None:
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
@@ -1455,8 +1646,8 @@ class QueueRepository:
         token: str,
         *,
         now: datetime | str | int | float,
-    ) -> tuple[str, str | None] | None:
-        """Return an owned, unexpired active and pending fingerprint pair."""
+    ) -> tuple[str, str | None, str | None, str | None] | None:
+        """Return an owned active/pending fingerprint and source-name pair."""
         now_dt = _datetime(now)
         row = self._connection.execute(
             "SELECT value FROM queue_metadata WHERE key = ?",
@@ -1485,7 +1676,18 @@ class QueueRepository:
             )
         ):
             return None
-        return fingerprint, pending
+        log_name = reservation.get("log_name")
+        pending_log_name = reservation.get("pending_log_name")
+        if log_name is not None and (
+            not isinstance(log_name, str) or Path(log_name).name != log_name
+        ):
+            return None
+        if pending_log_name is not None and (
+            not isinstance(pending_log_name, str)
+            or Path(pending_log_name).name != pending_log_name
+        ):
+            return None
+        return fingerprint, pending, log_name, pending_log_name
 
     def promote_pending_auto_compile(
         self,
@@ -1560,7 +1762,7 @@ class QueueRepository:
         self,
         token: str,
         fingerprint: str,
-        current_fingerprint: Callable[[], str | None],
+        current_content: Callable[[], AutoCompileContentRead],
         *,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
@@ -1610,11 +1812,13 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return None
-            observed_fingerprint = current_fingerprint()
-            active_observed = observed_fingerprint is not None
+            read_status, observed_fingerprint = self._validate_auto_compile_read(
+                current_content()
+            )
+            active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
             if (
-                observed_fingerprint is None
+                read_status == "covered"
                 and reservation.get("pending_log_name")
                 != reservation.get("log_name")
                 and isinstance(reservation.get("pending_fingerprint"), str)
@@ -1622,6 +1826,21 @@ class QueueRepository:
             ):
                 observed_fingerprint = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
+                active_observed = False
+            if read_status == "unreadable":
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "read_wait"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return fingerprint
             should_promote = (
                 observed_fingerprint is not None
                 and observed_fingerprint != fingerprint

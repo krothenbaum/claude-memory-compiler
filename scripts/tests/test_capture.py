@@ -2362,6 +2362,155 @@ def test_exit_zero_with_no_article_marker_progress_is_success(tmp_path, monkeypa
         assert _reservation(repository) is None
 
 
+def test_daily_compile_read_distinguishes_unreadable_covered_and_uncompiled(tmp_path):
+    daily = tmp_path / "daily.md"
+    unreadable = flush_module._read_daily_compile_state(daily)
+    assert unreadable.status == "unreadable"
+    assert unreadable.fingerprint is None
+
+    daily.write_text(
+        "<!-- @compiled-through:first -->\n", encoding="utf-8"
+    )
+    covered = flush_module._read_daily_compile_state(daily)
+    assert covered.status == "covered"
+    assert covered.markers == ("first",)
+    assert covered.fingerprint is None
+
+    daily.write_text(
+        "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
+    )
+    uncompiled = flush_module._read_daily_compile_state(daily)
+    assert uncompiled.status == "uncompiled"
+    assert uncompiled.markers == ("first",)
+    assert uncompiled.fingerprint == flush_module._uncompiled_fingerprint(daily)
+
+
+def test_unreadable_failure_observation_never_deletes_reservation(tmp_path):
+    owner = "1" * 64
+    watchdog = "2" * 64
+    fingerprint = "a" * 64
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            watchdog,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        ) == ("owner", "watchdog")
+        assert repository.record_auto_compile_failure(
+            owner,
+            fingerprint,
+            "compile_read_unreadable",
+            lambda: ("unreadable", None),
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=2),
+        ) == "retry_wait"
+        state = _reservation(repository)
+    assert state["fingerprint"] == fingerprint
+    assert state["attempt_count"] == 1
+    assert state["last_error_class"] == "compile_read_unreadable"
+
+
+def test_prelaunch_unreadable_daily_log_uses_durable_failure(tmp_path, monkeypatch):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+    daily.unlink()
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unreadable source must not launch")
+        ),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["fingerprint"] == fingerprint
+    assert state["attempt_count"] == 1
+    assert state["last_error_class"] == "compile_read_unreadable"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["unreadable", "replacement", "truncation"]
+)
+def test_exit_zero_invalid_or_unreadable_marker_state_uses_backoff(
+    tmp_path, monkeypatch, mutation
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    daily.write_text(
+        "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
+    )
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class InvalidProgressCompile:
+        def wait(self, timeout=None):
+            if mutation == "unreadable":
+                daily.unlink()
+            elif mutation == "replacement":
+                daily.write_text(
+                    "<!-- @compiled-through:replacement -->\nA\n",
+                    encoding="utf-8",
+                )
+            else:
+                daily.write_text("A\n", encoding="utf-8")
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: InvalidProgressCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["attempt_count"] == 1
+    assert state["status"] == "retry_wait"
+    assert state["last_error_class"] in {
+        "compile_read_unreadable",
+        "compile_invalid_marker_progress",
+    }
+
+
+@pytest.mark.parametrize(
+    "covered_content",
+    ["\n", "<!-- @compiled-through:replacement -->\n"],
+)
+def test_exit_zero_readable_covered_state_is_success_without_marker_progress(
+    tmp_path, monkeypatch, covered_content
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    if "replacement" in covered_content:
+        daily.write_text(
+            "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
+        )
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class CoveredCompile:
+        def wait(self, timeout=None):
+            daily.write_text(covered_content, encoding="utf-8")
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: CoveredCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
 def test_ordinary_failure_then_watchdog_retry_succeeds_without_new_session(
     tmp_path, monkeypatch
 ):
@@ -2398,7 +2547,7 @@ def test_ordinary_failure_then_watchdog_retry_succeeds_without_new_session(
             return repository.finish_auto_compile_generation(
                 retry_token,
                 retry_fingerprint,
-                lambda: None,
+                lambda: ("covered", None),
                 now=retry_at,
                 expires_at=retry_at + timedelta(minutes=2),
             ) is None
@@ -2438,7 +2587,7 @@ def test_repeated_compile_failures_reach_inspectable_retry_cap(tmp_path):
                 token,
                 fingerprint,
                 "provider_failure_with_untrusted_details" * 20,
-                lambda: fingerprint,
+                lambda: ("uncompiled", fingerprint),
                 now=NOW + timedelta(minutes=attempt),
                 expires_at=NOW + timedelta(minutes=attempt + 2),
             )
@@ -2511,7 +2660,7 @@ def test_content_change_during_failed_compile_starts_fresh_generation(tmp_path):
             owner,
             old,
             "compile_exit_1",
-            lambda: new,
+            lambda: ("uncompiled", new),
             now=NOW + timedelta(seconds=1),
             expires_at=NOW + timedelta(minutes=2),
         ) == "retry_wait"
@@ -2538,7 +2687,7 @@ def test_marker_covered_during_ordinary_failure_clears_retry_request(tmp_path):
             "1" * 64,
             "a" * 64,
             "compile_exit_1",
-            lambda: None,
+            lambda: ("covered", None),
             now=NOW + timedelta(seconds=1),
             expires_at=NOW + timedelta(minutes=2),
         ) == "covered"
@@ -2564,7 +2713,7 @@ def test_watchdog_crash_during_backoff_can_be_replaced_without_losing_retry(
             owner,
             fingerprint,
             "compile_exit_1",
-            lambda: fingerprint,
+            lambda: ("uncompiled", fingerprint),
             now=NOW + timedelta(seconds=1),
             expires_at=NOW + timedelta(minutes=2),
         ) == "retry_wait"
@@ -3000,7 +3149,7 @@ def test_auto_compile_handoff_reads_current_fingerprint_inside_transaction(tmp_p
 
         def observe_current():
             assert repository._connection.in_transaction
-            return latest
+            return "uncompiled", latest
 
         assert repository.finish_auto_compile_generation(
             token,
@@ -3036,7 +3185,7 @@ def test_completed_owner_promotes_pending_fingerprint_from_a_different_log(tmp_p
         assert repository.finish_auto_compile_generation(
             token,
             first,
-            lambda: None,
+            lambda: ("covered", None),
             now=NOW + timedelta(seconds=2),
             expires_at=NOW + timedelta(seconds=7),
         ) == pending
@@ -3072,7 +3221,7 @@ def test_residual_active_content_preserves_pending_fingerprint_for_next_log(tmp_
         assert repository.finish_auto_compile_generation(
             token,
             first,
-            lambda: residual,
+            lambda: ("uncompiled", residual),
             now=NOW + timedelta(seconds=2),
             expires_at=NOW + timedelta(seconds=7),
         ) == residual
@@ -3083,7 +3232,7 @@ def test_residual_active_content_preserves_pending_fingerprint_for_next_log(tmp_
         assert repository.finish_auto_compile_generation(
             token,
             residual,
-            lambda: None,
+            lambda: ("covered", None),
             now=NOW + timedelta(seconds=3),
             expires_at=NOW + timedelta(seconds=8),
         ) == pending
@@ -3114,7 +3263,7 @@ def test_deferred_owner_promotes_pending_fingerprint_from_a_different_log(tmp_pa
         assert repository.defer_auto_compile_generation(
             token,
             first,
-            lambda: None,
+            lambda: ("covered", None),
             now=NOW + timedelta(seconds=2),
             expires_at=NOW + timedelta(seconds=7),
         ) == pending
@@ -3351,9 +3500,10 @@ def test_each_crashed_takeover_owner_has_an_independent_successor_watchdog(
             ),
             lock_probe=lambda _root: False,
             clock=lambda: datetime.now(timezone.utc),
-        )
+    )
     assert commands[-1][2] == "watchdog"
-    second_watchdog = commands[-1][-1]
+    second_watchdog = commands[-1][-2]
+    assert commands[-1][-1] == first_watchdog
     assert second_watchdog != first_watchdog
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         state = _reservation(repository)
@@ -3377,13 +3527,298 @@ def test_each_crashed_takeover_owner_has_an_independent_successor_watchdog(
             lock_probe=lambda _root: False,
             clock=lambda: datetime.now(timezone.utc),
         )
-    third_watchdog = commands[-1][-1]
+    third_watchdog = commands[-1][-2]
     assert commands[-1][2] == "watchdog"
+    assert commands[-1][-1] == second_watchdog
     assert third_watchdog not in {first_watchdog, second_watchdog}
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         state = _reservation(repository)
     assert state["token"] == second_watchdog
     assert state["watcher_token"] == third_watchdog
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [sqlite3.OperationalError("commit failed"), SystemExit("pre-commit crash")],
+)
+def test_spawned_successor_recovers_takeover_after_transaction_rollback(
+    tmp_path, failure
+):
+    owner = "1" * 64
+    predecessor = "2" * 64
+    successor = "3" * 64
+    next_successor = "4" * 64
+    fingerprint = "a" * 64
+    database = tmp_path / "jobs.sqlite3"
+    with QueueRepository(database, sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            predecessor,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=2),
+        ) == ("owner", "watchdog")
+
+        spawned = []
+
+        def spawn_then_fail(token):
+            spawned.append(token)
+            raise failure
+
+        with pytest.raises(type(failure)):
+            repository.poll_auto_compile_watcher(
+                predecessor,
+                successor,
+                lambda _reservation: (
+                    "uncompiled",
+                    {"fingerprint": fingerprint, "log_name": "2026-08-11.md"},
+                ),
+                spawn_then_fail,
+                predecessor_token=None,
+                now=NOW + timedelta(seconds=3),
+                watcher_expires_at=NOW + timedelta(seconds=8),
+                owner_expires_at=NOW + timedelta(seconds=8),
+            )
+        state = _reservation(repository)
+    assert spawned == [successor]
+    assert state["watcher_token"] == predecessor
+    assert state["token"] == owner
+
+    next_spawns = []
+    with QueueRepository(database, sync_usage=False) as repository:
+        status, claimed = repository.poll_auto_compile_watcher(
+            successor,
+            next_successor,
+            lambda _reservation: (
+                "uncompiled",
+                {"fingerprint": fingerprint, "log_name": "2026-08-11.md"},
+            ),
+            next_spawns.append,
+            predecessor_token=predecessor,
+            now=NOW + timedelta(seconds=4),
+            watcher_expires_at=NOW + timedelta(seconds=9),
+            owner_expires_at=NOW + timedelta(seconds=9),
+        )
+        recovered = _reservation(repository)
+    assert (status, claimed) == ("claimed", fingerprint)
+    assert next_spawns == [next_successor]
+    assert recovered["token"] == successor
+    assert recovered["watcher_token"] == next_successor
+
+
+def test_successor_defers_while_predecessor_watcher_lease_is_live(tmp_path):
+    owner = "1" * 64
+    predecessor = "2" * 64
+    successor = "3" * 64
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            predecessor,
+            "a" * 64,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=10),
+        ) == ("owner", "watchdog")
+        status, claimed = repository.poll_auto_compile_watcher(
+            successor,
+            "4" * 64,
+            lambda _reservation: (_ for _ in ()).throw(
+                AssertionError("contender must not observe before predecessor expiry")
+            ),
+            lambda _token: (_ for _ in ()).throw(
+                AssertionError("contender must not spawn before predecessor expiry")
+            ),
+            predecessor_token=predecessor,
+            now=NOW + timedelta(seconds=1),
+            watcher_expires_at=NOW + timedelta(seconds=11),
+            owner_expires_at=NOW + timedelta(seconds=11),
+        )
+    assert (status, claimed) == ("wait", None)
+
+
+def test_successor_recovers_when_rolled_back_predecessor_was_pending_contender(
+    tmp_path,
+):
+    owner = "1" * 64
+    watcher = "2" * 64
+    contender = "3" * 64
+    successor = "4" * 64
+    next_successor = "5" * 64
+    fingerprint = "a" * 64
+    database = tmp_path / "jobs.sqlite3"
+    with QueueRepository(database, sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            watcher,
+            fingerprint,
+            log_name="2026-08-11.md",
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=2),
+        ) == ("owner", "watchdog")
+        state = _reservation(repository)
+        state.update(
+            {
+                "status": "queue_wait",
+                "contender_token": contender,
+                "contender_predecessor_token": watcher,
+                "contender_expires_at": (
+                    NOW + timedelta(seconds=4)
+                ).isoformat(timespec="microseconds"),
+            }
+        )
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+        def spawned_then_crashed(token):
+            assert token == successor
+            raise SystemExit("contender died before takeover commit")
+
+        with pytest.raises(SystemExit):
+            repository.poll_auto_compile_watcher(
+                contender,
+                successor,
+                lambda _reservation: (
+                    "uncompiled",
+                    {"fingerprint": fingerprint, "log_name": "2026-08-11.md"},
+                ),
+                spawned_then_crashed,
+                predecessor_token=watcher,
+                now=NOW + timedelta(seconds=3),
+                watcher_expires_at=NOW + timedelta(seconds=4),
+                owner_expires_at=NOW + timedelta(seconds=8),
+            )
+        rolled_back = _reservation(repository)
+    assert rolled_back["watcher_token"] == watcher
+    assert rolled_back["contender_token"] == contender
+
+    spawns = []
+    with QueueRepository(database, sync_usage=False) as repository:
+        status, claimed = repository.poll_auto_compile_watcher(
+            successor,
+            next_successor,
+            lambda _reservation: (
+                "uncompiled",
+                {"fingerprint": fingerprint, "log_name": "2026-08-11.md"},
+            ),
+            spawns.append,
+            predecessor_token=contender,
+            now=NOW + timedelta(seconds=5),
+            watcher_expires_at=NOW + timedelta(seconds=10),
+            owner_expires_at=NOW + timedelta(seconds=10),
+        )
+        recovered = _reservation(repository)
+    assert (status, claimed) == ("claimed", fingerprint)
+    assert spawns == [next_successor]
+    assert recovered["token"] == successor
+    assert recovered["watcher_token"] == next_successor
+
+
+@pytest.mark.parametrize("wait_status", ["queue_wait", "retry_wait"])
+def test_later_drain_preprovisions_contender_that_survives_watcher_death(
+    tmp_path, monkeypatch, wait_status
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    predecessor = _watchdog_command(commands)[-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["status"] = wait_status
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        state["watcher_expires_at"] = "2999-01-01T00:00:00.000000+00:00"
+        if wait_status == "retry_wait":
+            state["next_retry_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+    assert _schedule_auto_compile(root) is True
+    contender_command = commands[-1]
+    assert contender_command[2] == "watchdog"
+    contender = contender_command[-2]
+    assert contender_command[-1] == predecessor
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        assert state["contender_token"] == contender
+        state["watcher_expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+    resumed = []
+
+    def resume(_root, token, fingerprint):
+        resumed.append((token, fingerprint))
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            repository.release_auto_compile(token, fingerprint)
+        return True
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        contender,
+        predecessor_token=predecessor,
+        coordinator=resume,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("pre-provisioned contender must take over after expiry")
+        ),
+        lock_probe=lambda _root: False,
+        clock=lambda: datetime.now(timezone.utc),
+    )
+    assert resumed[0][0] == contender
+
+
+def test_watcher_retries_after_sqlite_takeover_error(tmp_path, monkeypatch):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    watchdog = _watchdog_command(commands)[-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+    real_poll = QueueRepository.poll_auto_compile_watcher
+    calls = []
+
+    def flaky_poll(self, *args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("commit failed")
+        return real_poll(self, *args, **kwargs)
+
+    monkeypatch.setattr(QueueRepository, "poll_auto_compile_watcher", flaky_poll)
+
+    def finish(_root, token, fingerprint):
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            repository.release_auto_compile(token, fingerprint)
+        return True
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watchdog,
+        coordinator=finish,
+        sleeper=lambda _seconds: None,
+        lock_probe=lambda _root: False,
+        clock=lambda: datetime.now(timezone.utc),
+    )
+    assert len(calls) == 2
 
 
 def test_delayed_live_watcher_can_renew_if_its_token_was_not_replaced(

@@ -15,18 +15,20 @@ import os
 
 import asyncio
 import ctypes
+from dataclasses import dataclass
 import hashlib
 import json
 import logging
 import re
 import secrets
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
@@ -255,8 +257,19 @@ class _AutoCompileContentChanged(RuntimeError):
     pass
 
 
+class _AutoCompileReadUnavailable(RuntimeError):
+    pass
+
+
 class _AutoCompileWatchdogSpawnError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _DailyCompileRead:
+    status: Literal["unreadable", "covered", "uncompiled"]
+    markers: tuple[str, ...]
+    fingerprint: str | None
 
 
 def _is_memory_codex_provider_command(arguments: list[str]) -> bool:
@@ -459,28 +472,34 @@ def count_interactive_agent_sessions() -> int:
     return _count_agent_processes(processes)
 
 
-def _uncompiled_fingerprint(path: Path) -> str | None:
+def _read_daily_compile_state(path: Path) -> _DailyCompileRead:
+    """Read fingerprint and marker state once without collapsing failures."""
     try:
         content, _baseline = read_text_with_baseline(path)
     except (OSError, UnicodeError, ValueError):
-        return None
+        return _DailyCompileRead("unreadable", (), None)
+    markers = tuple(match.group(1) for match in _COMPILED_MARKER_RE.finditer(content))
     last_end = 0
     for marker in _COMPILED_MARKER_RE.finditer(content):
         last_end = marker.end()
     uncompiled = content[last_end:].strip()
     if not uncompiled:
-        return None
+        return _DailyCompileRead("covered", markers, None)
     material = f"{path.name}\0{uncompiled}".encode()
-    return hashlib.sha256(material).hexdigest()
+    return _DailyCompileRead(
+        "uncompiled", markers, hashlib.sha256(material).hexdigest()
+    )
 
 
-def _compiled_marker_state(path: Path) -> tuple[str, ...] | None:
-    """Return durable marker identity, or ``None`` when it cannot be inspected."""
-    try:
-        content, _baseline = read_text_with_baseline(path)
-    except (OSError, UnicodeError, ValueError):
-        return None
-    return tuple(match.group(1) for match in _COMPILED_MARKER_RE.finditer(content))
+def _uncompiled_fingerprint(path: Path) -> str | None:
+    """Return only a readable uncompiled fingerprint for compatibility callers."""
+    read = _read_daily_compile_state(path)
+    return read.fingerprint if read.status == "uncompiled" else None
+
+
+def _queue_content_read(path: Path) -> tuple[str, str | None]:
+    read = _read_daily_compile_state(path)
+    return read.status, read.fingerprint
 
 
 def _release_auto_compile(root: Path, token: str, fingerprint: str) -> None:
@@ -507,6 +526,19 @@ def _clear_auto_compile_watcher(root: Path, token: str) -> None:
         config.queue_path, memory_home=root, sync_usage=False
     ) as repository:
         repository.clear_auto_compile_watcher(token)
+
+
+def _clear_auto_compile_contender(root: Path, token: str) -> None:
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        repository.clear_auto_compile_contender(token)
 
 
 def _fail_auto_compile_owner_spawn(
@@ -586,7 +618,10 @@ def _auto_compile_environment(root: Path) -> dict[str, str]:
 
 
 def _spawn_auto_compile_watchdog(
-    root: Path, coordinator_script: Path, token: str
+    root: Path,
+    coordinator_script: Path,
+    token: str,
+    predecessor_token: str | None = None,
 ) -> None:
     command = [
         sys.executable,
@@ -595,6 +630,8 @@ def _spawn_auto_compile_watchdog(
         str(root),
         token,
     ]
+    if predecessor_token is not None:
+        command.append(predecessor_token)
     last_error: Exception | None = None
     for attempt in range(AUTO_COMPILE_SPAWN_ATTEMPTS):
         try:
@@ -649,9 +686,10 @@ def maybe_trigger_compilation(
     # processing only the new sessions each time.
     today_log = f"{local_now.strftime('%Y-%m-%d')}.md"
     log_path = daily_dir / today_log
-    fingerprint = _uncompiled_fingerprint(log_path)
-    if fingerprint is None:
+    daily_read = _read_daily_compile_state(log_path)
+    if daily_read.status != "uncompiled" or daily_read.fingerprint is None:
         return False
+    fingerprint = daily_read.fingerprint
 
     compile_script = scripts_dir / "compile.py"
     if not compile_script.is_file() or compile_script.is_symlink():
@@ -683,6 +721,11 @@ def maybe_trigger_compilation(
         )
         if not roles:
             return False
+        contender_predecessor = (
+            repository.auto_compile_contender_predecessor(watchdog_token)
+            if "contender" in roles
+            else None
+        )
 
     logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
     if "watchdog" in roles:
@@ -694,6 +737,22 @@ def maybe_trigger_compilation(
             else:
                 _clear_auto_compile_watcher(root, watchdog_token)
             logging.error("Failed to spawn auto-compile watchdog: %s", exc)
+            return False
+
+    if "contender" in roles:
+        if contender_predecessor is None:
+            _clear_auto_compile_contender(root, watchdog_token)
+            return False
+        try:
+            _spawn_auto_compile_watchdog(
+                root,
+                coordinator_script,
+                watchdog_token,
+                contender_predecessor,
+            )
+        except _AutoCompileWatchdogSpawnError as exc:
+            _clear_auto_compile_contender(root, watchdog_token)
+            logging.error("Failed to spawn auto-compile contender: %s", exc)
             return False
 
     if "owner" in roles:
@@ -750,11 +809,16 @@ def run_auto_compile_coordinator(
         matches = [
             path
             for path in sorted((root / "daily").glob("*.md"))
-            if _uncompiled_fingerprint(path) == candidate
+            if _read_daily_compile_state(path).fingerprint == candidate
         ]
         return matches[0] if len(matches) == 1 else None
 
-    def record_failure(log_path: Path, error_class: str) -> None:
+    def record_failure(
+        log_path: Path,
+        error_class: str,
+        *,
+        reset_on_fingerprint_change: bool = True,
+    ) -> None:
         failed_at = datetime.now(timezone.utc)
         with QueueRepository(
             config.queue_path, memory_home=root, sync_usage=False
@@ -763,12 +827,13 @@ def run_auto_compile_coordinator(
                 token,
                 active_fingerprint,
                 error_class,
-                lambda: _uncompiled_fingerprint(log_path),
+                lambda: _queue_content_read(log_path),
                 now=failed_at,
                 expires_at=failed_at
                 + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
                 max_attempts=AUTO_COMPILE_MAX_ATTEMPTS,
                 retry_base_seconds=AUTO_COMPILE_RETRY_BASE_SECONDS,
+                reset_on_fingerprint_change=reset_on_fingerprint_change,
             )
 
     try:
@@ -785,10 +850,44 @@ def run_auto_compile_coordinator(
                     if reservation is None or reservation[0] != active_fingerprint:
                         return False
                     pending_fingerprint = reservation[1]
+                    active_log_name = reservation[2]
+                    if active_log_name is not None:
+                        active_log = root / "daily" / active_log_name
+                        active_read = _read_daily_compile_state(active_log)
+                        if active_read.status == "unreadable":
+                            record_failure(active_log, "compile_read_unreadable")
+                            return False
+                        if active_read.fingerprint == active_fingerprint:
+                            log_path = active_log
+                            break
+                        if (
+                            active_read.status == "covered"
+                            and pending_fingerprint is None
+                        ):
+                            repository.finish_auto_compile_generation(
+                                token,
+                                active_fingerprint,
+                                lambda: ("covered", None),
+                                now=reservation_now,
+                                expires_at=reservation_now
+                                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                            )
+                            return True
                     if pending_fingerprint is None:
                         return False
-                    pending_log = matching_log(pending_fingerprint)
+                    pending_log_name = reservation[3]
+                    pending_log = (
+                        root / "daily" / pending_log_name
+                        if pending_log_name is not None
+                        else matching_log(pending_fingerprint)
+                    )
                     if pending_log is None:
+                        return False
+                    pending_read = _read_daily_compile_state(pending_log)
+                    if pending_read.status == "unreadable":
+                        record_failure(pending_log, "compile_read_unreadable")
+                        return False
+                    if pending_read.fingerprint != pending_fingerprint:
                         return False
                     promoted = repository.promote_pending_auto_compile(
                         token,
@@ -805,17 +904,21 @@ def run_auto_compile_coordinator(
             if count_interactive_agent_sessions() != 0:
                 return False
 
-            marker_before: tuple[str, ...] | None = None
+            read_before: _DailyCompileRead | None = None
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
             ) as repository:
                 def launch() -> object:
-                    nonlocal marker_before
-                    if _uncompiled_fingerprint(log_path) != active_fingerprint:
+                    nonlocal read_before
+                    read_before = _read_daily_compile_state(log_path)
+                    if read_before.status == "unreadable":
+                        raise _AutoCompileReadUnavailable(
+                            "daily log became unreadable before compile launch"
+                        )
+                    if read_before.fingerprint != active_fingerprint:
                         raise _AutoCompileContentChanged(
                             "daily content changed before compile launch"
                         )
-                    marker_before = _compiled_marker_state(log_path)
                     with open_secure_log_stream(
                         root / "scripts" / "compile.log"
                     ) as log_handle:
@@ -832,6 +935,9 @@ def run_auto_compile_coordinator(
                     )
                 except _AutoCompileContentChanged:
                     continue
+                except _AutoCompileReadUnavailable:
+                    record_failure(log_path, "compile_read_unreadable")
+                    return False
                 except Exception as exc:
                     record_failure(log_path, f"compile_launch_{type(exc).__name__}")
                     return False
@@ -880,7 +986,7 @@ def run_auto_compile_coordinator(
                             repository.defer_auto_compile_generation(
                                 token,
                                 active_fingerprint,
-                                lambda: _uncompiled_fingerprint(log_path),
+                                lambda: _queue_content_read(log_path),
                                 now=deferred_at,
                                 expires_at=deferred_at
                                 + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -900,9 +1006,30 @@ def run_auto_compile_coordinator(
                 record_failure(log_path, f"compile_exit_{return_code}")
                 return False
 
-            marker_after = _compiled_marker_state(log_path)
-            if marker_after is None or marker_after == marker_before:
-                record_failure(log_path, "compile_no_progress")
+            read_after = _read_daily_compile_state(log_path)
+            assert read_before is not None
+            if read_after.status == "unreadable":
+                record_failure(log_path, "compile_read_unreadable")
+                return False
+            marker_history_valid = (
+                len(read_after.markers) >= len(read_before.markers)
+                and read_after.markers[: len(read_before.markers)]
+                == read_before.markers
+            )
+            marker_advanced = marker_history_valid and (
+                len(read_after.markers) > len(read_before.markers)
+            )
+            if read_after.status != "covered" and not marker_advanced:
+                markers_unchanged = read_after.markers == read_before.markers
+                record_failure(
+                    log_path,
+                    (
+                        "compile_no_progress"
+                        if markers_unchanged
+                        else "compile_invalid_marker_progress"
+                    ),
+                    reset_on_fingerprint_change=markers_unchanged,
+                )
                 return False
 
             handoff_at = datetime.now(timezone.utc)
@@ -912,7 +1039,7 @@ def run_auto_compile_coordinator(
                 next_fingerprint = repository.finish_auto_compile_generation(
                     token,
                     active_fingerprint,
-                    lambda: _uncompiled_fingerprint(log_path),
+                    lambda: (read_after.status, read_after.fingerprint),
                     now=handoff_at,
                     expires_at=handoff_at
                     + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -927,31 +1054,47 @@ def run_auto_compile_coordinator(
 
 def _observe_auto_compile_content(
     root: Path, reservation: dict[str, object]
-) -> dict[str, str] | None:
-    def current(name: object) -> tuple[str, str] | None:
-        if not isinstance(name, str) or Path(name).name != name:
+) -> tuple[str, dict[str, str] | None]:
+    def current(name: object) -> tuple[_DailyCompileRead, str] | None:
+        if name is None:
             return None
+        if not isinstance(name, str) or Path(name).name != name:
+            return _DailyCompileRead("unreadable", (), None), ""
         path = root / "daily" / name
-        fingerprint = _uncompiled_fingerprint(path)
-        return (fingerprint, name) if fingerprint is not None else None
+        return _read_daily_compile_state(path), name
 
     active = current(reservation.get("log_name"))
     pending = current(reservation.get("pending_log_name"))
-    if active is None:
-        if pending is None:
-            return None
-        return {"fingerprint": pending[0], "log_name": pending[1]}
-    observed = {"fingerprint": active[0], "log_name": active[1]}
-    if pending is not None and pending[1] != active[1]:
-        observed["pending_fingerprint"] = pending[0]
+    if (active is not None and active[0].status == "unreadable") or (
+        pending is not None and pending[0].status == "unreadable"
+    ):
+        return "unreadable", None
+    if active is None or active[0].status == "covered":
+        if pending is None or pending[0].status == "covered":
+            return "covered", None
+        assert pending[0].fingerprint is not None
+        return "uncompiled", {
+            "fingerprint": pending[0].fingerprint,
+            "log_name": pending[1],
+        }
+    assert active[0].fingerprint is not None
+    observed = {"fingerprint": active[0].fingerprint, "log_name": active[1]}
+    if (
+        pending is not None
+        and pending[0].status == "uncompiled"
+        and pending[1] != active[1]
+    ):
+        assert pending[0].fingerprint is not None
+        observed["pending_fingerprint"] = pending[0].fingerprint
         observed["pending_log_name"] = pending[1]
-    return observed
+    return "uncompiled", observed
 
 
 def run_auto_compile_watcher(
     memory_home: Path | str,
     token: str,
     *,
+    predecessor_token: str | None = None,
     coordinator: Callable[[Path, str, str], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
@@ -962,6 +1105,10 @@ def run_auto_compile_watcher(
 
     root = Path(memory_home).expanduser().resolve()
     if not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    if predecessor_token is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", predecessor_token
+    ):
         return False
     environment = dict(os.environ)
     environment["AI_MEMORY_HOME"] = str(root)
@@ -991,8 +1138,9 @@ def run_auto_compile_watcher(
                         root, dict(reservation)
                     ),
                     lambda candidate: _spawn_auto_compile_watchdog(
-                        root, coordinator_script, candidate
+                        root, coordinator_script, candidate, token
                     ),
+                    predecessor_token=predecessor_token,
                     now=observed_at,
                     watcher_expires_at=observed_at
                     + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -1001,6 +1149,10 @@ def run_auto_compile_watcher(
                 )
         except _AutoCompileWatchdogSpawnError as exc:
             logging.error("Failed to spawn successor auto-compile watchdog: %s", exc)
+            sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
+            continue
+        except sqlite3.Error as exc:
+            logging.error("Automatic compile watcher SQLite retry: %s", exc)
             sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
             continue
         if status == "done":
