@@ -249,6 +249,7 @@ AUTO_COMPILE_WATCHER_POLL_SECONDS = 5
 AUTO_COMPILE_SPAWN_ATTEMPTS = 3
 AUTO_COMPILE_SPAWN_RETRY_SECONDS = 0.05
 AUTO_COMPILE_STARTUP_WAIT_SECONDS = 5
+AUTO_COMPILE_BOOTSTRAP_WAIT_SECONDS = AUTO_COMPILE_LEASE_SECONDS * 2
 AUTO_COMPILE_MAX_ATTEMPTS = 3
 AUTO_COMPILE_RETRY_BASE_SECONDS = 5
 _COMPILED_MARKER_RE = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
@@ -259,6 +260,10 @@ class _AutoCompileContentChanged(RuntimeError):
 
 
 class _AutoCompileReadUnavailable(RuntimeError):
+    pass
+
+
+class _AutoCompileMarkerInvalid(RuntimeError):
     pass
 
 
@@ -498,9 +503,9 @@ def _uncompiled_fingerprint(path: Path) -> str | None:
     return read.fingerprint if read.status == "uncompiled" else None
 
 
-def _queue_content_read(path: Path) -> tuple[str, str | None]:
+def _queue_content_read(path: Path) -> tuple[str, str | None, tuple[str, ...]]:
     read = _read_daily_compile_state(path)
-    return read.status, read.fingerprint
+    return read.status, read.fingerprint, read.markers
 
 
 def _release_auto_compile(root: Path, token: str, fingerprint: str) -> None:
@@ -625,14 +630,20 @@ def _spawn_auto_compile_watchdog(
     predecessor_token: str | None = None,
     *,
     role: str = "watchdog",
+    bootstrap: tuple[str, str, str, tuple[str, ...]] | None = None,
 ) -> None:
     command = [
         sys.executable,
         str(coordinator_script),
         role,
         str(root),
-        token,
     ]
+    if bootstrap is not None:
+        owner_token, fingerprint, log_name, marker_prefix = bootstrap
+        command.extend(
+            [owner_token, fingerprint, log_name, json.dumps(list(marker_prefix))]
+        )
+    command.append(token)
     if predecessor_token is not None:
         command.append(predecessor_token)
     last_error: Exception | None = None
@@ -714,7 +725,17 @@ def maybe_trigger_compilation(
 
     def launch_roles(roles: tuple[str, ...], predecessor: str | None) -> None:
         if "watchdog" in roles:
-            _spawn_auto_compile_watchdog(root, coordinator_script, watchdog_token)
+            _spawn_auto_compile_watchdog(
+                root,
+                coordinator_script,
+                watchdog_token,
+                bootstrap=(
+                    owner_token,
+                    fingerprint,
+                    today_log,
+                    daily_read.markers,
+                ),
+            )
         if "contender" in roles:
             if predecessor is None:
                 raise _AutoCompileWatchdogSpawnError(
@@ -750,6 +771,7 @@ def maybe_trigger_compilation(
                 watchdog_token,
                 fingerprint,
                 log_name=today_log,
+                required_marker_prefix=daily_read.markers,
                 now=lease_now,
                 expires_at=lease_expires,
                 launch_roles=launch_roles,
@@ -825,6 +847,71 @@ def run_auto_compile_owner_startup(
         return False
     run_coordinator = coordinator or run_auto_compile_coordinator
     return run_coordinator(root, token, fingerprint)
+
+
+def run_auto_compile_watchdog_bootstrap(
+    memory_home: Path | str,
+    watchdog_token: str,
+    owner_token: str,
+    fingerprint: str,
+    log_name: str,
+    required_marker_prefix: tuple[str, ...],
+    *,
+    coordinator: Callable[[Path, str, str], bool] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> bool:
+    """Recover or join the genesis reservation after the parent transaction."""
+    from scripts.queue import QueueRepository
+
+    root = Path(memory_home).expanduser().resolve()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", watchdog_token)
+        or not re.fullmatch(r"[0-9a-f]{64}", owner_token)
+        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        or Path(log_name).name != log_name
+        or not all(isinstance(marker, str) for marker in required_marker_prefix)
+    ):
+        return False
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    log_path = root / "daily" / log_name
+    deadline = clock() + timedelta(seconds=AUTO_COMPILE_BOOTSTRAP_WAIT_SECONDS)
+    while True:
+        observed_at = clock()
+        try:
+            with QueueRepository(
+                config.queue_path, memory_home=root, sync_usage=False
+            ) as repository:
+                outcome = repository.bootstrap_auto_compile_watchdog(
+                    watchdog_token,
+                    owner_token,
+                    fingerprint,
+                    log_name=log_name,
+                    required_marker_prefix=required_marker_prefix,
+                    current_content=lambda: _queue_content_read(log_path),
+                    now=observed_at,
+                    watcher_expires_at=observed_at
+                    + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                )
+        except sqlite3.Error:
+            if observed_at >= deadline:
+                return False
+            sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
+            continue
+        if outcome == "rejected":
+            return False
+        return run_auto_compile_watcher(
+            root,
+            watchdog_token,
+            coordinator=coordinator,
+            sleeper=sleeper,
+            lock_probe=lock_probe,
+            clock=clock,
+        )
 
 
 def run_auto_compile_coordinator(
@@ -978,12 +1065,29 @@ def run_auto_compile_coordinator(
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
             ) as repository:
+                owned = repository.auto_compile_reservation(
+                    token, now=datetime.now(timezone.utc)
+                )
+                if owned is None or owned[0] != active_fingerprint:
+                    return False
+                required_markers = owned[4]
+                if required_markers is None:
+                    return False
+
                 def launch() -> object:
                     nonlocal read_before
                     read_before = _read_daily_compile_state(log_path)
                     if read_before.status == "unreadable":
                         raise _AutoCompileReadUnavailable(
                             "daily log became unreadable before compile launch"
+                        )
+                    if (
+                        len(read_before.markers) < len(required_markers)
+                        or read_before.markers[: len(required_markers)]
+                        != required_markers
+                    ):
+                        raise _AutoCompileMarkerInvalid(
+                            "daily marker history changed before compile launch"
                         )
                     if read_before.fingerprint != active_fingerprint:
                         raise _AutoCompileContentChanged(
@@ -1007,6 +1111,14 @@ def run_auto_compile_coordinator(
                     continue
                 except _AutoCompileReadUnavailable:
                     record_failure(log_path, "compile_read_unreadable")
+                    return False
+                except _AutoCompileMarkerInvalid:
+                    record_failure(
+                        log_path,
+                        "compile_invalid_marker_progress",
+                        reset_on_fingerprint_change=False,
+                        required_marker_prefix=required_markers,
+                    )
                     return False
                 except Exception as exc:
                     record_failure(log_path, f"compile_launch_{type(exc).__name__}")
@@ -1049,6 +1161,7 @@ def run_auto_compile_coordinator(
                 while True:
                     deferred_at = datetime.now(timezone.utc)
                     previous_fingerprint = active_fingerprint
+                    compiler_lock_held = lock_probe(root)
                     with QueueRepository(
                         config.queue_path, memory_home=root, sync_usage=False
                     ) as repository:
@@ -1057,6 +1170,7 @@ def run_auto_compile_coordinator(
                                 token,
                                 active_fingerprint,
                                 lambda: _queue_content_read(log_path),
+                                compiler_lock_held=compiler_lock_held,
                                 now=deferred_at,
                                 expires_at=deferred_at
                                 + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -1067,7 +1181,7 @@ def run_auto_compile_coordinator(
                     active_fingerprint = deferred_fingerprint
                     if deferred_fingerprint != previous_fingerprint:
                         break
-                    if not lock_probe(root):
+                    if not compiler_lock_held:
                         break
                     sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
                 continue
@@ -1129,7 +1243,7 @@ def run_auto_compile_coordinator(
 
 def _observe_auto_compile_content(
     root: Path, reservation: dict[str, object]
-) -> tuple[str, dict[str, str] | None]:
+) -> tuple[str, dict[str, object] | None]:
     def current(name: object) -> tuple[_DailyCompileRead, str] | None:
         if name is None:
             return None
@@ -1145,35 +1259,65 @@ def _observe_auto_compile_content(
     ):
         return "unreadable", None
     required_marker_prefix = reservation.get("required_marker_prefix")
-    if (
-        active is not None
-        and active[0].status == "covered"
-        and isinstance(required_marker_prefix, list)
-        and all(isinstance(marker, str) for marker in required_marker_prefix)
+    if not isinstance(required_marker_prefix, list) or not all(
+        isinstance(marker, str) for marker in required_marker_prefix
     ):
-        required = tuple(required_marker_prefix)
-        marker_advanced = (
-            len(active[0].markers) > len(required)
+        return "unreadable", None
+    required = tuple(required_marker_prefix)
+    if active is not None:
+        marker_history_valid = (
+            len(active[0].markers) >= len(required)
             and active[0].markers[: len(required)] == required
         )
-        if not marker_advanced:
+        marker_advanced = marker_history_valid and len(active[0].markers) > len(
+            required
+        )
+        if not marker_history_valid or (
+            active[0].status == "covered" and not marker_advanced
+        ):
             fingerprint = reservation.get("fingerprint")
             if not isinstance(fingerprint, str):
                 return "unreadable", None
-            return "uncompiled", {
+            retained = {
                 "fingerprint": fingerprint,
                 "log_name": active[1],
+                "required_marker_prefix": list(required),
             }
+            pending_fingerprint = reservation.get("pending_fingerprint")
+            pending_log_name = reservation.get("pending_log_name")
+            pending_prefix = reservation.get("pending_required_marker_prefix")
+            if (
+                isinstance(pending_fingerprint, str)
+                and isinstance(pending_log_name, str)
+                and isinstance(pending_prefix, list)
+                and all(isinstance(marker, str) for marker in pending_prefix)
+            ):
+                retained.update(
+                    {
+                        "pending_fingerprint": pending_fingerprint,
+                        "pending_log_name": pending_log_name,
+                        "pending_required_marker_prefix": pending_prefix,
+                    }
+                )
+            return "uncompiled", retained
     if active is None or active[0].status == "covered":
         if pending is None or pending[0].status == "covered":
             return "covered", None
         assert pending[0].fingerprint is not None
+        pending_prefix = reservation.get("pending_required_marker_prefix")
+        if not isinstance(pending_prefix, list) or not all(
+            isinstance(marker, str) for marker in pending_prefix
+        ):
+            return "unreadable", None
         return "uncompiled", {
             "fingerprint": pending[0].fingerprint,
             "log_name": pending[1],
+            "required_marker_prefix": pending_prefix,
         }
     assert active[0].fingerprint is not None
     observed = {"fingerprint": active[0].fingerprint, "log_name": active[1]}
+    if len(active[0].markers) > len(required):
+        observed["required_marker_prefix"] = list(active[0].markers)
     if (
         pending is not None
         and pending[0].status == "uncompiled"
@@ -1230,7 +1374,8 @@ def run_auto_compile_watcher(
     while True:
         observed_at = clock()
         successor_token = secrets.token_hex(32)
-        if lock_probe(root):
+        compiler_lock_held = lock_probe(root)
+        if compiler_lock_held:
             logging.debug("Automatic compile watcher observed a live child lock")
         try:
             with QueueRepository(
@@ -1247,6 +1392,7 @@ def run_auto_compile_watcher(
                     ),
                     predecessor_token=predecessor_token,
                     registration_required=registration_required,
+                    compiler_lock_held=compiler_lock_held,
                     now=observed_at,
                     watcher_expires_at=observed_at
                     + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),

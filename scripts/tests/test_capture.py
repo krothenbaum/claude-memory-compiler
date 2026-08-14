@@ -1832,6 +1832,20 @@ def test_first_auto_compile_request_atomically_spawns_owner_and_watchdog(
     assert state["token"] == owner_token
     assert state["fingerprint"] == fingerprint
     assert state["watcher_token"] == watchdog_token
+    assert state["required_marker_prefix"] == []
+
+
+def test_initial_schedule_persists_readable_marker_prefix(tmp_path, monkeypatch):
+    root, daily = _auto_compile_test_root(tmp_path)
+    daily.write_text(
+        "<!-- @compiled-through:first -->\nA\n", encoding="utf-8"
+    )
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["required_marker_prefix"] == ["first"]
 
 
 def test_first_owner_crash_is_taken_over_without_a_later_drain(tmp_path, monkeypatch):
@@ -1919,10 +1933,10 @@ def test_watchdog_spawn_rollback_leaves_latest_generation_retryable(
     assert state["fingerprint"] == latest
 
 
-def test_partial_first_pair_spawn_failure_rolls_back_registration(
+def test_owner_spawn_failure_watchdog_bootstraps_recovery_without_later_drain(
     tmp_path, monkeypatch
 ):
-    root, _daily = _auto_compile_test_root(tmp_path)
+    root, daily = _auto_compile_test_root(tmp_path)
     launches = []
     monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
     monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
@@ -1940,6 +1954,23 @@ def test_partial_first_pair_spawn_failure_rolls_back_registration(
     assert [command[2] for command in launches] == ["watchdog", "owner"]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         assert _reservation(repository) is None
+    bootstrap = launches[0]
+    recovered = []
+    assert flush_module.run_auto_compile_watchdog_bootstrap(
+        root,
+        bootstrap[8],
+        bootstrap[4],
+        bootstrap[5],
+        bootstrap[6],
+        tuple(json.loads(bootstrap[7])),
+        coordinator=lambda _root, token, fingerprint: (
+            recovered.append((token, fingerprint)) or True
+        ),
+        sleeper=lambda _seconds: None,
+        lock_probe=lambda _root: False,
+        clock=lambda: datetime.now(timezone.utc),
+    )
+    assert recovered == [(bootstrap[8], flush_module._uncompiled_fingerprint(daily))]
 
 
 def test_schedule_spawn_then_commit_failure_rolls_back_and_children_see_no_role(
@@ -1972,6 +2003,96 @@ def test_schedule_spawn_then_commit_failure_rolls_back_and_children_see_no_role(
     assert spawned == ["owner", "watchdog"]
     with QueueRepository(database, sync_usage=False) as repository:
         assert _reservation(repository) is None
+
+
+def test_bootstrap_rejects_nonidle_queue_and_does_not_create_reservation(tmp_path):
+    root, daily = _auto_compile_test_root(tmp_path)
+    fingerprint = flush_module._uncompiled_fingerprint(daily)
+    assert fingerprint is not None
+    source = tmp_path / "busy.jsonl"
+    write_claude_transcript(source)
+    capture_transcript(
+        source,
+        source_agent="claude",
+        metadata={"trigger": "session_end"},
+        memory_home=root,
+        launcher=lambda _root: None,
+        clock=lambda: NOW,
+    )
+    assert not flush_module.run_auto_compile_watchdog_bootstrap(
+        root,
+        "2" * 64,
+        "1" * 64,
+        fingerprint,
+        daily.name,
+        (),
+        coordinator=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("non-idle bootstrap must not coordinate")
+        ),
+        sleeper=lambda _seconds: None,
+        lock_probe=lambda _root: False,
+        clock=lambda: NOW,
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_bootstrap_waits_past_five_seconds_for_parent_transaction(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    fingerprint = flush_module._uncompiled_fingerprint(daily)
+    assert fingerprint is not None
+    real_bootstrap = QueueRepository.bootstrap_auto_compile_watchdog
+    bootstrap_calls = []
+
+    def blocked_then_committed(self, *args, **kwargs):
+        bootstrap_calls.append(True)
+        if len(bootstrap_calls) == 1:
+            raise sqlite3.OperationalError("parent transaction still owns writer lock")
+        return real_bootstrap(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        QueueRepository,
+        "bootstrap_auto_compile_watchdog",
+        blocked_then_committed,
+    )
+    monkeypatch.setattr(
+        flush_module, "_spawn_auto_compile_watchdog", lambda *_args: None
+    )
+    clock_calls = []
+
+    def clock():
+        current = NOW + timedelta(seconds=6 * len(clock_calls))
+        clock_calls.append(current)
+        return current
+
+    sleeps = []
+    coordinated = []
+
+    def coordinate(_root, token, active_fingerprint):
+        coordinated.append((token, active_fingerprint))
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            repository.release_auto_compile(token, active_fingerprint)
+        return True
+
+    assert flush_module.run_auto_compile_watchdog_bootstrap(
+        root,
+        "2" * 64,
+        "1" * 64,
+        fingerprint,
+        daily.name,
+        (),
+        coordinator=coordinate,
+        sleeper=sleeps.append,
+        lock_probe=lambda _root: False,
+        clock=clock,
+    )
+    assert len(bootstrap_calls) == 2
+    assert sleeps == [flush_module.AUTO_COMPILE_WATCHER_POLL_SECONDS]
+    assert coordinated == [("2" * 64, fingerprint)]
 
 
 @pytest.mark.parametrize("registration", ["replacement", "contender"])
@@ -3031,13 +3152,14 @@ def test_content_change_during_failed_compile_starts_fresh_generation(tmp_path):
     assert "last_error_class" not in state
 
 
-def test_marker_covered_during_ordinary_failure_clears_retry_request(tmp_path):
+def test_marker_covered_during_ordinary_failure_retains_retry_request(tmp_path):
     with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
         assert repository.schedule_auto_compile(
             "1" * 64,
             "2" * 64,
             "a" * 64,
             log_name="2026-08-11.md",
+            required_marker_prefix=("first",),
             now=NOW,
             expires_at=NOW + timedelta(minutes=2),
         ) == ("owner", "watchdog")
@@ -3045,11 +3167,14 @@ def test_marker_covered_during_ordinary_failure_clears_retry_request(tmp_path):
             "1" * 64,
             "a" * 64,
             "compile_exit_1",
-            lambda: ("covered", None),
+            lambda: ("covered", None, ("first", "second")),
             now=NOW + timedelta(seconds=1),
             expires_at=NOW + timedelta(minutes=2),
-        ) == "covered"
-        assert _reservation(repository) is None
+        ) == "retry_wait"
+        state = _reservation(repository)
+        assert state["fingerprint"] == "a" * 64
+        assert state["required_marker_prefix"] == ["first", "second"]
+        assert state["attempt_count"] == 1
 
 
 def test_watchdog_crash_during_backoff_can_be_replaced_without_losing_retry(
@@ -3657,6 +3782,7 @@ def test_exit_75_continues_with_promoted_pending_log_from_next_day(
         ) == "watcher"
     monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
     launches = []
+    compiler_lock_held = [False]
 
     class CompileProcess:
         def wait(self, timeout=None):
@@ -3671,16 +3797,20 @@ def test_exit_75_continues_with_promoted_pending_log_from_next_day(
             second_log.write_text(
                 "B\n<!-- @compiled-through:second -->\n", encoding="utf-8"
             )
+        compiler_lock_held[0] = False
+
+    def launch(*_args, **_kwargs):
+        launches.append(True)
+        compiler_lock_held[0] = True
+        return CompileProcess()
 
     assert flush_module.run_auto_compile_coordinator(
         root,
         token,
         first,
-        compile_launcher=lambda *_args, **_kwargs: (
-            launches.append(True) or CompileProcess()
-        ),
+        compile_launcher=launch,
         sleeper=defer,
-        lock_probe=lambda _root: True,
+        lock_probe=lambda _root: compiler_lock_held[0],
     )
     assert launches == [True, True]
 
@@ -4222,6 +4352,7 @@ def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resoluti
     token, fingerprint = _owner_command(commands)[-2:]
     launches = []
     lock_held = [True]
+    defer_calls = []
 
     class CompileProcess:
         def __init__(self, returncode):
@@ -4239,6 +4370,7 @@ def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resoluti
         return CompileProcess(75 if len(launches) == 1 else 0)
 
     def defer(_seconds):
+        defer_calls.append(True)
         with QueueRepository(
             root / "scripts/jobs.sqlite3", sync_usage=False
         ) as repository:
@@ -4246,9 +4378,13 @@ def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resoluti
         assert state["token"] == token
         assert state["fingerprint"] == fingerprint
         if resolution == "marker":
-            daily.write_text(
-                "A\n<!-- @compiled-through:orphan -->\n", encoding="utf-8"
-            )
+            if len(defer_calls) == 1:
+                daily.write_text(
+                    "A\n<!-- @compiled-through:orphan -->\n", encoding="utf-8"
+                )
+            else:
+                daily.write_text("A\n", encoding="utf-8")
+                lock_held[0] = False
         else:
             lock_held[0] = False
 
@@ -4260,7 +4396,7 @@ def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resoluti
         sleeper=defer,
         lock_probe=lambda _root: lock_held[0],
     )
-    assert launches == ([0] if resolution == "marker" else [0, 1])
+    assert launches == [0, 1]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
         assert _reservation(repository) is None
 
@@ -4293,7 +4429,7 @@ def test_watcher_exits_cleanly_when_owner_finishes_and_clears_reservation(
     )
 
 
-def test_watcher_exits_when_marker_covers_content_before_owner_lease_expires(
+def test_watcher_waits_when_marker_is_visible_before_owner_lease_expires(
     tmp_path, monkeypatch
 ):
     root, daily = _auto_compile_test_root(tmp_path)
@@ -4306,22 +4442,125 @@ def test_watcher_exits_when_marker_covers_content_before_owner_lease_expires(
         "A\nB\n<!-- @compiled-through:owner -->\n", encoding="utf-8"
     )
 
-    assert flush_module.run_auto_compile_watcher(
-        root,
-        watcher_token,
-        coordinator=lambda *_args: (_ for _ in ()).throw(
-            AssertionError("covered content must not be taken over")
-        ),
-        sleeper=lambda _seconds: (_ for _ in ()).throw(
-            AssertionError("covered watcher must exit immediately")
-        ),
-        lock_probe=lambda _root: True,
-    )
+    class ExpectedWait(RuntimeError):
+        pass
+
+    with pytest.raises(ExpectedWait):
+        flush_module.run_auto_compile_watcher(
+            root,
+            watcher_token,
+            coordinator=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("covered content must not be taken over")
+            ),
+            sleeper=lambda _seconds: (_ for _ in ()).throw(ExpectedWait()),
+            lock_probe=lambda _root: True,
+        )
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
-        assert _reservation(repository) is None
+        assert _reservation(repository) is not None
 
 
-def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
+@pytest.mark.parametrize("blocker", ["owner", "compiler_lock"])
+def test_watcher_never_clears_visible_marker_while_owner_or_compiler_is_live(
+    tmp_path, blocker
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    owner = "1" * 64
+    watcher = "2" * 64
+    successor = "3" * 64
+    fingerprint = flush_module._uncompiled_fingerprint(daily)
+    assert fingerprint is not None
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        repository.schedule_auto_compile(
+            owner,
+            watcher,
+            fingerprint,
+            log_name=daily.name,
+            required_marker_prefix=(),
+            now=(NOW if blocker == "owner" else NOW - timedelta(minutes=3)),
+            expires_at=(
+                NOW + timedelta(minutes=2)
+                if blocker == "owner"
+                else NOW - timedelta(microseconds=1)
+            ),
+        )
+        daily.write_text(
+            "A\n<!-- @compiled-through:staged -->\n", encoding="utf-8"
+        )
+        status, claimed = repository.poll_auto_compile_watcher(
+            watcher,
+            successor,
+            lambda reservation: flush_module._observe_auto_compile_content(
+                root, dict(reservation)
+            ),
+            lambda _token: (_ for _ in ()).throw(
+                AssertionError("live compiler state must not be claimed")
+            ),
+            predecessor_token=None,
+            compiler_lock_held=blocker == "compiler_lock",
+            now=NOW,
+            watcher_expires_at=NOW + timedelta(minutes=3),
+            owner_expires_at=NOW + timedelta(minutes=3),
+        )
+        assert (status, claimed) == ("wait", None)
+        assert _reservation(repository) is not None
+        daily.write_text("A\n", encoding="utf-8")
+        state = _reservation(repository)
+        state["expires_at"] = (NOW - timedelta(microseconds=1)).isoformat()
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+        launches = []
+        status, claimed = repository.poll_auto_compile_watcher(
+            watcher,
+            successor,
+            lambda reservation: flush_module._observe_auto_compile_content(
+                root, dict(reservation)
+            ),
+            launches.append,
+            predecessor_token=None,
+            compiler_lock_held=False,
+            now=NOW,
+            watcher_expires_at=NOW + timedelta(minutes=3),
+            owner_expires_at=NOW + timedelta(minutes=3),
+        )
+    assert (status, claimed) == ("claimed", fingerprint)
+    assert launches == [successor]
+
+
+def test_observer_retains_required_prefix_across_uncompiled_replacement(tmp_path):
+    root, daily = _auto_compile_test_root(tmp_path)
+    pending_log = root / "daily/2026-08-12.md"
+    pending_log.write_text("Pending\n", encoding="utf-8")
+    original = flush_module._uncompiled_fingerprint(daily)
+    pending = flush_module._uncompiled_fingerprint(pending_log)
+    assert original is not None
+    assert pending is not None
+    reservation = {
+        "fingerprint": original,
+        "log_name": daily.name,
+        "required_marker_prefix": ["first"],
+        "pending_fingerprint": pending,
+        "pending_log_name": pending_log.name,
+        "pending_required_marker_prefix": [],
+    }
+    daily.write_text(
+        "<!-- @compiled-through:replacement -->\nB\n", encoding="utf-8"
+    )
+    status, observed = flush_module._observe_auto_compile_content(root, reservation)
+    assert status == "uncompiled"
+    assert observed == {
+        "fingerprint": original,
+        "log_name": daily.name,
+        "required_marker_prefix": ["first"],
+        "pending_fingerprint": pending,
+        "pending_log_name": pending_log.name,
+        "pending_required_marker_prefix": [],
+    }
+
+
+def test_orphan_takeover_keeps_exit_75_request_until_lock_releases(
     tmp_path, monkeypatch
 ):
     root, daily = _auto_compile_test_root(tmp_path)
@@ -4340,6 +4579,7 @@ def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
             (json.dumps(state),),
         )
     launches = []
+    lock_held = [True]
 
     class LockedCompile:
         def wait(self, timeout=None):
@@ -4353,6 +4593,7 @@ def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
         daily.write_text(
             "A\nB\n<!-- @compiled-through:orphan -->\n", encoding="utf-8"
         )
+        lock_held[0] = False
 
     def takeover(target, token, fingerprint):
         return flush_module.run_auto_compile_coordinator(
@@ -4363,7 +4604,7 @@ def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
                 launches.append(True) or LockedCompile()
             ),
             sleeper=deferred,
-            lock_probe=lambda _root: True,
+            lock_probe=lambda _root: lock_held[0],
         )
 
     assert flush_module.run_auto_compile_watcher(
@@ -4373,7 +4614,7 @@ def test_orphan_takeover_keeps_exit_75_request_until_marker_advances(
         sleeper=lambda _seconds: (_ for _ in ()).throw(
             AssertionError("expired owner should be claimed immediately")
         ),
-        lock_probe=lambda _root: True,
+        lock_probe=lambda _root: False,
     )
     assert launches == [True]
 

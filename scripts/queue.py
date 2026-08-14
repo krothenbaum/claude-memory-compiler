@@ -57,7 +57,10 @@ SimpleQueue = _stdlib_queue.SimpleQueue
 
 JobStatus = Literal["pending", "leased", "succeeded", "failed", "dead"]
 AutoCompileReadStatus = Literal["unreadable", "covered", "uncompiled"]
-AutoCompileContentRead: TypeAlias = tuple[AutoCompileReadStatus, str | None]
+AutoCompileContentRead: TypeAlias = (
+    tuple[AutoCompileReadStatus, str | None]
+    | tuple[AutoCompileReadStatus, str | None, tuple[str, ...]]
+)
 SCHEMA_VERSION = 2
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
@@ -753,9 +756,12 @@ class QueueRepository:
     @classmethod
     def _validate_auto_compile_read(
         cls, observation: AutoCompileContentRead
-    ) -> AutoCompileContentRead:
+    ) -> tuple[AutoCompileReadStatus, str | None, tuple[str, ...] | None]:
+        if not isinstance(observation, tuple) or len(observation) not in {2, 3}:
+            raise ValueError("invalid auto-compile content observation")
         try:
-            status, fingerprint = observation
+            status, fingerprint = observation[:2]
+            markers = observation[2] if len(observation) == 3 else None
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid auto-compile content observation") from exc
         if status not in {"unreadable", "covered", "uncompiled"}:
@@ -767,7 +773,12 @@ class QueueRepository:
                 raise ValueError("uncompiled observation requires a fingerprint")
         elif fingerprint is not None:
             raise ValueError("non-uncompiled observation cannot have a fingerprint")
-        return status, fingerprint
+        if markers is not None and (
+            not isinstance(markers, tuple)
+            or not all(isinstance(marker, str) for marker in markers)
+        ):
+            raise ValueError("invalid auto-compile marker observation")
+        return status, fingerprint, markers
 
     def _active_work_unlocked(self) -> bool:
         return self._connection.execute(
@@ -896,12 +907,14 @@ class QueueRepository:
                     "token": token,
                     "fingerprint": fingerprint,
                     "log_name": log_name,
+                    "required_marker_prefix": [],
                     "expires_at": _stored_time(expires_dt),
                 }
                 role = "owner"
             else:
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
+                reservation["pending_required_marker_prefix"] = []
                 try:
                     watcher_live = (
                         _datetime(reservation["watcher_expires_at"]) > now_dt
@@ -948,6 +961,7 @@ class QueueRepository:
         fingerprint: str,
         *,
         log_name: str,
+        required_marker_prefix: tuple[str, ...] = (),
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
         launch_roles: Callable[[tuple[str, ...], str | None], None] | None = None,
@@ -964,6 +978,8 @@ class QueueRepository:
         expires_dt = _datetime(expires_at)
         if expires_dt <= now_dt:
             raise ValueError("auto-compile reservation expiry must be in the future")
+        if not all(isinstance(marker, str) for marker in required_marker_prefix):
+            raise ValueError("invalid auto-compile marker prefix")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if self._active_work_unlocked():
@@ -989,11 +1005,15 @@ class QueueRepository:
                     "expires_at": _stored_time(expires_dt),
                     "watcher_token": watchdog_token,
                     "watcher_expires_at": _stored_time(expires_dt),
+                    "required_marker_prefix": list(required_marker_prefix),
                 }
                 roles = ("owner", "watchdog")
             else:
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
+                reservation["pending_required_marker_prefix"] = list(
+                    required_marker_prefix
+                )
                 try:
                     watcher_live = (
                         _datetime(reservation["watcher_expires_at"]) > now_dt
@@ -1185,6 +1205,87 @@ class QueueRepository:
             )
         return False
 
+    def bootstrap_auto_compile_watchdog(
+        self,
+        watchdog_token: str,
+        owner_token: str,
+        fingerprint: str,
+        *,
+        log_name: str,
+        required_marker_prefix: tuple[str, ...],
+        current_content: Callable[[], AutoCompileContentRead],
+        now: datetime | str | int | float,
+        watcher_expires_at: datetime | str | int | float,
+    ) -> str:
+        """Recover a rolled-back genesis registration from its spawned watchdog."""
+        for value in (watchdog_token, owner_token, fingerprint):
+            if not self._valid_reservation_component(value):
+                raise ValueError("invalid auto-compile bootstrap identity")
+        if Path(log_name).name != log_name or not all(
+            isinstance(marker, str) for marker in required_marker_prefix
+        ):
+            raise ValueError("invalid auto-compile bootstrap source")
+        now_dt = _datetime(now)
+        watcher_expiry = _datetime(watcher_expires_at)
+        if watcher_expiry <= now_dt:
+            raise ValueError("bootstrap watcher expiry must be in the future")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._active_work_unlocked():
+                self._connection.execute("COMMIT")
+                return "rejected"
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    reservation = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    reservation = {}
+                exact = (
+                    reservation.get("token") == owner_token
+                    and reservation.get("watcher_token") == watchdog_token
+                    and reservation.get("fingerprint") == fingerprint
+                    and reservation.get("log_name") == log_name
+                    and reservation.get("required_marker_prefix")
+                    == list(required_marker_prefix)
+                )
+                self._connection.execute("COMMIT")
+                return "registered" if exact else "rejected"
+            status, observed_fingerprint, observed_markers = (
+                self._validate_auto_compile_read(current_content())
+            )
+            if (
+                status != "uncompiled"
+                or observed_fingerprint != fingerprint
+                or observed_markers != required_marker_prefix
+            ):
+                self._connection.execute("COMMIT")
+                return "rejected"
+            reservation = {
+                "token": owner_token,
+                "fingerprint": fingerprint,
+                "log_name": log_name,
+                "required_marker_prefix": list(required_marker_prefix),
+                "expires_at": _stored_time(now_dt),
+                "watcher_token": watchdog_token,
+                "watcher_expires_at": _stored_time(watcher_expiry),
+            }
+            self._connection.execute(
+                "INSERT INTO queue_metadata(key, value) VALUES (?, ?)",
+                (
+                    AUTO_COMPILE_RESERVATION_KEY,
+                    json.dumps(reservation, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            self._connection.execute("COMMIT")
+            return "bootstrapped"
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
     def clear_auto_compile_contender(self, token: str) -> bool:
         """Clear only the matching contender after its process fails to spawn."""
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1273,12 +1374,14 @@ class QueueRepository:
         token: str,
         successor_token: str,
         observe: Callable[
-            [Mapping[str, object]], tuple[AutoCompileReadStatus, Mapping[str, str] | None]
+            [Mapping[str, object]],
+            tuple[AutoCompileReadStatus, Mapping[str, object] | None],
         ],
         launch_successor: Callable[[str], None],
         *,
         predecessor_token: str | None,
         registration_required: bool = False,
+        compiler_lock_held: bool = False,
         now: datetime | str | int | float,
         watcher_expires_at: datetime | str | int | float,
         owner_expires_at: datetime | str | int | float,
@@ -1398,6 +1501,19 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return "wait", None
+            if current_owner_expiry > now_dt or compiler_lock_held:
+                reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return "wait", None
             observed_status, observed = observe(reservation)
             if observed_status == "unreadable":
                 reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
@@ -1422,21 +1538,28 @@ class QueueRepository:
                 return "done", None
             if observed_status != "uncompiled" or observed is None:
                 raise ValueError("invalid watcher content observation")
-            if current_owner_expiry > now_dt:
-                reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
-                self._connection.execute(
-                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
-                    (
-                        json.dumps(
-                            reservation, sort_keys=True, separators=(",", ":")
-                        ),
-                        AUTO_COMPILE_RESERVATION_KEY,
-                    ),
+            observed_fingerprint = observed.get("fingerprint")
+            observed_log_name = observed.get("log_name")
+            observed_prefix = observed.get("required_marker_prefix")
+            if (
+                not isinstance(observed_fingerprint, str)
+                or not self._valid_reservation_component(observed_fingerprint)
+                or not isinstance(observed_log_name, str)
+                or Path(observed_log_name).name != observed_log_name
+                or (
+                    observed_prefix is not None
+                    and (
+                        not isinstance(observed_prefix, list)
+                        or not all(
+                            isinstance(marker, str) for marker in observed_prefix
+                        )
+                    )
                 )
-                self._connection.execute("COMMIT")
-                return "wait", None
+            ):
+                raise ValueError("invalid watcher generation observation")
             reservation.pop("pending_fingerprint", None)
             reservation.pop("pending_log_name", None)
+            reservation.pop("pending_required_marker_prefix", None)
             reservation.pop("contender_token", None)
             reservation.pop("contender_predecessor_token", None)
             reservation.pop("contender_expires_at", None)
@@ -1452,7 +1575,6 @@ class QueueRepository:
             if changed_generation:
                 reservation.pop("attempt_count", None)
                 reservation.pop("last_error_class", None)
-                reservation.pop("required_marker_prefix", None)
             reservation.pop("next_retry_at", None)
             reservation.pop("status", None)
             self._connection.execute(
@@ -1512,11 +1634,34 @@ class QueueRepository:
             ):
                 self._connection.execute("COMMIT")
                 return "lost"
-            read_status, observed = self._validate_auto_compile_read(current_content())
+            read_status, observed, observed_markers = self._validate_auto_compile_read(
+                current_content()
+            )
             active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
+            promoted_marker_prefix: tuple[str, ...] | None = None
+            stored_prefix_value = reservation.get("required_marker_prefix")
+            stored_prefix = (
+                tuple(stored_prefix_value)
+                if isinstance(stored_prefix_value, list)
+                and all(isinstance(marker, str) for marker in stored_prefix_value)
+                else None
+            )
+            marker_history_valid = True
+            if observed_markers is not None and stored_prefix is not None:
+                marker_history_valid = (
+                    len(observed_markers) >= len(stored_prefix)
+                    and observed_markers[: len(stored_prefix)] == stored_prefix
+                )
+                if marker_history_valid and len(observed_markers) > len(
+                    stored_prefix
+                ):
+                    promoted_marker_prefix = observed_markers
+            if not marker_history_valid:
+                observed = fingerprint
             if (
                 read_status == "covered"
+                and marker_history_valid
                 and required_marker_prefix is None
                 and reservation.get("pending_log_name")
                 != reservation.get("log_name")
@@ -1525,22 +1670,22 @@ class QueueRepository:
             ):
                 observed = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
+                pending_prefix = reservation.get("pending_required_marker_prefix")
+                if isinstance(pending_prefix, list) and all(
+                    isinstance(marker, str) for marker in pending_prefix
+                ):
+                    promoted_marker_prefix = tuple(pending_prefix)
                 active_observed = False
-            if (
-                read_status == "covered"
-                and required_marker_prefix is None
-                and observed is None
-            ):
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
-                )
-                self._connection.execute("COMMIT")
-                return "covered"
             if read_status == "unreadable" or required_marker_prefix is not None:
                 observed = fingerprint
             if required_marker_prefix is not None:
                 reservation["required_marker_prefix"] = list(required_marker_prefix)
+            elif promoted_marker_prefix is not None:
+                reservation["required_marker_prefix"] = list(
+                    promoted_marker_prefix
+                )
+            if observed is None:
+                observed = fingerprint
             changed = observed != fingerprint
             if changed and reset_on_fingerprint_change:
                 reservation["fingerprint"] = observed
@@ -1555,6 +1700,7 @@ class QueueRepository:
                 if not preserve_other_log:
                     reservation.pop("pending_fingerprint", None)
                     reservation.pop("pending_log_name", None)
+                    reservation.pop("pending_required_marker_prefix", None)
                 reservation["status"] = "retry_wait"
                 reservation["next_retry_at"] = _stored_time(now_dt)
                 reservation["expires_at"] = _stored_time(now_dt)
@@ -1572,6 +1718,7 @@ class QueueRepository:
                     if not preserve_other_log:
                         reservation.pop("pending_fingerprint", None)
                         reservation.pop("pending_log_name", None)
+                        reservation.pop("pending_required_marker_prefix", None)
                 attempt = int(reservation.get("attempt_count", 0)) + 1
                 reservation["attempt_count"] = attempt
                 reservation["last_error_class"] = safe_error or "compile_failure"
@@ -1608,6 +1755,7 @@ class QueueRepository:
         fingerprint: str,
         current_content: Callable[[], AutoCompileContentRead],
         *,
+        compiler_lock_held: bool = False,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
     ) -> str | None:
@@ -1634,7 +1782,22 @@ class QueueRepository:
             ):
                 self._connection.execute("COMMIT")
                 return None
-            read_status, observed = self._validate_auto_compile_read(current_content())
+            if compiler_lock_held:
+                reservation["expires_at"] = _stored_time(expires_dt)
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return fingerprint
+            read_status, observed, _markers = self._validate_auto_compile_read(
+                current_content()
+            )
             active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
             if (
@@ -1679,6 +1842,7 @@ class QueueRepository:
             if observed != fingerprint and not preserve_other_log:
                 reservation.pop("pending_fingerprint", None)
                 reservation.pop("pending_log_name", None)
+                reservation.pop("pending_required_marker_prefix", None)
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
                 (
@@ -1806,6 +1970,14 @@ class QueueRepository:
                 return False
             reservation["fingerprint"] = pending_fingerprint
             reservation.pop("pending_fingerprint", None)
+            pending_log_name = reservation.pop("pending_log_name", None)
+            if isinstance(pending_log_name, str):
+                reservation["log_name"] = pending_log_name
+            pending_prefix = reservation.pop("pending_required_marker_prefix", None)
+            if isinstance(pending_prefix, list) and all(
+                isinstance(marker, str) for marker in pending_prefix
+            ):
+                reservation["required_marker_prefix"] = pending_prefix
             reservation["expires_at"] = _stored_time(expires_dt)
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
@@ -1875,11 +2047,43 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return None
-            read_status, observed_fingerprint = self._validate_auto_compile_read(
-                current_content()
+            read_status, observed_fingerprint, observed_markers = (
+                self._validate_auto_compile_read(current_content())
             )
+            required_prefix_value = reservation.get("required_marker_prefix")
+            required_prefix = (
+                tuple(required_prefix_value)
+                if isinstance(required_prefix_value, list)
+                and all(isinstance(marker, str) for marker in required_prefix_value)
+                else None
+            )
+            if observed_markers is not None and required_prefix is not None:
+                marker_history_valid = (
+                    len(observed_markers) >= len(required_prefix)
+                    and observed_markers[: len(required_prefix)] == required_prefix
+                )
+                marker_advanced = marker_history_valid and len(
+                    observed_markers
+                ) > len(required_prefix)
+                if not marker_history_valid or not marker_advanced:
+                    reservation["expires_at"] = _stored_time(now_dt)
+                    reservation["status"] = "read_wait"
+                    self._connection.execute(
+                        "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                        (
+                            json.dumps(
+                                reservation,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            AUTO_COMPILE_RESERVATION_KEY,
+                        ),
+                    )
+                    self._connection.execute("COMMIT")
+                    return fingerprint
             active_observed = read_status == "uncompiled"
             promoted_log_name = reservation.get("log_name")
+            promoted_marker_prefix = observed_markers
             if (
                 read_status == "covered"
                 and reservation.get("pending_log_name")
@@ -1889,6 +2093,11 @@ class QueueRepository:
             ):
                 observed_fingerprint = reservation["pending_fingerprint"]
                 promoted_log_name = reservation["pending_log_name"]
+                pending_prefix = reservation.get("pending_required_marker_prefix")
+                if isinstance(pending_prefix, list) and all(
+                    isinstance(marker, str) for marker in pending_prefix
+                ):
+                    promoted_marker_prefix = tuple(pending_prefix)
                 active_observed = False
             if read_status == "unreadable":
                 reservation["expires_at"] = _stored_time(now_dt)
@@ -1911,6 +2120,10 @@ class QueueRepository:
             if should_promote:
                 reservation["fingerprint"] = observed_fingerprint
                 reservation["log_name"] = promoted_log_name
+                if promoted_marker_prefix is not None:
+                    reservation["required_marker_prefix"] = list(
+                        promoted_marker_prefix
+                    )
                 preserve_other_log = (
                     active_observed
                     and reservation.get("pending_log_name")
@@ -1919,6 +2132,7 @@ class QueueRepository:
                 if not preserve_other_log:
                     reservation.pop("pending_fingerprint", None)
                     reservation.pop("pending_log_name", None)
+                    reservation.pop("pending_required_marker_prefix", None)
                 reservation["expires_at"] = _stored_time(expires_dt)
                 self._connection.execute(
                     "UPDATE queue_metadata SET value = ? WHERE key = ?",

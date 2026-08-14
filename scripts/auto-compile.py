@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 
@@ -11,6 +12,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from flush import (  # noqa: E402
     run_auto_compile_owner_startup,
+    run_auto_compile_watchdog_bootstrap,
     run_auto_compile_watcher,
 )
 
@@ -25,6 +27,28 @@ def main(argv: list[str] | None = None) -> int:
         return (
             0
             if run_auto_compile_watcher(root, token, registration_required=True)
+            else 1
+        )
+    if len(arguments) == 7 and arguments[0] == "watchdog":
+        _role, root, owner, fingerprint, log_name, markers_json, token = arguments
+        try:
+            markers_value = json.loads(markers_json)
+        except (TypeError, ValueError):
+            return 2
+        if not isinstance(markers_value, list) or not all(
+            isinstance(marker, str) for marker in markers_value
+        ):
+            return 2
+        return (
+            0
+            if run_auto_compile_watchdog_bootstrap(
+                root,
+                token,
+                owner,
+                fingerprint,
+                log_name,
+                tuple(markers_value),
+            )
             else 1
         )
     if len(arguments) == 4 and arguments[0] in {"watcher", "watchdog"}:
