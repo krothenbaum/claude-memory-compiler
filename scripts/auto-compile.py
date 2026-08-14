@@ -1,0 +1,79 @@
+"""Detached coordinator for one reserved end-of-day compile."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from flush import (  # noqa: E402
+    run_auto_compile_owner_startup,
+    run_auto_compile_watchdog_bootstrap,
+    run_auto_compile_watcher,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) == 4 and arguments[0] == "owner":
+        _role, root, token, fingerprint = arguments
+        return 0 if run_auto_compile_owner_startup(root, token, fingerprint) else 1
+    if len(arguments) == 3 and arguments[0] in {"watcher", "watchdog"}:
+        _role, root, token = arguments
+        return (
+            0
+            if run_auto_compile_watcher(root, token, registration_required=True)
+            else 1
+        )
+    if len(arguments) == 7 and arguments[0] == "watchdog":
+        _role, root, owner, fingerprint, log_name, markers_json, token = arguments
+        try:
+            markers_value = json.loads(markers_json)
+        except (TypeError, ValueError):
+            return 2
+        if not isinstance(markers_value, list) or not all(
+            isinstance(marker, str) for marker in markers_value
+        ):
+            return 2
+        return (
+            0
+            if run_auto_compile_watchdog_bootstrap(
+                root,
+                token,
+                owner,
+                fingerprint,
+                log_name,
+                tuple(markers_value),
+            )
+            else 1
+        )
+    if len(arguments) == 4 and arguments[0] in {"watcher", "watchdog"}:
+        _role, root, token, predecessor_token = arguments
+        return (
+            0
+            if run_auto_compile_watcher(
+                root, token, predecessor_token=predecessor_token
+            )
+            else 1
+        )
+    if len(arguments) == 4 and arguments[0] == "contender":
+        _role, root, token, predecessor_token = arguments
+        return (
+            0
+            if run_auto_compile_watcher(
+                root,
+                token,
+                predecessor_token=predecessor_token,
+                registration_required=True,
+            )
+            else 1
+        )
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

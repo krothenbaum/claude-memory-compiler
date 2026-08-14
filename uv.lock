@@ -287,7 +287,9 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "jsonschema" },
     { name = "python-dotenv" },
+    { name = "referencing" },
     { name = "tzdata" },
 ]
 
@@ -299,7 +301,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = ">=0.1.29" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "referencing", specifier = ">=0.37.0" },
     { name = "tzdata", specifier = ">=2024.1" },
 ]
 

@@ -1,0 +1,12 @@
+{"timestamp":"2026-08-10T16:00:00Z","type":"session_meta","payload":{"id":"codex-basic-session","cwd":"/workspaces/card-app","timestamp":"2026-08-10T16:00:00Z","instructions":"SESSION_INSTRUCTIONS_SHOULD_NOT_APPEAR"}}
+{"timestamp":"2026-08-10T16:00:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"DEVELOPER_INSTRUCTIONS_SHOULD_NOT_APPEAR"}]}}
+{"timestamp":"2026-08-10T16:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Plan the confirmation card"}]}}
+{"timestamp":"2026-08-10T16:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Proceeding to tickets"}]}}
+{"timestamp":"2026-08-10T16:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"Proceeding to tickets"}}
+{"timestamp":"2026-08-10T16:00:04Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"HIDDEN_RESPONSE_REASONING_SHOULD_NOT_APPEAR"}],"encrypted_content":"SECRET_REASONING_TOKEN"}}
+{"timestamp":"2026-08-10T16:00:04Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"HIDDEN_EVENT_REASONING_SHOULD_NOT_APPEAR"}}
+{"timestamp":"2026-08-10T16:00:05Z","type":"turn_context","payload":{"tokens":12345,"instructions":"TURN_CONTEXT_SHOULD_NOT_APPEAR"}}
+{"timestamp":"2026-08-10T16:00:06Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat secrets.txt\"}","call_id":"routine-1"}}
+{"timestamp":"2026-08-10T16:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"routine-1","output":"ROUTINE_TOOL_OUTPUT_SHOULD_NOT_APPEAR"}}
+{"timestamp":"2026-08-10T16:00:08Z","type":"response_item","payload":{"type":"function_call","name":"unknown_future_tool","arguments":"{}","call_id":"unknown-1"}}
+{"timestamp":"2026-08-10T16:00:09Z","type":"response_item","payload":{"type":"function_call_output","call_id":"unknown-1","output":"UNKNOWN_TOOL_OUTPUT_SHOULD_NOT_APPEAR"}}

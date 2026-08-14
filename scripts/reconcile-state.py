@@ -28,11 +28,17 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from compile import COMPILED_MARKER_RE, append_compiled_marker  # noqa: E402
 from config import DAILY_DIR, KNOWLEDGE_DIR, now_iso  # noqa: E402
-from utils import file_hash, load_state, save_state  # noqa: E402
+from staging import (  # noqa: E402
+    ApplyBookkeeping,
+    apply_host_bookkeeping,
+    has_incomplete_apply,
+    recover_incomplete_apply,
+)
+from utils import load_state_with_baseline, read_text_with_baseline  # noqa: E402
 
 LOG_MD_PATH = KNOWLEDGE_DIR / "log.md"
+COMPILED_MARKER_RE = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
 COMPILE_ENTRY_RE = re.compile(r"^##\s+\[[^\]]+\]\s+compile\s+\|\s+(\S+\.md)", re.MULTILINE)
 
 
@@ -48,7 +54,17 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Report changes without writing")
     args = parser.parse_args()
 
-    state = load_state()
+    if args.dry_run:
+        if has_incomplete_apply(DAILY_DIR.parent):
+            print(
+                "Cannot dry-run while a memory apply journal needs recovery; "
+                "run reconcile-state.py without --dry-run first.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    else:
+        recover_incomplete_apply(DAILY_DIR.parent)
+    state, _initial_state_baseline = load_state_with_baseline()
     ingested = state.setdefault("ingested", {})
 
     mentioned = files_mentioned_in_log_md()
@@ -61,9 +77,9 @@ def main() -> None:
             print(f"  SKIP {name}: file missing from daily/")
             continue
         if name in ingested:
-            current_hash = file_hash(log_path)
+            content, log_baseline = read_text_with_baseline(log_path)
+            current_hash = log_baseline.sha256[:16] if log_baseline.sha256 else ""
             recorded_hash = ingested[name].get("hash")
-            content = log_path.read_text(encoding="utf-8")
             has_marker = bool(COMPILED_MARKER_RE.search(content))
             if recorded_hash == current_hash and has_marker:
                 continue  # already healthy
@@ -85,20 +101,48 @@ def main() -> None:
         print("\n(dry-run; no changes written)")
         return
 
+    from compile import commit_compiled_bookkeeping
+
     print("\nApplying...")
     now = now_iso()
     for log_path in to_reconcile:
-        content = log_path.read_text(encoding="utf-8")
-        if not COMPILED_MARKER_RE.search(content):
-            append_compiled_marker(log_path, now)
+        state, state_baseline = load_state_with_baseline()
+        ingested = state.setdefault("ingested", {})
+        content, log_baseline = read_text_with_baseline(log_path)
+        needs_marker = not COMPILED_MARKER_RE.search(content)
         prior = ingested.get(log_path.name, {})
         ingested[log_path.name] = {
-            "hash": file_hash(log_path),  # post-marker hash
+            **prior,
+            "hash": (
+                "pending-transaction"
+                if needs_marker
+                else (log_baseline.sha256[:16] if log_baseline.sha256 else "")
+            ),
             "compiled_at": prior.get("compiled_at", now),
-            "cost_usd": prior.get("cost_usd", 0.0),
             "reconciled_at": now,
         }
-    save_state(state)
+        if needs_marker:
+            commit_compiled_bookkeeping(
+                DAILY_DIR.parent.resolve(),
+                log_path,
+                state,
+                now,
+                state_baseline,
+                log_baseline,
+            )
+        else:
+            relative = (
+                log_path.resolve().relative_to(DAILY_DIR.parent.resolve()).as_posix()
+            )
+            apply_host_bookkeeping(
+                DAILY_DIR.parent,
+                ApplyBookkeeping(
+                    state=state,
+                    state_baseline=state_baseline,
+                    input_baselines={relative: log_baseline},
+                ),
+            )
+        ingested = state.setdefault("ingested", {})
     print(f"Done. state.json now tracks {len(ingested)} ingested file(s).")
 
 

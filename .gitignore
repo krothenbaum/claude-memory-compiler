@@ -11,6 +11,13 @@ scripts/flush.log
 scripts/compile.log
 scripts/session-flush-*
 scripts/flush-context-*
+scripts/jobs.sqlite3*
+scripts/memory-worker.lock
+scripts/memory-writer.lock
+scripts/memory-apply-journal/
+scripts/spool/
+scripts/staging/
+scripts/logs/
 
 # Generated content (built up per-user by hooks and scripts)
 drafts/
