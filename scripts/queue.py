@@ -1022,9 +1022,14 @@ class QueueRepository:
             raise
 
     def rollback_auto_compile_schedule(
-        self, owner_token: str, watchdog_token: str
+        self,
+        owner_token: str,
+        watchdog_token: str,
+        *,
+        now: datetime | str | int | float,
     ) -> bool:
-        """Remove only an unstarted matching owner/watchdog pair."""
+        """Roll back an unstarted pair without erasing a concurrent generation."""
+        now_dt = _datetime(now)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             row = self._connection.execute(
@@ -1041,7 +1046,22 @@ class QueueRepository:
                 reservation.get("token") == owner_token
                 and reservation.get("watcher_token") == watchdog_token
             )
-            if matched:
+            has_pending = isinstance(reservation.get("pending_fingerprint"), str)
+            if matched and has_pending:
+                reservation.pop("watcher_token", None)
+                reservation.pop("watcher_expires_at", None)
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "spawn_failed"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+            elif matched:
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
@@ -1138,13 +1158,17 @@ class QueueRepository:
     def poll_auto_compile_watcher(
         self,
         token: str,
+        successor_token: str,
         observe: Callable[[Mapping[str, object]], Mapping[str, str] | None],
+        launch_successor: Callable[[str], None],
         *,
         now: datetime | str | int | float,
         watcher_expires_at: datetime | str | int | float,
         owner_expires_at: datetime | str | int | float,
     ) -> tuple[str, str | None]:
         """Heartbeat a watcher or atomically promote it after owner expiry."""
+        if not self._valid_reservation_component(successor_token):
+            raise ValueError("successor token must be a lowercase SHA-256 value")
         now_dt = _datetime(now)
         watcher_expiry = _datetime(watcher_expires_at)
         owner_expiry = _datetime(owner_expires_at)
@@ -1223,6 +1247,7 @@ class QueueRepository:
             fingerprint = reservation["fingerprint"]
             reservation["token"] = token
             reservation["expires_at"] = _stored_time(owner_expiry)
+            reservation["watcher_token"] = successor_token
             reservation["watcher_expires_at"] = _stored_time(watcher_expiry)
             if changed_generation:
                 reservation.pop("attempt_count", None)
@@ -1236,6 +1261,7 @@ class QueueRepository:
                     AUTO_COMPILE_RESERVATION_KEY,
                 ),
             )
+            launch_successor(successor_token)
             self._connection.execute("COMMIT")
             return "claimed", fingerprint
         except BaseException:
@@ -1500,9 +1526,16 @@ class QueueRepository:
                 self._connection.execute("COMMIT")
                 return False
             if self._active_work_unlocked():
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "queue_wait"
                 self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
                 )
                 self._connection.execute("COMMIT")
                 return False
@@ -1564,9 +1597,16 @@ class QueueRepository:
                 self._connection.execute("COMMIT")
                 return None
             if self._active_work_unlocked():
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "queue_wait"
                 self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
                 )
                 self._connection.execute("COMMIT")
                 return None
@@ -1738,12 +1778,21 @@ class QueueRepository:
                 unexpired = _datetime(reservation["expires_at"]) > now_dt
             except (KeyError, TypeError, ValueError):
                 unexpired = False
-            if not matched or not unexpired or self._active_work_unlocked():
-                if matched:
-                    self._connection.execute(
-                        "DELETE FROM queue_metadata WHERE key = ?",
-                        (AUTO_COMPILE_RESERVATION_KEY,),
-                    )
+            if not matched or not unexpired:
+                self._connection.execute("COMMIT")
+                return None
+            if self._active_work_unlocked():
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "queue_wait"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
                 self._connection.execute("COMMIT")
                 return None
             process = launch()

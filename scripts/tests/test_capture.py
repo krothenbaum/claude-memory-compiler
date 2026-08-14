@@ -1663,6 +1663,19 @@ def test_windows_agent_session_counter_fails_closed_on_enumeration_error(
     assert flush_module.count_interactive_agent_sessions() == -1
 
 
+def test_windows_agent_session_counter_fails_closed_on_timeout(monkeypatch):
+    monkeypatch.setattr(flush_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        flush_module,
+        "_list_windows_processes",
+        lambda: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["powershell.exe"], 5)
+        ),
+    )
+
+    assert flush_module.count_interactive_agent_sessions() == -1
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -1855,6 +1868,35 @@ def test_watchdog_spawn_failure_rolls_back_both_first_roles_for_retry(
         assert _reservation(repository) is None
 
 
+def test_watchdog_spawn_rollback_preserves_concurrent_pending_generation(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    attempts = []
+    monkeypatch.setattr(flush_module, "count_interactive_agent_sessions", lambda: 0)
+    monkeypatch.setattr(flush_module, "_resolve_tty_path", lambda: None)
+    monkeypatch.setattr(flush_module, "notify_terminal", lambda _message: None)
+    monkeypatch.setattr(flush_module.time, "sleep", lambda _seconds: None)
+
+    def fail_watchdog(command, **_options):
+        attempts.append(command)
+        if len(attempts) == 1:
+            daily.write_text("A\nB\n", encoding="utf-8")
+            assert _schedule_auto_compile(root) is False
+        raise OSError("watchdog spawn failed")
+
+    monkeypatch.setattr(flush_module.subprocess, "Popen", fail_watchdog)
+
+    assert _schedule_auto_compile(root) is False
+
+    latest = flush_module._uncompiled_fingerprint(daily)
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["pending_fingerprint"] == latest
+    assert state["status"] == "spawn_failed"
+    assert "watcher_token" not in state
+
+
 def test_owner_spawn_failure_preserves_watchdog_for_immediate_takeover(
     tmp_path, monkeypatch
 ):
@@ -1975,6 +2017,106 @@ def test_auto_compile_coordinator_cancels_if_job_arrives_after_reservation(
     assert compile_launches == []
 
 
+def test_queue_work_before_launch_defers_and_watchdog_resumes_without_new_drain(
+    tmp_path, monkeypatch
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    owner_token, fingerprint = _owner_command(commands)[-2:]
+    watchdog_token = _watchdog_command(commands)[-1]
+    launches = []
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        enqueue_capture_job(repository, root, session_id="arrived-before-launch")
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        owner_token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: launches.append(True),
+    )
+    assert launches == []
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        assert state["fingerprint"] == fingerprint
+        assert state["watcher_token"] == watchdog_token
+        repository._connection.execute("UPDATE jobs SET status = 'dead'")
+
+    resumed = []
+
+    def resume(_root, token, current):
+        resumed.append((token, current))
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            repository.release_auto_compile(token, current)
+        return True
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watchdog_token,
+        coordinator=resume,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("deferred owner must be immediately reclaimable")
+        ),
+        lock_probe=lambda _root: False,
+        clock=lambda: datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert resumed[0][1] == fingerprint
+
+
+def test_queue_work_during_pending_promotion_preserves_latest_generation(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    owner_token, first = _owner_command(commands)[-2:]
+    watchdog_token = _watchdog_command(commands)[-1]
+    daily.write_text("A\nB\n", encoding="utf-8")
+    latest = flush_module._uncompiled_fingerprint(daily)
+    assert _schedule_auto_compile(root) is False
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        enqueue_capture_job(repository, root, session_id="arrived-before-promotion")
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        owner_token,
+        first,
+        compile_launcher=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("queue work must prevent compile launch")
+        ),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        assert state["pending_fingerprint"] == latest
+        repository._connection.execute("UPDATE jobs SET status = 'dead'")
+
+    resumed = []
+
+    def resume(_root, token, current):
+        resumed.append(current)
+        with QueueRepository(
+            root / "scripts/jobs.sqlite3", sync_usage=False
+        ) as repository:
+            repository.release_auto_compile(token, current)
+        return True
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watchdog_token,
+        coordinator=resume,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("latest generation must resume immediately")
+        ),
+        lock_probe=lambda _root: False,
+        clock=lambda: datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert resumed == [latest]
+
+
 def test_auto_compile_reservation_fingerprint_changes_with_uncompiled_content(
     tmp_path, monkeypatch
 ):
@@ -2058,6 +2200,166 @@ def test_compile_process_spawn_failure_uses_same_durable_retry_budget(
     assert state["attempt_count"] == 1
     assert state["last_error_class"] == "compile_launch_OSError"
     assert state["status"] == "retry_wait"
+
+
+@pytest.mark.parametrize("completed_path", ["provider", "stage", "deferred_apply"])
+def test_exit_zero_without_marker_progress_uses_durable_retry_budget(
+    tmp_path, monkeypatch, completed_path
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class NoProgressCompile:
+        def wait(self, timeout=None):
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: NoProgressCompile(),
+    ), completed_path
+
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["fingerprint"] == fingerprint
+    assert state["attempt_count"] == 1
+    assert state["last_error_class"] == "compile_no_progress"
+    assert state["status"] == "retry_wait"
+
+
+def test_exit_zero_no_progress_then_watchdog_retry_with_marker_succeeds(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    owner_token, fingerprint = _owner_command(commands)[-2:]
+    watchdog_token = _watchdog_command(commands)[-1]
+
+    class NoProgressCompile:
+        def wait(self, timeout=None):
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        owner_token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: NoProgressCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        retry_at = datetime.fromisoformat(_reservation(repository)["next_retry_at"])
+
+    class MarkerProgressCompile:
+        def wait(self, timeout=None):
+            daily.write_text(
+                "A\n<!-- @compiled-through:no-article -->\n", encoding="utf-8"
+            )
+            return 0
+
+    def retry(target, token, current):
+        return flush_module.run_auto_compile_coordinator(
+            target,
+            token,
+            current,
+            compile_launcher=lambda *_args, **_kwargs: MarkerProgressCompile(),
+        )
+
+    assert flush_module.run_auto_compile_watcher(
+        root,
+        watchdog_token,
+        coordinator=retry,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("retry deadline has arrived")
+        ),
+        lock_probe=lambda _root: False,
+        clock=lambda: retry_at + timedelta(microseconds=1),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
+
+
+def test_exit_zero_no_progress_reaches_inspectable_failed_cap(
+    tmp_path, monkeypatch
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    monkeypatch.setattr(flush_module, "AUTO_COMPILE_MAX_ATTEMPTS", 1)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class NoProgressCompile:
+        def wait(self, timeout=None):
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: NoProgressCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["status"] == "failed"
+    assert state["attempt_count"] == 1
+    assert state["last_error_class"] == "compile_no_progress"
+
+
+def test_exit_zero_without_marker_but_with_new_content_resets_generation(
+    tmp_path, monkeypatch
+):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class ChangedWithoutProgress:
+        def wait(self, timeout=None):
+            daily.write_text("A\nB\n", encoding="utf-8")
+            return 0
+
+    assert not flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: ChangedWithoutProgress(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["fingerprint"] == flush_module._uncompiled_fingerprint(daily)
+    assert state["status"] == "retry_wait"
+    assert "attempt_count" not in state
+    assert "last_error_class" not in state
+
+
+def test_exit_zero_with_no_article_marker_progress_is_success(tmp_path, monkeypatch):
+    root, daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    token, fingerprint = _owner_command(commands)[-2:]
+
+    class MarkerOnlyCompile:
+        def wait(self, timeout=None):
+            daily.write_text(
+                "A\n<!-- @compiled-through:no-article -->\n", encoding="utf-8"
+            )
+            return 0
+
+    assert flush_module.run_auto_compile_coordinator(
+        root,
+        token,
+        fingerprint,
+        compile_launcher=lambda *_args, **_kwargs: MarkerOnlyCompile(),
+    )
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        assert _reservation(repository) is None
 
 
 def test_ordinary_failure_then_watchdog_retry_succeeds_without_new_session(
@@ -2607,7 +2909,7 @@ def test_coordinator_defers_changed_generation_after_first_compile_failure(
     assert state["fingerprint"] == flush_module._uncompiled_fingerprint(daily)
 
 
-def test_coordinator_stops_handoff_when_new_queue_job_arrives(
+def test_coordinator_defers_handoff_when_new_queue_job_arrives(
     tmp_path, monkeypatch
 ):
     root, daily = _auto_compile_test_root(tmp_path)
@@ -2642,7 +2944,10 @@ def test_coordinator_stops_handoff_when_new_queue_job_arrives(
     )
     assert launches == [True]
     with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
-        assert _reservation(repository) is None
+        state = _reservation(repository)
+    assert state["status"] == "queue_wait"
+    assert state["watcher_token"] == _watchdog_command(commands)[-1]
+    assert state["pending_fingerprint"] != fingerprint
 
 
 def test_expired_coordinator_with_pending_is_replaced_by_latest_reservation(tmp_path):
@@ -3013,6 +3318,74 @@ def test_watcher_takes_over_expired_owner_without_another_session(
     assert takeovers == [(watcher_token, flush_module._uncompiled_fingerprint(daily))]
 
 
+def test_each_crashed_takeover_owner_has_an_independent_successor_watchdog(
+    tmp_path, monkeypatch
+):
+    root, _daily = _auto_compile_test_root(tmp_path)
+    commands = []
+    _configure_auto_compile_test(monkeypatch, commands)
+    assert _schedule_auto_compile(root) is True
+    first_watchdog = _watchdog_command(commands)[-1]
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+    class OwnerCrash(RuntimeError):
+        pass
+
+    def crash(*_args):
+        raise OwnerCrash("takeover owner crashed")
+
+    with pytest.raises(OwnerCrash):
+        flush_module.run_auto_compile_watcher(
+            root,
+            first_watchdog,
+            coordinator=crash,
+            sleeper=lambda _seconds: (_ for _ in ()).throw(
+                AssertionError("expired owner must be claimed immediately")
+            ),
+            lock_probe=lambda _root: False,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+    assert commands[-1][2] == "watchdog"
+    second_watchdog = commands[-1][-1]
+    assert second_watchdog != first_watchdog
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+        assert state["token"] == first_watchdog
+        assert state["watcher_token"] == second_watchdog
+        state["expires_at"] = "2000-01-01T00:00:00.000000+00:00"
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? "
+            "WHERE key = 'auto_compile_reservation'",
+            (json.dumps(state),),
+        )
+
+    with pytest.raises(OwnerCrash):
+        flush_module.run_auto_compile_watcher(
+            root,
+            second_watchdog,
+            coordinator=crash,
+            sleeper=lambda _seconds: (_ for _ in ()).throw(
+                AssertionError("second crashed owner must be reclaimed immediately")
+            ),
+            lock_probe=lambda _root: False,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+    third_watchdog = commands[-1][-1]
+    assert commands[-1][2] == "watchdog"
+    assert third_watchdog not in {first_watchdog, second_watchdog}
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        state = _reservation(repository)
+    assert state["token"] == second_watchdog
+    assert state["watcher_token"] == third_watchdog
+
+
 def test_delayed_live_watcher_can_renew_if_its_token_was_not_replaced(
     tmp_path, monkeypatch
 ):
@@ -3062,6 +3435,10 @@ def test_exit_75_defers_without_deleting_request(tmp_path, monkeypatch, resoluti
             self.returncode = returncode
 
         def wait(self, timeout=None):
+            if self.returncode == 0:
+                daily.write_text(
+                    "A\n<!-- @compiled-through:retried -->\n", encoding="utf-8"
+                )
             return self.returncode
 
     def launch(*_args, **_kwargs):

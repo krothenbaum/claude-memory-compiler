@@ -248,9 +248,14 @@ AUTO_COMPILE_SPAWN_ATTEMPTS = 3
 AUTO_COMPILE_SPAWN_RETRY_SECONDS = 0.05
 AUTO_COMPILE_MAX_ATTEMPTS = 3
 AUTO_COMPILE_RETRY_BASE_SECONDS = 5
+_COMPILED_MARKER_RE = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
 
 
 class _AutoCompileContentChanged(RuntimeError):
+    pass
+
+
+class _AutoCompileWatchdogSpawnError(RuntimeError):
     pass
 
 
@@ -424,7 +429,7 @@ def count_interactive_agent_sessions() -> int:
     if sys.platform == "win32":
         try:
             return _count_agent_processes(_list_windows_processes())
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             return -1
 
     try:
@@ -459,15 +464,23 @@ def _uncompiled_fingerprint(path: Path) -> str | None:
         content, _baseline = read_text_with_baseline(path)
     except (OSError, UnicodeError, ValueError):
         return None
-    marker_re = re.compile(r"<!--\s*@compiled-through:([^\s>]+)\s*-->")
     last_end = 0
-    for marker in marker_re.finditer(content):
+    for marker in _COMPILED_MARKER_RE.finditer(content):
         last_end = marker.end()
     uncompiled = content[last_end:].strip()
     if not uncompiled:
         return None
     material = f"{path.name}\0{uncompiled}".encode()
     return hashlib.sha256(material).hexdigest()
+
+
+def _compiled_marker_state(path: Path) -> tuple[str, ...] | None:
+    """Return durable marker identity, or ``None`` when it cannot be inspected."""
+    try:
+        content, _baseline = read_text_with_baseline(path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return tuple(match.group(1) for match in _COMPILED_MARKER_RE.finditer(content))
 
 
 def _release_auto_compile(root: Path, token: str, fingerprint: str) -> None:
@@ -525,7 +538,11 @@ def _rollback_auto_compile_schedule(
     with QueueRepository(
         config.queue_path, memory_home=root, sync_usage=False
     ) as repository:
-        repository.rollback_auto_compile_schedule(owner_token, watchdog_token)
+        repository.rollback_auto_compile_schedule(
+            owner_token,
+            watchdog_token,
+            now=datetime.now(timezone.utc),
+        )
 
 
 def _auto_compile_lock_is_held(root: Path) -> bool:
@@ -566,6 +583,34 @@ def _auto_compile_environment(root: Path) -> dict[str, str]:
     if tty_path:
         environment["CLAUDE_MEMORY_TTY"] = tty_path
     return environment
+
+
+def _spawn_auto_compile_watchdog(
+    root: Path, coordinator_script: Path, token: str
+) -> None:
+    command = [
+        sys.executable,
+        str(coordinator_script),
+        "watchdog",
+        str(root),
+        token,
+    ]
+    last_error: Exception | None = None
+    for attempt in range(AUTO_COMPILE_SPAWN_ATTEMPTS):
+        try:
+            with open_secure_log_stream(root / "scripts" / "compile.log") as log_handle:
+                subprocess.Popen(
+                    command,
+                    **_compile_process_options(root, log_handle),
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < AUTO_COMPILE_SPAWN_ATTEMPTS:
+                time.sleep(AUTO_COMPILE_SPAWN_RETRY_SECONDS)
+    raise _AutoCompileWatchdogSpawnError(
+        f"watchdog spawn failed after {AUTO_COMPILE_SPAWN_ATTEMPTS} attempts"
+    ) from last_error
 
 
 def maybe_trigger_compilation(
@@ -640,35 +685,16 @@ def maybe_trigger_compilation(
             return False
 
     logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
-    watchdog_command = [
-        sys.executable,
-        str(coordinator_script),
-        "watchdog",
-        str(root),
-        watchdog_token,
-    ]
     if "watchdog" in roles:
-        for attempt in range(AUTO_COMPILE_SPAWN_ATTEMPTS):
-            try:
-                with open_secure_log_stream(
-                    scripts_dir / "compile.log"
-                ) as log_handle:
-                    subprocess.Popen(
-                        watchdog_command,
-                        **_compile_process_options(root, log_handle),
-                    )
-                break
-            except Exception as exc:
-                if attempt + 1 == AUTO_COMPILE_SPAWN_ATTEMPTS:
-                    if "owner" in roles:
-                        _rollback_auto_compile_schedule(
-                            root, owner_token, watchdog_token
-                        )
-                    else:
-                        _clear_auto_compile_watcher(root, watchdog_token)
-                    logging.error("Failed to spawn auto-compile watchdog: %s", exc)
-                    return False
-                time.sleep(AUTO_COMPILE_SPAWN_RETRY_SECONDS)
+        try:
+            _spawn_auto_compile_watchdog(root, coordinator_script, watchdog_token)
+        except _AutoCompileWatchdogSpawnError as exc:
+            if "owner" in roles:
+                _rollback_auto_compile_schedule(root, owner_token, watchdog_token)
+            else:
+                _clear_auto_compile_watcher(root, watchdog_token)
+            logging.error("Failed to spawn auto-compile watchdog: %s", exc)
+            return False
 
     if "owner" in roles:
         owner_command = [
@@ -779,14 +805,17 @@ def run_auto_compile_coordinator(
             if count_interactive_agent_sessions() != 0:
                 return False
 
+            marker_before: tuple[str, ...] | None = None
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
             ) as repository:
                 def launch() -> object:
+                    nonlocal marker_before
                     if _uncompiled_fingerprint(log_path) != active_fingerprint:
                         raise _AutoCompileContentChanged(
                             "daily content changed before compile launch"
                         )
+                    marker_before = _compiled_marker_state(log_path)
                     with open_secure_log_stream(
                         root / "scripts" / "compile.log"
                     ) as log_handle:
@@ -871,6 +900,11 @@ def run_auto_compile_coordinator(
                 record_failure(log_path, f"compile_exit_{return_code}")
                 return False
 
+            marker_after = _compiled_marker_state(log_path)
+            if marker_after is None or marker_after == marker_before:
+                record_failure(log_path, "compile_no_progress")
+                return False
+
             handoff_at = datetime.now(timezone.utc)
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
@@ -933,6 +967,9 @@ def run_auto_compile_watcher(
     environment["AI_MEMORY_HOME"] = str(root)
     environment.pop("CLAUDE_MEMORY_HOME", None)
     config = load_config(environment)
+    coordinator_script = root / "scripts" / "auto-compile.py"
+    if not coordinator_script.is_file() or coordinator_script.is_symlink():
+        return False
     run_coordinator = coordinator or (
         lambda target, owner_token, fingerprint: run_auto_compile_coordinator(
             target, owner_token, fingerprint
@@ -940,22 +977,32 @@ def run_auto_compile_watcher(
     )
     while True:
         observed_at = clock()
+        successor_token = secrets.token_hex(32)
         if lock_probe(root):
             logging.debug("Automatic compile watcher observed a live child lock")
-        with QueueRepository(
-            config.queue_path, memory_home=root, sync_usage=False
-        ) as repository:
-            status, fingerprint = repository.poll_auto_compile_watcher(
-                token,
-                lambda reservation: _observe_auto_compile_content(
-                    root, dict(reservation)
-                ),
-                now=observed_at,
-                watcher_expires_at=observed_at
-                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
-                owner_expires_at=observed_at
-                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
-            )
+        try:
+            with QueueRepository(
+                config.queue_path, memory_home=root, sync_usage=False
+            ) as repository:
+                status, fingerprint = repository.poll_auto_compile_watcher(
+                    token,
+                    successor_token,
+                    lambda reservation: _observe_auto_compile_content(
+                        root, dict(reservation)
+                    ),
+                    lambda candidate: _spawn_auto_compile_watchdog(
+                        root, coordinator_script, candidate
+                    ),
+                    now=observed_at,
+                    watcher_expires_at=observed_at
+                    + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                    owner_expires_at=observed_at
+                    + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                )
+        except _AutoCompileWatchdogSpawnError as exc:
+            logging.error("Failed to spawn successor auto-compile watchdog: %s", exc)
+            sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
+            continue
         if status == "done":
             return True
         if status == "claimed":
