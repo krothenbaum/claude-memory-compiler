@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import logging
@@ -24,7 +25,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -243,6 +244,10 @@ COMPILE_AFTER_HOUR = 16  # 4 PM local time
 AUTO_COMPILE_LEASE_SECONDS = 120
 AUTO_COMPILE_HEARTBEAT_SECONDS = 30
 AUTO_COMPILE_WATCHER_POLL_SECONDS = 5
+AUTO_COMPILE_SPAWN_ATTEMPTS = 3
+AUTO_COMPILE_SPAWN_RETRY_SECONDS = 0.05
+AUTO_COMPILE_MAX_ATTEMPTS = 3
+AUTO_COMPILE_RETRY_BASE_SECONDS = 5
 
 
 class _AutoCompileContentChanged(RuntimeError):
@@ -270,19 +275,29 @@ def _is_memory_codex_provider_command(arguments: list[str]) -> bool:
             return False
         values[option] = arguments[cursor + 1]
         cursor += 2
+    schema_value: str | None = None
     if arguments[cursor : cursor + 1] == ["--output-schema"]:
         if cursor + 1 >= len(arguments):
             return False
-        schema = Path(arguments[cursor + 1])
-        if not schema.is_absolute():
-            return False
+        schema_value = arguments[cursor + 1]
         cursor += 2
     if arguments[cursor:] != ["-"]:
         return False
 
-    workspace = Path(values["--cd"])
-    output = Path(values["--output-last-message"])
-    if not workspace.is_absolute() or not output.is_absolute() or not values["--model"]:
+    path_values = [values["--cd"], values["--output-last-message"]]
+    if schema_value is not None:
+        path_values.append(schema_value)
+    windows_paths = any("\\" in value for value in path_values)
+    path_type = PureWindowsPath if windows_paths else Path
+    workspace = path_type(values["--cd"])
+    output = path_type(values["--output-last-message"])
+    schema = path_type(schema_value) if schema_value is not None else None
+    if (
+        not workspace.is_absolute()
+        or not output.is_absolute()
+        or (schema is not None and not schema.is_absolute())
+        or not values["--model"]
+    ):
         return False
     if values["--sandbox"] == "read-only":
         return (
@@ -301,6 +316,103 @@ def _is_memory_codex_provider_command(arguments: list[str]) -> bool:
     return False
 
 
+def _split_windows_command_line(command_line: str) -> list[str]:
+    """Parse one Windows command line with the operating system's argv rules."""
+    if not command_line:
+        return []
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    count = ctypes.c_int()
+    shell32.CommandLineToArgvW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    pointer = shell32.CommandLineToArgvW(command_line, ctypes.byref(count))
+    if not pointer:
+        raise OSError("CommandLineToArgvW failed")
+    try:
+        return [pointer[index] for index in range(count.value)]
+    finally:
+        kernel32.LocalFree(ctypes.cast(pointer, ctypes.c_void_p))
+
+
+def _list_windows_processes() -> list[tuple[str, list[str]]]:
+    """List Windows executable paths and argv through a bounded CIM query."""
+    command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process "
+        "-Filter \"Name = 'claude.exe' OR Name = 'codex.exe'\" | "
+        "Select-Object Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress",
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise OSError("Windows process enumeration failed")
+    payload = result.stdout.strip()
+    if not payload:
+        return []
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise OSError("Windows process enumeration returned invalid JSON") from exc
+    if decoded is None:
+        return []
+    rows = decoded if isinstance(decoded, list) else [decoded]
+    processes: list[tuple[str, list[str]]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise OSError("Windows process enumeration returned an invalid row")
+        executable = row.get("ExecutablePath") or row.get("Name")
+        command_line = row.get("CommandLine")
+        if not isinstance(executable, str) or not isinstance(command_line, str):
+            raise OSError("Windows process enumeration found an inaccessible process")
+        processes.append((executable, _split_windows_command_line(command_line)))
+    return processes
+
+
+def _basename(path: str) -> str:
+    return path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_bundled_claude(executable: str, arguments: list[str]) -> bool:
+    candidates = [executable, arguments[0] if arguments else ""]
+    return any(
+        re.search(
+            r"/_bundled/claude(?:\.exe)?$",
+            candidate.replace("\\", "/").lower(),
+        )
+        is not None
+        for candidate in candidates
+    )
+
+
+def _count_agent_processes(processes: list[tuple[str, list[str]]]) -> int:
+    count = 0
+    for executable, arguments in processes:
+        command = _basename(executable)
+        if command in {"claude", "claude.exe"}:
+            if _is_bundled_claude(executable, arguments):
+                continue
+            count += 1
+        elif command in {"codex", "codex.exe"}:
+            if _is_memory_codex_provider_command(arguments):
+                continue
+            count += 1
+    return count
+
+
 def count_interactive_agent_sessions() -> int:
     """Count interactive Claude Code and Codex CLI processes.
 
@@ -309,6 +421,12 @@ def count_interactive_agent_sessions() -> int:
     subcommand. Return ``-1`` when process inspection is unavailable or cannot
     be parsed safely so callers can fail closed.
     """
+    if sys.platform == "win32":
+        try:
+            return _count_agent_processes(_list_windows_processes())
+        except (OSError, ValueError, TypeError):
+            return -1
+
     try:
         result = subprocess.run(
             ["ps", "-A", "-o", "pid=,comm=,args="],
@@ -321,29 +439,19 @@ def count_interactive_agent_sessions() -> int:
     if result.returncode != 0:
         return -1
 
-    count = 0
+    processes: list[tuple[str, list[str]]] = []
     for line in result.stdout.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 2:
             continue
         comm = parts[1]
-        args = parts[2] if len(parts) > 2 else ""
-        command = comm.rsplit("/", 1)[-1].lower()
-        if command == "claude":
-            if "/_bundled/claude" in args.replace("\\", "/"):
-                continue
-            count += 1
-            continue
-        if command != "codex":
-            continue
+        flattened = parts[2] if len(parts) > 2 else ""
         try:
-            arguments = shlex.split(args)
+            arguments = shlex.split(flattened)
         except ValueError:
             return -1
-        if _is_memory_codex_provider_command(arguments):
-            continue
-        count += 1
-    return count
+        processes.append((comm, arguments))
+    return _count_agent_processes(processes)
 
 
 def _uncompiled_fingerprint(path: Path) -> str | None:
@@ -403,6 +511,21 @@ def _fail_auto_compile_owner_spawn(
         repository.fail_auto_compile_owner_spawn(
             token, fingerprint, now=datetime.now(timezone.utc)
         )
+
+
+def _rollback_auto_compile_schedule(
+    root: Path, owner_token: str, watchdog_token: str
+) -> None:
+    from scripts.queue import QueueRepository
+
+    environment = dict(os.environ)
+    environment["AI_MEMORY_HOME"] = str(root)
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    config = load_config(environment)
+    with QueueRepository(
+        config.queue_path, memory_home=root, sync_usage=False
+    ) as repository:
+        repository.rollback_auto_compile_schedule(owner_token, watchdog_token)
 
 
 def _auto_compile_lock_is_held(root: Path) -> bool:
@@ -498,45 +621,74 @@ def maybe_trigger_compilation(
     environment["AI_MEMORY_HOME"] = str(root)
     environment.pop("CLAUDE_MEMORY_HOME", None)
     config = load_config(environment)
-    token = secrets.token_hex(32)
+    owner_token = secrets.token_hex(32)
+    watchdog_token = secrets.token_hex(32)
     lease_now = datetime.now(timezone.utc)
     lease_expires = lease_now + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS)
     with QueueRepository(
         config.queue_path, memory_home=root, sync_usage=False
     ) as repository:
-        role = repository.request_auto_compile(
-            token,
+        roles = repository.schedule_auto_compile(
+            owner_token,
+            watchdog_token,
             fingerprint,
             log_name=today_log,
             now=lease_now,
             expires_at=lease_expires,
         )
-        if role is None:
+        if not roles:
             return False
 
     logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
-    command = [
+    watchdog_command = [
         sys.executable,
         str(coordinator_script),
-        role,
+        "watchdog",
         str(root),
-        token,
+        watchdog_token,
     ]
-    if role == "owner":
-        command.append(fingerprint)
+    if "watchdog" in roles:
+        for attempt in range(AUTO_COMPILE_SPAWN_ATTEMPTS):
+            try:
+                with open_secure_log_stream(
+                    scripts_dir / "compile.log"
+                ) as log_handle:
+                    subprocess.Popen(
+                        watchdog_command,
+                        **_compile_process_options(root, log_handle),
+                    )
+                break
+            except Exception as exc:
+                if attempt + 1 == AUTO_COMPILE_SPAWN_ATTEMPTS:
+                    if "owner" in roles:
+                        _rollback_auto_compile_schedule(
+                            root, owner_token, watchdog_token
+                        )
+                    else:
+                        _clear_auto_compile_watcher(root, watchdog_token)
+                    logging.error("Failed to spawn auto-compile watchdog: %s", exc)
+                    return False
+                time.sleep(AUTO_COMPILE_SPAWN_RETRY_SECONDS)
 
-    try:
-        with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
-            subprocess.Popen(command, **_compile_process_options(root, log_handle))
-        notify_terminal("end-of-day compile scheduled")
-        return True
-    except Exception as exc:
-        if role == "owner":
-            _fail_auto_compile_owner_spawn(root, token, fingerprint)
-        else:
-            _clear_auto_compile_watcher(root, token)
-        logging.error("Failed to spawn auto-compile coordinator: %s", exc)
-        return False
+    if "owner" in roles:
+        owner_command = [
+            sys.executable,
+            str(coordinator_script),
+            "owner",
+            str(root),
+            owner_token,
+            fingerprint,
+        ]
+        try:
+            with open_secure_log_stream(scripts_dir / "compile.log") as log_handle:
+                subprocess.Popen(
+                    owner_command, **_compile_process_options(root, log_handle)
+                )
+        except Exception as exc:
+            _fail_auto_compile_owner_spawn(root, owner_token, fingerprint)
+            logging.error("Failed to spawn auto-compile owner: %s", exc)
+    notify_terminal("end-of-day compile scheduled")
+    return True
 
 
 def run_auto_compile_coordinator(
@@ -575,6 +727,23 @@ def run_auto_compile_coordinator(
             if _uncompiled_fingerprint(path) == candidate
         ]
         return matches[0] if len(matches) == 1 else None
+
+    def record_failure(log_path: Path, error_class: str) -> None:
+        failed_at = datetime.now(timezone.utc)
+        with QueueRepository(
+            config.queue_path, memory_home=root, sync_usage=False
+        ) as repository:
+            repository.record_auto_compile_failure(
+                token,
+                active_fingerprint,
+                error_class,
+                lambda: _uncompiled_fingerprint(log_path),
+                now=failed_at,
+                expires_at=failed_at
+                + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
+                max_attempts=AUTO_COMPILE_MAX_ATTEMPTS,
+                retry_base_seconds=AUTO_COMPILE_RETRY_BASE_SECONDS,
+            )
 
     try:
         while True:
@@ -634,6 +803,9 @@ def run_auto_compile_coordinator(
                     )
                 except _AutoCompileContentChanged:
                     continue
+                except Exception as exc:
+                    record_failure(log_path, f"compile_launch_{type(exc).__name__}")
+                    return False
             if launched is None:
                 return False
 
@@ -664,6 +836,9 @@ def run_auto_compile_coordinator(
                         launched.kill()
                         launched.wait()
                     return False
+                except Exception as exc:
+                    record_failure(log_path, f"compile_wait_{type(exc).__name__}")
+                    return False
 
             if return_code == 75:
                 while True:
@@ -692,6 +867,10 @@ def run_auto_compile_coordinator(
                     sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
                 continue
 
+            if return_code != 0:
+                record_failure(log_path, f"compile_exit_{return_code}")
+                return False
+
             handoff_at = datetime.now(timezone.utc)
             with QueueRepository(
                 config.queue_path, memory_home=root, sync_usage=False
@@ -710,8 +889,6 @@ def run_auto_compile_coordinator(
     except Exception as exc:
         logging.error("Automatic compile failed: %s", exc)
         return False
-    finally:
-        _release_auto_compile(root, token, active_fingerprint)
 
 
 def _observe_auto_compile_content(
@@ -744,6 +921,7 @@ def run_auto_compile_watcher(
     coordinator: Callable[[Path, str, str], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     lock_probe: Callable[[Path], bool] = _auto_compile_lock_is_held,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> bool:
     """Wait for one owner lease and durably take over after it expires."""
     from scripts.queue import QueueRepository
@@ -761,7 +939,7 @@ def run_auto_compile_watcher(
         )
     )
     while True:
-        observed_at = datetime.now(timezone.utc)
+        observed_at = clock()
         if lock_probe(root):
             logging.debug("Automatic compile watcher observed a live child lock")
         with QueueRepository(
@@ -782,7 +960,9 @@ def run_auto_compile_watcher(
             return True
         if status == "claimed":
             assert fingerprint is not None
-            return run_coordinator(root, token, fingerprint)
+            if run_coordinator(root, token, fingerprint):
+                return True
+            continue
         sleeper(AUTO_COMPILE_WATCHER_POLL_SECONDS)
 
 
