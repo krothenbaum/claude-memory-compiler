@@ -991,6 +991,7 @@ def run_auto_compile_coordinator(
                         return False
                     pending_fingerprint = reservation[1]
                     active_log_name = reservation[2]
+                    active_log: Path | None = None
                     if active_log_name is not None:
                         active_log = root / "daily" / active_log_name
                         active_read = _read_daily_compile_state(active_log)
@@ -1032,6 +1033,8 @@ def run_auto_compile_coordinator(
                             break
                     if pending_fingerprint is None:
                         return False
+                    if active_log is None:
+                        return False
                     pending_log_name = reservation[3]
                     pending_log = (
                         root / "daily" / pending_log_name
@@ -1050,6 +1053,7 @@ def run_auto_compile_coordinator(
                         token,
                         active_fingerprint,
                         pending_fingerprint,
+                        lambda: _queue_content_read(active_log),
                         now=reservation_now,
                         expires_at=reservation_now
                         + timedelta(seconds=AUTO_COMPILE_LEASE_SECONDS),
@@ -1324,8 +1328,14 @@ def _observe_auto_compile_content(
         and pending[1] != active[1]
     ):
         assert pending[0].fingerprint is not None
+        pending_prefix = reservation.get("pending_required_marker_prefix")
+        if not isinstance(pending_prefix, list) or not all(
+            isinstance(marker, str) for marker in pending_prefix
+        ):
+            return "unreadable", None
         observed["pending_fingerprint"] = pending[0].fingerprint
         observed["pending_log_name"] = pending[1]
+        observed["pending_required_marker_prefix"] = pending_prefix
     return "uncompiled", observed
 
 

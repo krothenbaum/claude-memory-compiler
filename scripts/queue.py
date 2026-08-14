@@ -1795,22 +1795,31 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return fingerprint
-            read_status, observed, _markers = self._validate_auto_compile_read(
+            read_status, observed, observed_markers = self._validate_auto_compile_read(
                 current_content()
             )
-            active_observed = read_status == "uncompiled"
-            promoted_log_name = reservation.get("log_name")
+            required_prefix_value = reservation.get("required_marker_prefix")
+            required_prefix = (
+                tuple(required_prefix_value)
+                if isinstance(required_prefix_value, list)
+                and all(isinstance(marker, str) for marker in required_prefix_value)
+                else None
+            )
+            marker_history_valid = False
+            marker_advanced = False
+            if observed_markers is not None and required_prefix is not None:
+                marker_history_valid = (
+                    len(observed_markers) >= len(required_prefix)
+                    and observed_markers[: len(required_prefix)] == required_prefix
+                )
+                marker_advanced = marker_history_valid and len(
+                    observed_markers
+                ) > len(required_prefix)
             if (
-                read_status == "covered"
-                and reservation.get("pending_log_name")
-                != reservation.get("log_name")
-                and isinstance(reservation.get("pending_fingerprint"), str)
-                and isinstance(reservation.get("pending_log_name"), str)
+                read_status == "unreadable"
+                or not marker_history_valid
+                or (read_status == "covered" and not marker_advanced)
             ):
-                observed = reservation["pending_fingerprint"]
-                promoted_log_name = reservation["pending_log_name"]
-                active_observed = False
-            if read_status == "unreadable":
                 reservation["expires_at"] = _stored_time(expires_dt)
                 reservation["status"] = "read_wait"
                 self._connection.execute(
@@ -1824,6 +1833,41 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return fingerprint
+            active_observed = read_status == "uncompiled"
+            promoted_log_name = reservation.get("log_name")
+            promoted_marker_prefix = (
+                observed_markers if marker_advanced else required_prefix
+            )
+            if (
+                read_status == "covered"
+                and reservation.get("pending_log_name")
+                != reservation.get("log_name")
+                and isinstance(reservation.get("pending_fingerprint"), str)
+                and isinstance(reservation.get("pending_log_name"), str)
+            ):
+                observed = reservation["pending_fingerprint"]
+                promoted_log_name = reservation["pending_log_name"]
+                pending_prefix = reservation.get("pending_required_marker_prefix")
+                if not isinstance(pending_prefix, list) or not all(
+                    isinstance(marker, str) for marker in pending_prefix
+                ):
+                    reservation["expires_at"] = _stored_time(expires_dt)
+                    reservation["status"] = "read_wait"
+                    self._connection.execute(
+                        "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                        (
+                            json.dumps(
+                                reservation,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            AUTO_COMPILE_RESERVATION_KEY,
+                        ),
+                    )
+                    self._connection.execute("COMMIT")
+                    return fingerprint
+                promoted_marker_prefix = tuple(pending_prefix)
+                active_observed = False
             if read_status == "covered" and observed is None:
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
@@ -1833,6 +1877,10 @@ class QueueRepository:
                 return None
             reservation["fingerprint"] = observed
             reservation["log_name"] = promoted_log_name
+            if promoted_marker_prefix is not None:
+                reservation["required_marker_prefix"] = list(
+                    promoted_marker_prefix
+                )
             reservation["expires_at"] = _stored_time(expires_dt)
             preserve_other_log = (
                 active_observed
@@ -1921,11 +1969,12 @@ class QueueRepository:
         token: str,
         fingerprint: str,
         pending_fingerprint: str,
+        current_content: Callable[[], AutoCompileContentRead],
         *,
         now: datetime | str | int | float,
         expires_at: datetime | str | int | float,
     ) -> bool:
-        """Promote the exact pending generation while the queue remains idle."""
+        """Promote pending work only after validating the active marker history."""
         now_dt = _datetime(now)
         expires_dt = _datetime(expires_at)
         if expires_dt <= now_dt:
@@ -1957,6 +2006,49 @@ class QueueRepository:
             if self._active_work_unlocked():
                 reservation["expires_at"] = _stored_time(now_dt)
                 reservation["status"] = "queue_wait"
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return False
+            read_status, observed_fingerprint, observed_markers = (
+                self._validate_auto_compile_read(current_content())
+            )
+            required_prefix_value = reservation.get("required_marker_prefix")
+            required_prefix = (
+                tuple(required_prefix_value)
+                if isinstance(required_prefix_value, list)
+                and all(isinstance(marker, str) for marker in required_prefix_value)
+                else None
+            )
+            marker_history_valid = False
+            marker_advanced = False
+            if observed_markers is not None and required_prefix is not None:
+                marker_history_valid = (
+                    len(observed_markers) >= len(required_prefix)
+                    and observed_markers[: len(required_prefix)] == required_prefix
+                )
+                marker_advanced = marker_history_valid and len(
+                    observed_markers
+                ) > len(required_prefix)
+            same_log = reservation.get("pending_log_name") == reservation.get(
+                "log_name"
+            )
+            current_generation_matches = (
+                read_status == "uncompiled"
+                and observed_fingerprint == pending_fingerprint
+                if same_log
+                else read_status == "covered" and marker_advanced
+            )
+            if not marker_history_valid or not current_generation_matches:
+                reservation["expires_at"] = _stored_time(now_dt)
+                reservation["status"] = "read_wait"
                 self._connection.execute(
                     "UPDATE queue_metadata SET value = ? WHERE key = ?",
                     (

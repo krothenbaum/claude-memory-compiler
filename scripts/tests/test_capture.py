@@ -3746,7 +3746,7 @@ def test_deferred_owner_promotes_pending_fingerprint_from_a_different_log(tmp_pa
         assert repository.defer_auto_compile_generation(
             token,
             first,
-            lambda: ("covered", None),
+            lambda: ("covered", None, ("compiled",)),
             now=NOW + timedelta(seconds=2),
             expires_at=NOW + timedelta(seconds=7),
         ) == pending
@@ -4558,6 +4558,203 @@ def test_observer_retains_required_prefix_across_uncompiled_replacement(tmp_path
         "pending_log_name": pending_log.name,
         "pending_required_marker_prefix": [],
     }
+
+
+@pytest.mark.parametrize(
+    ("pending_log_name", "observed_status", "observed_fingerprint", "observed_markers"),
+    [
+        ("2026-08-11.md", "uncompiled", "b" * 64, ("replacement",)),
+        ("2026-08-12.md", "covered", None, ("first",)),
+    ],
+)
+def test_pending_promotion_rejects_regressed_active_marker_history(
+    tmp_path,
+    pending_log_name,
+    observed_status,
+    observed_fingerprint,
+    observed_markers,
+):
+    database = tmp_path / "jobs.sqlite3"
+    owner = "1" * 64
+    watchdog = "2" * 64
+    active = "a" * 64
+    pending = "b" * 64
+    active_log_name = "2026-08-11.md"
+    pending_prefix = (
+        ("replacement",) if pending_log_name == active_log_name else ("next",)
+    )
+    with QueueRepository(database, sync_usage=False) as repository:
+        assert repository.schedule_auto_compile(
+            owner,
+            watchdog,
+            active,
+            log_name=active_log_name,
+            required_marker_prefix=("first", "second"),
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        ) == ("owner", "watchdog")
+        repository.schedule_auto_compile(
+            "3" * 64,
+            "4" * 64,
+            pending,
+            log_name=pending_log_name,
+            required_marker_prefix=pending_prefix,
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        assert not repository.promote_pending_auto_compile(
+            owner,
+            active,
+            pending,
+            lambda: (observed_status, observed_fingerprint, observed_markers),
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        state = _reservation(repository)
+    assert state["fingerprint"] == active
+    assert state["required_marker_prefix"] == ["first", "second"]
+    assert state["pending_fingerprint"] == pending
+    assert state["pending_log_name"] == pending_log_name
+    assert state["pending_required_marker_prefix"] == list(pending_prefix)
+    assert state["status"] == "read_wait"
+
+
+def test_watcher_takeover_preserves_distinct_pending_marker_prefix(tmp_path):
+    root, active_log = _auto_compile_test_root(tmp_path)
+    pending_log = root / "daily/2026-08-12.md"
+    active_log.write_text(
+        "<!-- @compiled-through:active -->\nA\n", encoding="utf-8"
+    )
+    pending_log.write_text(
+        "<!-- @compiled-through:pending -->\nB\n", encoding="utf-8"
+    )
+    active = flush_module._uncompiled_fingerprint(active_log)
+    pending = flush_module._uncompiled_fingerprint(pending_log)
+    assert active is not None
+    assert pending is not None
+    owner = "1" * 64
+    watcher = "2" * 64
+    successor = "3" * 64
+    launches = []
+    with QueueRepository(root / "scripts/jobs.sqlite3", sync_usage=False) as repository:
+        repository.schedule_auto_compile(
+            owner,
+            watcher,
+            active,
+            log_name=active_log.name,
+            required_marker_prefix=("active",),
+            now=NOW - timedelta(minutes=3),
+            expires_at=NOW - timedelta(microseconds=1),
+        )
+        repository.schedule_auto_compile(
+            "4" * 64,
+            "5" * 64,
+            pending,
+            log_name=pending_log.name,
+            required_marker_prefix=("pending",),
+            now=NOW - timedelta(minutes=2),
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        status, claimed = repository.poll_auto_compile_watcher(
+            watcher,
+            successor,
+            lambda reservation: flush_module._observe_auto_compile_content(
+                root, dict(reservation)
+            ),
+            launches.append,
+            predecessor_token=None,
+            now=NOW,
+            watcher_expires_at=NOW + timedelta(minutes=2),
+            owner_expires_at=NOW + timedelta(minutes=2),
+        )
+        state = _reservation(repository)
+    assert (status, claimed) == ("claimed", active)
+    assert launches == [successor]
+    assert state["required_marker_prefix"] == ["active"]
+    assert state["pending_fingerprint"] == pending
+    assert state["pending_required_marker_prefix"] == ["pending"]
+
+
+@pytest.mark.parametrize(
+    ("observed_markers", "covered"),
+    [
+        (("first", "second"), False),
+        (("first", "replacement"), False),
+        (("first",), False),
+        (("first", "second", "third"), True),
+    ],
+)
+def test_exit_75_requires_strict_valid_marker_advancement(
+    tmp_path, observed_markers, covered
+):
+    database = tmp_path / "jobs.sqlite3"
+    owner = "1" * 64
+    fingerprint = "a" * 64
+    with QueueRepository(database, sync_usage=False) as repository:
+        repository.schedule_auto_compile(
+            owner,
+            "2" * 64,
+            fingerprint,
+            log_name="2026-08-11.md",
+            required_marker_prefix=("first", "second"),
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        result = repository.defer_auto_compile_generation(
+            owner,
+            fingerprint,
+            lambda: ("covered", None, observed_markers),
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        state = _reservation(repository)
+    if covered:
+        assert result is None
+        assert state is None
+    else:
+        assert result == fingerprint
+        assert state["fingerprint"] == fingerprint
+        assert state["required_marker_prefix"] == ["first", "second"]
+        assert state["status"] == "read_wait"
+
+
+def test_exit_75_different_log_promotion_uses_pending_marker_prefix(tmp_path):
+    database = tmp_path / "jobs.sqlite3"
+    owner = "1" * 64
+    active = "a" * 64
+    pending = "b" * 64
+    with QueueRepository(database, sync_usage=False) as repository:
+        repository.schedule_auto_compile(
+            owner,
+            "2" * 64,
+            active,
+            log_name="2026-08-11.md",
+            required_marker_prefix=("first",),
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        repository.schedule_auto_compile(
+            "3" * 64,
+            "4" * 64,
+            pending,
+            log_name="2026-08-12.md",
+            required_marker_prefix=("next",),
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        assert repository.defer_auto_compile_generation(
+            owner,
+            active,
+            lambda: ("covered", None, ("first", "compiled")),
+            now=NOW + timedelta(seconds=2),
+            expires_at=NOW + timedelta(minutes=2),
+        ) == pending
+        state = _reservation(repository)
+    assert state["fingerprint"] == pending
+    assert state["log_name"] == "2026-08-12.md"
+    assert state["required_marker_prefix"] == ["next"]
+    assert "pending_fingerprint" not in state
+    assert "pending_required_marker_prefix" not in state
 
 
 def test_orphan_takeover_keeps_exit_75_request_until_lock_releases(
