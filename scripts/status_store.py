@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,9 +47,8 @@ ALLOWED_PHASES = frozenset(
 MAX_SUMMARY_CHARS = 1_000
 MAX_DETAIL_ITEMS = 32
 MAX_DETAIL_STRING_CHARS = 1_000
-_DETAIL_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_FORBIDDEN_DETAIL_KEYS = frozenset(
-    {"prompt", "transcript", "content", "output", "rendered_context"}
+_ALLOWED_DETAIL_KEYS = frozenset(
+    {"chars_saved", "changed_files", "retry_at", "elapsed_ms"}
 )
 
 
@@ -83,9 +81,7 @@ def normalize_details(
 
     normalized: dict[str, JsonScalar] = {}
     for key, value in details.items():
-        if not isinstance(key, str) or not _DETAIL_KEY.fullmatch(key):
-            raise ValueError("status detail keys must be lowercase snake_case")
-        if key in _FORBIDDEN_DETAIL_KEYS:
+        if not isinstance(key, str) or key not in _ALLOWED_DETAIL_KEYS:
             raise ValueError(f"status detail key {key!r} is not permitted")
         if not isinstance(value, (str, int, float, bool)) and value is not None:
             raise ValueError(f"status detail {key!r} must be a scalar JSON value")

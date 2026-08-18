@@ -381,8 +381,6 @@ def test_details_accept_only_safe_scalar_json_metadata():
             "changed_files": 3,
             "retry_at": "2026-08-18T12:05:00+00:00",
             "elapsed_ms": 1250,
-            "fallback": True,
-            "cost": None,
         }
     )
 
@@ -391,8 +389,6 @@ def test_details_accept_only_safe_scalar_json_metadata():
         "changed_files": 3,
         "retry_at": "2026-08-18T12:05:00+00:00",
         "elapsed_ms": 1250,
-        "fallback": True,
-        "cost": None,
     }
     with pytest.raises(TypeError):
         details["chars_saved"] = 43
@@ -406,9 +402,18 @@ def test_details_reject_non_scalar_values(value):
 
 @pytest.mark.parametrize(
     "key",
-    ["prompt", "transcript", "content", "output", "rendered_context"],
+    [
+        "api_key",
+        "model_output",
+        "arbitrary",
+        "prompt",
+        "transcript",
+        "content",
+        "output",
+        "rendered_context",
+    ],
 )
-def test_details_reject_sensitive_keys(key):
+def test_details_reject_unapproved_and_sensitive_keys(key):
     with pytest.raises(ValueError, match="not permitted"):
         normalize_details({key: "private data"})
 
