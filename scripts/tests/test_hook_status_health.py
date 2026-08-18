@@ -204,6 +204,95 @@ def test_malformed_hook_input_records_precise_error_event(
 
 
 @pytest.mark.parametrize(
+    "hook_name",
+    ["session-end.py", "codex-session-end.py", "pre-compact.py"],
+)
+@pytest.mark.parametrize(
+    "configured_queue",
+    ["", "relative/private-queue.sqlite3"],
+)
+def test_hook_quarantines_invalid_queue_override_before_scripts_import(
+    tmp_path, hook_name, configured_queue
+):
+    memory_home = tmp_path / "memory"
+    environment = os.environ.copy()
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment.update(
+        {
+            "AI_MEMORY_HOME": str(memory_home),
+            "AI_MEMORY_QUEUE_PATH": configured_queue,
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, str(HOOKS / hook_name)],
+        input=json.dumps(
+            {
+                "session_id": "invalid-queue-session",
+                "transcript_path": "private-transcript-path",
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=3,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    records = [
+        json.loads(line)
+        for line in (memory_home / "scripts" / "logs" / "hooks.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0] == {
+        **records[0],
+        "level": "ERROR",
+        "event": "queue_unavailable",
+        "session_id": "invalid-queue-session",
+        "message": "configured queue path is invalid",
+    }
+    assert configured_queue not in json.dumps(records[0]) or configured_queue == ""
+    assert "private-transcript-path" not in json.dumps(records[0])
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    "hook_name",
+    ["session-end.py", "codex-session-end.py", "pre-compact.py"],
+)
+def test_internal_job_guard_precedes_invalid_queue_quarantine(tmp_path, hook_name):
+    memory_home = tmp_path / "must-not-exist"
+    environment = os.environ.copy()
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment.update(
+        {
+            "AI_MEMORY_HOME": str(memory_home),
+            "AI_MEMORY_QUEUE_PATH": "relative/private-queue.sqlite3",
+            "AI_MEMORY_INTERNAL_JOB": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(HOOKS / hook_name)],
+        input="{}",
+        text=True,
+        capture_output=True,
+        timeout=3,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert not memory_home.exists()
+
+
+@pytest.mark.parametrize(
     ("hook_name", "source_agent"),
     [("session-end.py", "claude"), ("codex-session-end.py", "codex")],
 )

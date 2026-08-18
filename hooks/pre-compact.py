@@ -15,6 +15,16 @@ from pathlib import Path
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
     sys.exit(0)
 
+_raw_queue_override = os.environ.get("AI_MEMORY_QUEUE_PATH")
+_INVALID_QUEUE_OVERRIDE = "AI_MEMORY_QUEUE_PATH" in os.environ and (
+    not isinstance(_raw_queue_override, str)
+    or not _raw_queue_override.strip()
+    or not Path(_raw_queue_override).expanduser().is_absolute()
+)
+if _INVALID_QUEUE_OVERRIDE:
+    os.environ.pop("AI_MEMORY_QUEUE_PATH", None)
+del _raw_queue_override
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -88,6 +98,21 @@ def extract_conversation_context(
 def main(clock: Callable[[], float] = time.monotonic) -> None:
     deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
+    if _INVALID_QUEUE_OVERRIDE:
+        try:
+            invalid_input = _read_hook_input()
+            session_id = invalid_input.get("session_id")
+        except (json.JSONDecodeError, ValueError, EOFError):
+            session_id = None
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "queue_unavailable",
+            "configured queue path is invalid",
+            source_agent="claude",
+            session_id=session_id,
+        )
+        return
     try:
         hook_input = _read_hook_input()
     except (json.JSONDecodeError, ValueError, EOFError):
