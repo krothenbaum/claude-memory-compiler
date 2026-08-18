@@ -512,6 +512,35 @@ def test_invalid_environment_is_guarded_without_traceback(command):
     assert completed.stderr == ""
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        [sys.executable, str(ROOT / "scripts" / "status.py")],
+        [sys.executable, "-m", "scripts.status"],
+    ],
+    ids=["direct-default", "module-default"],
+)
+def test_invalid_environment_in_default_mode_is_guarded_without_traceback(command):
+    env = dict(os.environ)
+    env["AI_MEMORY_PROVIDER_ORDER"] = "bad"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == (
+        "MEMORY STATUS\n\nInspection failed: AI_MEMORY_PROVIDER_ORDER must be codex,claude\n"
+    )
+    assert completed.stderr == ""
+
+
 def test_ascii_output_uses_encoding_safe_semantic_glyphs(tmp_path, monkeypatch):
     snapshot = StatusSnapshot(
         active=(_run(1, state="running", phase="codex_started", summary="Working"),),

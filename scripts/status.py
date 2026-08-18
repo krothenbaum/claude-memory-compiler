@@ -89,6 +89,12 @@ def read_snapshot(*args, **kwargs):
     return _status_store_module().read_snapshot(*args, **kwargs)
 
 
+def read_recent_hook_alerts(*args, **kwargs):
+    """Import hook health lazily after configuration has been validated."""
+    module_name = f"{__package__}.status_health" if __package__ else "status_health"
+    return importlib.import_module(module_name).read_recent_hook_alerts(*args, **kwargs)
+
+
 def _safe_terminal_text(value: object) -> str:
     """Remove terminal controls while retaining readable single-line text."""
     text = _OSC_PATTERN.sub("", str(value))
@@ -260,6 +266,15 @@ def _render_snapshot(
                 _STATE_COLORS.get(snapshot.compile.run.state),
             )
         )
+    if snapshot.health_alerts:
+        lines.extend((("", None), ("HEALTH", _HEADING_COLOR)))
+        lines.extend(
+            (
+                f"  ! {_safe_terminal_text(alert.message)}",
+                _STATE_COLORS["failed"],
+            )
+            for alert in snapshot.health_alerts
+        )
     return (
         "\n".join(
             _colorize(_fit(line, width, ellipsis), code, enabled=color) for line, code in lines
@@ -299,11 +314,20 @@ def main(
         help="disable semantic terminal colors",
     )
     args = parser.parse_args(argv)
-    if not args.snapshot:
-        return _run_dashboard(no_color=args.no_color)
-
     source_env = os.environ if env is None else env
     stream = sys.stdout if output is None else output
+    if not args.snapshot:
+        try:
+            return _run_dashboard(no_color=args.no_color)
+        except (OSError, RuntimeError, ValueError) as error:
+            diagnostic = _safe_terminal_text(error)
+            _write_output(
+                stream,
+                f"MEMORY STATUS\n\nInspection failed: {diagnostic}\n",
+                encoding=_output_encoding(stream),
+            )
+            return 2
+
     current = datetime.now(UTC) if now is None else now
     is_tty = bool(getattr(stream, "isatty", lambda: False)())
     width = (
@@ -317,12 +341,16 @@ def main(
     try:
         config = load_config(source_env)
         observer_state = load_observer_state(observer_state_path(config.root_dir))
+        try:
+            health_alerts = read_recent_hook_alerts(config.root_dir, now=current)
+        except (OSError, RuntimeError, ValueError):
+            health_alerts = ()
         snapshot = read_snapshot(
             config.queue_path,
             now=current,
             observer_state=observer_state,
             memory_home=config.root_dir,
-            health_alerts=(),
+            health_alerts=health_alerts,
         )
     except (OSError, RuntimeError, ValueError) as error:
         diagnostic = _safe_terminal_text(error)

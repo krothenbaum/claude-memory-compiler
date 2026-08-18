@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import sqlite3
 from collections.abc import Callable
@@ -50,7 +51,14 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
 
 SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
+HealthLoader = Callable[..., tuple[HealthAlert, ...]]
 MAX_RENDERED_RUNS = 200
+
+
+def read_recent_hook_alerts(*args, **kwargs) -> tuple[HealthAlert, ...]:
+    """Import hook health only when a configured dashboard refreshes."""
+    module_name = f"{__package__}.status_health" if __package__ else "status_health"
+    return importlib.import_module(module_name).read_recent_hook_alerts(*args, **kwargs)
 
 
 class DetailsOverlay(ModalScreen[None]):
@@ -142,7 +150,7 @@ class StatusDashboard(App[None]):
         observer_loader: Callable[[Path], ObserverState] = load_observer_state,
         acknowledger: Callable[[Path, int], ObserverState] = acknowledge_run,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        health_loader: Callable[[], tuple[HealthAlert, ...]] = tuple,
+        health_loader: HealthLoader = read_recent_hook_alerts,
         no_color: bool | None = None,
     ) -> None:
         super().__init__()
@@ -253,14 +261,23 @@ class StatusDashboard(App[None]):
     async def refresh_snapshot(self) -> None:
         self._refresh_generation += 1
         generation = self._refresh_generation
+        current = self._clock()
+        try:
+            health_alerts = await asyncio.to_thread(
+                self._health_loader,
+                self.memory_home,
+                now=current,
+            )
+        except (OSError, RuntimeError, ValueError):
+            health_alerts = ()
         try:
             result = await asyncio.to_thread(
                 self._snapshot_reader,
                 self.queue_path,
-                now=self._clock(),
+                now=current,
                 observer_state=self.observer_state,
                 query=self.filter_query,
-                health_alerts=self._health_loader(),
+                health_alerts=health_alerts,
                 memory_home=self.memory_home,
                 max_runs=MAX_RENDERED_RUNS,
             )
@@ -538,6 +555,11 @@ def run_dashboard(*, no_color: bool) -> int:
     StatusDashboard(
         config.queue_path,
         memory_home=config.root_dir,
+        snapshot_reader=read_snapshot,
+        details_reader=read_run_details,
+        observer_loader=load_observer_state,
+        acknowledger=acknowledge_run,
+        health_loader=read_recent_hook_alerts,
         no_color=no_color,
     ).run()
     return 0
