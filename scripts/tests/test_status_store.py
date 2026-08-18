@@ -1642,6 +1642,51 @@ def test_legacy_projection_replaces_unsafe_identity_and_excludes_it_from_search(
 
 
 @pytest.mark.parametrize(
+    "operation_key",
+    [
+        "compile-credential-value-never-display",
+        "x" * 513,
+        "compile\ncontrol",
+    ],
+)
+def test_projection_removes_unsafe_operation_keys(
+    tmp_path, monkeypatch, operation_key
+):
+    path = tmp_path / "operation-private.sqlite3"
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", "credential-value-never-display")
+    _create_projection_queue(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE status_runs SET operation_key = ? WHERE id = 7",
+            (operation_key,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+    details = status_store_module.read_run_details(path, 7)
+    searched = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        query="credential-value-never-display",
+    )
+
+    assert snapshot.compile.run is not None
+    assert snapshot.compile.run.operation_key is None
+    assert details.run.operation_key is None
+    assert searched.active == ()
+    assert searched.attention == ()
+    assert searched.recent == ()
+
+
+@pytest.mark.parametrize(
     "component",
     [
         "hook\nprivate",
@@ -1796,7 +1841,10 @@ def test_load_observer_state_rejects_target_swapped_before_open(tmp_path, monkey
 
     def swap_before_open(candidate, *args, **kwargs):
         nonlocal swapped
-        if Path(candidate) == path and not swapped:
+        is_target = Path(candidate) == path or (
+            candidate == path.name and kwargs.get("dir_fd") is not None
+        )
+        if is_target and not swapped:
             swapped = True
             path.rename(backup)
             replacement.rename(path)
@@ -1823,6 +1871,55 @@ def test_load_observer_state_rejects_symlink_without_following(tmp_path):
     assert status_store_module.load_observer_state(link) == (
         status_store_module.ObserverState.empty()
     )
+
+
+def test_observer_read_and_write_reject_symlinked_parent(tmp_path):
+    real_parent = tmp_path / "real-scripts"
+    real_parent.mkdir()
+    target = real_parent / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    linked_parent = tmp_path / "scripts"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    assert status_store_module.load_observer_state(linked_parent / target.name) == (
+        status_store_module.ObserverState.empty()
+    )
+    with pytest.raises(ValueError, match="linked ancestor"):
+        status_store_module.acknowledge_run(linked_parent / target.name, 2)
+    assert status_store_module.load_observer_state(target).acknowledged_run_ids == {
+        1
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits required")
+def test_observer_read_rejects_group_or_world_writable_parent(tmp_path):
+    parent = tmp_path / "scripts"
+    parent.mkdir()
+    target = parent / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    parent.chmod(0o777)
+
+    assert status_store_module.load_observer_state(target) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits required")
+def test_observer_write_rejects_writable_parent_and_preserves_prior(tmp_path):
+    parent = tmp_path / "scripts"
+    parent.mkdir()
+    target = parent / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    prior = target.read_bytes()
+    parent.chmod(0o777)
+
+    with pytest.raises(ValueError, match="unsafe permissions"):
+        status_store_module.acknowledge_run(target, 2)
+
+    assert target.read_bytes() == prior
 
 
 def test_acknowledge_run_atomically_writes_private_exact_state(tmp_path):
@@ -1897,7 +1994,7 @@ def test_atomic_observer_write_rejects_parent_swap_and_preserves_prior_state(
     assert not (attacker / target.name).exists()
 
 
-@pytest.mark.parametrize("changed_identity_call", [2, 3, 4])
+@pytest.mark.parametrize("changed_identity_call", [3, 4, 5])
 def test_atomic_observer_write_rejects_temp_or_destination_identity_swap(
     tmp_path, monkeypatch, changed_identity_call
 ):
@@ -1925,6 +2022,66 @@ def test_atomic_observer_write_rejects_temp_or_destination_identity_swap(
         )
 
     assert target.read_bytes() == prior
+
+
+def test_atomic_observer_write_keeps_live_state_single_linked_and_readable(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    real_replace = utils_module.os.replace
+    observations: list[tuple[int, frozenset[int]]] = []
+
+    def inspect_live_state(source, destination, *args, **kwargs):
+        if destination == target.name and kwargs.get("dst_dir_fd") is not None:
+            info = os.stat(
+                target.name,
+                dir_fd=kwargs["dst_dir_fd"],
+                follow_symlinks=False,
+            )
+            observed = status_store_module.load_observer_state(target)
+            observations.append((info.st_nlink, observed.acknowledged_run_ids))
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "replace", inspect_live_state)
+
+    status_store_module.acknowledge_run(target, 2)
+
+    assert observations == [(1, frozenset({1}))]
+    assert target.stat().st_nlink == 1
+    assert status_store_module.load_observer_state(target).acknowledged_run_ids == {
+        1,
+        2,
+    }
+
+
+def test_interrupted_atomic_observer_write_never_links_or_corrupts_live_state(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    observed_links: list[int] = []
+
+    def interrupt_before_replace(_source, destination, *args, **kwargs):
+        if destination == target.name and kwargs.get("dst_dir_fd") is not None:
+            info = os.stat(
+                target.name,
+                dir_fd=kwargs["dst_dir_fd"],
+                follow_symlinks=False,
+            )
+            observed_links.append(info.st_nlink)
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(utils_module.os, "replace", interrupt_before_replace)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        status_store_module.acknowledge_run(target, 2)
+
+    assert observed_links == [1]
+    assert target.stat().st_nlink == 1
+    assert status_store_module.load_observer_state(target).acknowledged_run_ids == {
+        1
+    }
 
 
 def test_acknowledge_run_supports_synthetic_legacy_run_identifiers(tmp_path):

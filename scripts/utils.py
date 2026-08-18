@@ -30,7 +30,6 @@ _PRIVATE_STATE_DIR_FD_SUPPORTED = bool(
     and getattr(os, "O_DIRECTORY", 0)
     and hasattr(os, "fchmod")
     and os.open in getattr(os, "supports_dir_fd", set())
-    and os.link in getattr(os, "supports_dir_fd", set())
     and os.stat in getattr(os, "supports_dir_fd", set())
     and os.unlink in getattr(os, "supports_dir_fd", set())
 )
@@ -140,7 +139,72 @@ def read_private_bounded_file(path: Path | str, *, max_bytes: int) -> bytes | No
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     target = Path(os.path.abspath(Path(path).expanduser()))
+    if _PRIVATE_STATE_DIR_FD_SUPPORTED:
+        return _read_private_bounded_file_posix(target, max_bytes=max_bytes)
+    return _read_private_bounded_file_fallback(target, max_bytes=max_bytes)
+
+
+def _read_private_bounded_file_posix(
+    target: Path,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    parent = target.parent
     try:
+        parent_before = _inspect_private_state_parent(parent)
+    except FileNotFoundError:
+        return None
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(parent, directory_flags)
+    descriptor = -1
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = parent.lstat()
+        _validate_private_state_directory(parent_opened, parent)
+        _validate_private_state_directory(parent_after, parent)
+        if not _same_file_identity(parent_before, parent_opened) or (
+            parent_opened.st_dev,
+            parent_opened.st_ino,
+        ) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError(f"state directory identity changed: {parent}")
+        before = _relative_stat(parent_descriptor, target.name)
+        if before is None:
+            return None
+        _validate_private_regular_file(before, target)
+        if before.st_size > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(target.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if not _same_file_identity(before, opened):
+            raise ValueError(f"state path identity changed while opening: {target}")
+        if opened.st_size > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        visible = _relative_stat(parent_descriptor, target.name)
+        if visible is None:
+            raise ValueError(f"state path identity changed while reading: {target}")
+        _validate_private_regular_file(visible, target)
+        if not _same_file_identity(opened, visible):
+            raise ValueError(f"state path identity changed while reading: {target}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        return data
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _read_private_bounded_file_fallback(
+    target: Path,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    try:
+        _inspect_private_state_parent(target.parent)
         before = target.lstat()
     except FileNotFoundError:
         return None
@@ -161,8 +225,6 @@ def read_private_bounded_file(path: Path | str, *, max_bytes: int) -> bytes | No
         _validate_private_regular_file(opened, target)
         if not _same_file_identity(before, opened):
             raise ValueError(f"state path identity changed while opening: {target}")
-        if opened.st_size > max_bytes:
-            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
         visible = target.lstat()
         _validate_private_regular_file(visible, target)
         if not _same_file_identity(opened, visible):
@@ -181,6 +243,8 @@ def _validate_private_state_directory(info: os.stat_result, path: Path) -> None:
         raise ValueError(f"state directory must be a real directory: {path}")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise ValueError(f"state directory has an unsafe owner: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"state directory has unsafe permissions: {path}")
 
 
 def _validate_no_linked_ancestors(path: Path) -> None:
@@ -210,6 +274,13 @@ def _prepare_private_state_parent(parent: Path) -> os.stat_result:
     return info
 
 
+def _inspect_private_state_parent(parent: Path) -> os.stat_result:
+    _validate_no_linked_ancestors(parent)
+    info = parent.lstat()
+    _validate_private_state_directory(info, parent)
+    return info
+
+
 def _relative_stat(directory_descriptor: int, name: str) -> os.stat_result | None:
     try:
         return os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
@@ -217,30 +288,15 @@ def _relative_stat(directory_descriptor: int, name: str) -> os.stat_result | Non
         return None
 
 
-def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
-    parent = target.parent
-    parent_before = _prepare_private_state_parent(parent)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    parent_descriptor = os.open(parent, directory_flags)
+def _write_private_temp_posix(
+    parent_descriptor: int,
+    target: Path,
+    data: bytes,
+) -> tuple[str, int, os.stat_result]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     temporary_descriptor = -1
     temporary_name = ""
-    backup_name = ""
     try:
-        parent_opened = os.fstat(parent_descriptor)
-        parent_after = parent.lstat()
-        _validate_private_state_directory(parent_opened, parent)
-        _validate_private_state_directory(parent_after, parent)
-        if not _same_file_identity(parent_before, parent_opened) or (
-            parent_opened.st_dev,
-            parent_opened.st_ino,
-        ) != (parent_after.st_dev, parent_after.st_ino):
-            raise ValueError(f"state directory identity changed: {parent}")
-
-        target_before = _relative_stat(parent_descriptor, target.name)
-        if target_before is not None:
-            _validate_private_regular_file(target_before, target)
-
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         for _attempt in range(100):
             temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
             try:
@@ -255,7 +311,6 @@ def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
                 continue
         else:  # pragma: no cover - collision probability is negligible.
             raise FileExistsError("could not allocate private state temporary file")
-
         os.fchmod(temporary_descriptor, 0o600)
         with os.fdopen(temporary_descriptor, "wb", closefd=False) as stream:
             stream.write(data)
@@ -265,10 +320,112 @@ def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
         temporary_visible = _relative_stat(parent_descriptor, temporary_name)
         if temporary_visible is None:
             raise ValueError("state temporary identity changed before replacement")
-        _validate_private_regular_file(temporary_opened, parent / temporary_name)
-        _validate_private_regular_file(temporary_visible, parent / temporary_name)
+        _validate_private_regular_file(temporary_opened, target.parent / temporary_name)
+        _validate_private_regular_file(temporary_visible, target.parent / temporary_name)
         if not _same_file_identity(temporary_opened, temporary_visible):
             raise ValueError("state temporary identity changed before replacement")
+        return temporary_name, temporary_descriptor, temporary_opened
+    except BaseException:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        raise
+
+
+def _restore_private_state_posix(
+    parent_descriptor: int,
+    target: Path,
+    prior_bytes: bytes | None,
+) -> None:
+    if prior_bytes is None:
+        try:
+            os.unlink(target.name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        os.fsync(parent_descriptor)
+        return
+    restore_name = ""
+    restore_descriptor = -1
+    try:
+        restore_name, restore_descriptor, restore_info = _write_private_temp_posix(
+            parent_descriptor,
+            target,
+            prior_bytes,
+        )
+        os.replace(
+            restore_name,
+            target.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        restore_name = ""
+        restored = _relative_stat(parent_descriptor, target.name)
+        if restored is None or (
+            restored.st_dev,
+            restored.st_ino,
+        ) != (restore_info.st_dev, restore_info.st_ino):
+            raise ValueError("state restoration identity changed after replacement")
+        os.fsync(parent_descriptor)
+    finally:
+        if restore_name:
+            try:
+                os.unlink(restore_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if restore_descriptor >= 0:
+            os.close(restore_descriptor)
+
+
+def _atomic_write_private_file_posix(
+    target: Path,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
+    parent = target.parent
+    parent_before = _prepare_private_state_parent(parent)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(parent, directory_flags)
+    temporary_descriptor = -1
+    temporary_name = ""
+    prior_descriptor = -1
+    prior_bytes: bytes | None = None
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = parent.lstat()
+        _validate_private_state_directory(parent_opened, parent)
+        _validate_private_state_directory(parent_after, parent)
+        if not _same_file_identity(parent_before, parent_opened) or (
+            parent_opened.st_dev,
+            parent_opened.st_ino,
+        ) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError(f"state directory identity changed: {parent}")
+
+        target_before = _relative_stat(parent_descriptor, target.name)
+        if target_before is not None:
+            _validate_private_regular_file(target_before, target)
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            prior_descriptor = os.open(
+                target.name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+            prior_opened = os.fstat(prior_descriptor)
+            _validate_private_regular_file(prior_opened, target)
+            if not _same_file_identity(target_before, prior_opened):
+                raise ValueError("state destination identity changed while opening")
+            with os.fdopen(prior_descriptor, "rb", closefd=False) as stream:
+                prior_bytes = stream.read(max_bytes + 1)
+            if len(prior_bytes) > max_bytes:
+                raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+
+        temporary_name, temporary_descriptor, temporary_opened = (
+            _write_private_temp_posix(parent_descriptor, target, data)
+        )
 
         target_current = _relative_stat(parent_descriptor, target.name)
         if target_before is None:
@@ -278,29 +435,6 @@ def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
             target_before, target_current
         ):
             raise ValueError("state destination identity changed before replacement")
-
-        if target_current is not None:
-            for _attempt in range(100):
-                backup_name = f".{target.name}.{uuid.uuid4().hex}.backup"
-                try:
-                    os.link(
-                        target.name,
-                        backup_name,
-                        src_dir_fd=parent_descriptor,
-                        dst_dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                    break
-                except FileExistsError:
-                    continue
-            else:  # pragma: no cover - collision probability is negligible.
-                raise FileExistsError("could not allocate private state backup")
-            backup = _relative_stat(parent_descriptor, backup_name)
-            if backup is None or (
-                backup.st_dev,
-                backup.st_ino,
-            ) != (target_current.st_dev, target_current.st_ino):
-                raise ValueError("state backup identity changed before replacement")
 
         os.replace(
             temporary_name,
@@ -312,29 +446,11 @@ def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
         if destination is None or not _same_file_identity(
             temporary_opened, destination
         ):
-            if backup_name:
-                os.replace(
-                    backup_name,
-                    target.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                )
-                backup_name = ""
-            else:
-                os.unlink(target.name, dir_fd=parent_descriptor)
-            os.fsync(parent_descriptor)
+            _restore_private_state_posix(parent_descriptor, target, prior_bytes)
             raise ValueError("state destination identity changed after replacement")
-        if backup_name:
-            os.unlink(backup_name, dir_fd=parent_descriptor)
-            backup_name = ""
         temporary_name = ""
         os.fsync(parent_descriptor)
     finally:
-        if backup_name:
-            try:
-                os.unlink(backup_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
         if temporary_name:
             try:
                 os.unlink(temporary_name, dir_fd=parent_descriptor)
@@ -342,21 +458,65 @@ def _atomic_write_private_file_posix(target: Path, data: bytes) -> None:
                 pass
         if temporary_descriptor >= 0:
             os.close(temporary_descriptor)
+        if prior_descriptor >= 0:
+            os.close(prior_descriptor)
         os.close(parent_descriptor)
 
 
-def _atomic_write_private_file_fallback(target: Path, data: bytes) -> None:
+def _restore_private_state_fallback(target: Path, prior_bytes: bytes | None) -> None:
+    if prior_bytes is None:
+        target.unlink(missing_ok=True)
+        _fsync_directory(target.parent)
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".restore.tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, temporary)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(prior_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        opened = os.fstat(descriptor)
+        visible = temporary.lstat()
+        _validate_private_regular_file(opened, temporary)
+        _validate_private_regular_file(visible, temporary)
+        if not _same_file_identity(opened, visible):
+            raise ValueError("state restoration identity changed before replacement")
+        os.replace(temporary, target)
+        restored = target.lstat()
+        if (restored.st_dev, restored.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("state restoration identity changed after replacement")
+        _fsync_directory(target.parent)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_private_file_fallback(
+    target: Path,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
     parent = target.parent
     parent_before = _prepare_private_state_parent(parent)
     target_before = target.lstat() if target.exists() or target.is_symlink() else None
+    prior_bytes: bytes | None = None
     if target_before is not None:
         _validate_private_regular_file(target_before, target)
+        prior_bytes = _read_private_bounded_file_fallback(
+            target,
+            max_bytes=max_bytes,
+        )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=parent
     )
     temporary = Path(temporary_name)
-    backup = parent / f".{target.name}.{uuid.uuid4().hex}.backup"
-    backup_exists = False
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
@@ -384,33 +544,14 @@ def _atomic_write_private_file_fallback(target: Path, data: bytes) -> None:
             target_before, target_current
         ):
             raise ValueError("state destination identity changed before replacement")
-        if target_current is not None:
-            os.link(target, backup, follow_symlinks=False)
-            backup_exists = True
-            backup_info = backup.lstat()
-            if (backup_info.st_dev, backup_info.st_ino) != (
-                target_current.st_dev,
-                target_current.st_ino,
-            ):
-                raise ValueError("state backup identity changed before replacement")
         os.replace(temporary, target)
         destination = target.lstat()
         if not _same_file_identity(temporary_opened, destination):
-            if backup_exists:
-                os.replace(backup, target)
-                backup_exists = False
-            else:
-                target.unlink(missing_ok=True)
-            _fsync_directory(parent)
+            _restore_private_state_fallback(target, prior_bytes)
             raise ValueError("state destination identity changed after replacement")
-        if backup_exists:
-            backup.unlink()
-            backup_exists = False
         _fsync_directory(parent)
     finally:
         os.close(descriptor)
-        if backup_exists:
-            backup.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
 
 
@@ -427,9 +568,9 @@ def atomic_write_private_file(
         raise ValueError(f"state payload exceeds {max_bytes} bytes")
     target = Path(os.path.abspath(Path(path).expanduser()))
     if _PRIVATE_STATE_DIR_FD_SUPPORTED:
-        _atomic_write_private_file_posix(target, data)
+        _atomic_write_private_file_posix(target, data, max_bytes=max_bytes)
     else:  # pragma: no cover - exercised on descriptor-limited platforms.
-        _atomic_write_private_file_fallback(target, data)
+        _atomic_write_private_file_fallback(target, data, max_bytes=max_bytes)
 
 
 def _validate_log_directory(info: os.stat_result, path: Path) -> None:

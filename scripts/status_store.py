@@ -7,12 +7,12 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import InitVar, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Literal, cast, get_args
+from typing import Literal, cast, get_args
 
 try:
     from .privacy import normalize_persistence_reason
@@ -380,7 +380,7 @@ class ObserverState:
     acknowledged_run_ids: frozenset[int]
 
     @classmethod
-    def empty(cls) -> "ObserverState":
+    def empty(cls) -> ObserverState:
         return cls(version=1, acknowledged_run_ids=frozenset())
 
     def __post_init__(self) -> None:
@@ -913,6 +913,7 @@ def _safe_projection_identity(
 def _safe_projection_run(run: StatusRun) -> StatusRun:
     return replace(
         run,
+        operation_key=_safe_projection_operation_key(run.operation_key),
         kind=_safe_projection_identity(
             "kind", run.kind, max_chars=64, allowed=_RUN_KINDS
         ),
@@ -934,6 +935,23 @@ def _safe_projection_run(run: StatusRun) -> StatusRun:
         ),
         redaction_env=os.environ,
     )
+
+
+def _safe_projection_operation_key(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        return _validate_identity_text(
+            "operation_key",
+            value,
+            max_chars=MAX_OPERATION_KEY_CHARS,
+            allow_empty=False,
+            redaction_env=os.environ,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _read_runs(
