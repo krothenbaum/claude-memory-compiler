@@ -46,7 +46,7 @@ def test_migration_creates_exact_queue_contract_in_wal_mode(tmp_path):
 
     connection = sqlite3.connect(path)
     assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert {row[1] for row in connection.execute("PRAGMA table_info(jobs)")} == {
         "id", "kind", "source_agent", "session_id", "project", "cwd",
         "trigger", "source_path", "source_hash", "payload_json", "status",

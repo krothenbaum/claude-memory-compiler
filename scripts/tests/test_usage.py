@@ -1183,7 +1183,7 @@ def test_v1_queue_migrates_atomically_and_preserves_attempts(tmp_path):
         }
         assert "legacy_cost_usd" in columns
         assert len(repository.queue_id) == 32
-        assert repository._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert repository._connection.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_corrupt_usage_recovery_rejects_unsafe_existing_quarantine(tmp_path):

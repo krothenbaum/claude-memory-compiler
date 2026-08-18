@@ -8,6 +8,7 @@ dependencies = [
     "jsonschema>=4.26.0",
     "python-dotenv>=1.0.0",
     "referencing>=0.37.0",
+    "textual>=8,<9",
     "tzdata>=2024.1",
 ]
 

@@ -61,12 +61,49 @@ AutoCompileContentRead: TypeAlias = (
     tuple[AutoCompileReadStatus, str | None]
     | tuple[AutoCompileReadStatus, str | None, tuple[str, ...]]
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 1_000
 AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
 _SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
 _SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
+
+_STATUS_SCHEMA_SQL = """
+CREATE TABLE status_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+    operation_key TEXT UNIQUE,
+    kind TEXT NOT NULL,
+    source_agent TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    project TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'retrying', 'succeeded', 'failed', 'dead')
+    ),
+    phase TEXT NOT NULL,
+    summary TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK ((job_id IS NULL) <> (operation_key IS NULL))
+);
+
+CREATE TABLE status_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES status_runs(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+    provider TEXT,
+    attempt INTEGER,
+    message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX status_runs_state_updated_idx ON status_runs(state, updated_at DESC);
+CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id);
+"""
 
 
 class LeaseOwnershipError(RuntimeError):
@@ -292,6 +329,21 @@ class QueueRepository:
                 )
                 self._connection.execute("PRAGMA user_version = 2")
                 self._connection.execute("COMMIT")
+                version = 2
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        if version == 2:
+            try:
+                self._connection.executescript(
+                    f"""
+                    BEGIN IMMEDIATE;
+                    {_STATUS_SCHEMA_SQL}
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                    """
+                )
                 return
             except BaseException:
                 if self._connection.in_transaction:
@@ -299,7 +351,7 @@ class QueueRepository:
                 raise
         try:
             self._connection.executescript(
-                """
+                f"""
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,7 +406,8 @@ class QueueRepository:
                 );
                 INSERT OR IGNORE INTO queue_metadata(key, value)
                     VALUES ('queue_id', lower(hex(randomblob(16))));
-                PRAGMA user_version = 2;
+                {_STATUS_SCHEMA_SQL}
+                PRAGMA user_version = 3;
                 COMMIT;
                 """
             )
