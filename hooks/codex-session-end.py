@@ -6,7 +6,6 @@ import importlib.util
 import json
 import logging
 import os
-import sqlite3
 import sys
 import time
 from collections.abc import Callable
@@ -20,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.hook_logging import (
+    classify_capture_error,
     classify_transcript_path,
     configure_hook_logger,
     log_hook_event,
@@ -150,17 +150,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             session_id=value.get("session_id"),
         )
     except Exception as error:
-        child_event = getattr(error, "event", None)
-        event = (
-            child_event
-            if isinstance(child_event, str)
-            and child_event in {"queue_unavailable", "capture_failed"}
-            else (
-                "queue_unavailable"
-                if isinstance(error, sqlite3.Error)
-                else "capture_failed"
-            )
-        )
+        event = classify_capture_error(error)
         log_hook_event(
             logger,
             logging.ERROR,

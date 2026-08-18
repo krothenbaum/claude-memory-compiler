@@ -34,7 +34,7 @@ _HOOK_ERROR_EVENTS: Final[frozenset[str]] = frozenset(
 _ALERT_WINDOW = timedelta(days=1)
 _FUTURE_SKEW = timedelta(minutes=5)
 _MAX_TAIL_BYTES = 1_000_000
-_MAX_CONTEXT_CHARS = 256
+_MAX_ALERTS = 100
 
 
 def _canonical_redaction_env() -> dict[str, str]:
@@ -45,27 +45,18 @@ def _canonical_redaction_env() -> dict[str, str]:
     }
 
 
-def _safe_message(value: object) -> str | None:
+def _safe_message(
+    value: object,
+    redaction_env: dict[str, str],
+) -> str | None:
     if not isinstance(value, str):
         return None
     text = "".join(
         character if ord(character) >= 32 and ord(character) != 127 else " "
         for character in value
     )
-    normalized = normalize_persistence_reason(text, _canonical_redaction_env())
+    normalized = normalize_persistence_reason(text, redaction_env)
     return normalized if normalized else None
-
-
-def _safe_session_id(value: object) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > _MAX_CONTEXT_CHARS:
-        return None
-    if value != value.strip() or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
-    ):
-        return None
-    if normalize_persistence_reason(value, _canonical_redaction_env()) != value:
-        return None
-    return value
 
 
 def _loaded_timestamp(value: object) -> datetime | None:
@@ -73,11 +64,11 @@ def _loaded_timestamp(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError):
         return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed.astimezone(UTC)
 
 
 def _bounded_log_tail(path: Path, *, max_bytes: int) -> bytes | None:
@@ -167,9 +158,10 @@ def read_recent_hook_alerts(
 
     utc_now = now.astimezone(UTC)
     cutoff = utc_now - _ALERT_WINDOW
+    redaction_env = _canonical_redaction_env()
     deduplicated: dict[
-        tuple[str, str, str, str | None],
-        tuple[datetime, str, str, str | None],
+        tuple[datetime, str, str],
+        tuple[datetime, str, str],
     ] = {}
     for line in tail.splitlines():
         if not line.strip():
@@ -197,14 +189,11 @@ def read_recent_hook_alerts(
             or timestamp > utc_now + _FUTURE_SKEW
         ):
             continue
-        message = _safe_message(record.get("message"))
+        message = _safe_message(record.get("message"), redaction_env)
         if message is None:
             continue
-        session_id = _safe_session_id(record.get("session_id"))
-        key = (component, event, message, session_id)
-        existing = deduplicated.get(key)
-        if existing is None or timestamp > existing[0]:
-            deduplicated[key] = (timestamp, component, message, session_id)
+        key = (timestamp, component, message)
+        deduplicated[key] = key
 
     ordered = sorted(
         deduplicated.values(),
@@ -212,17 +201,16 @@ def read_recent_hook_alerts(
             value[0],
             value[1],
             value[2],
-            value[3] or "",
         ),
         reverse=True,
-    )
+    )[:_MAX_ALERTS]
     return tuple(
         HealthAlert(
             created_at=timestamp,
             level="error",
             message=message,
             component=component,
-            redaction_env=os.environ,
+            redaction_env=redaction_env,
         )
-        for timestamp, component, message, _session_id in ordered
+        for timestamp, component, message in ordered
     )

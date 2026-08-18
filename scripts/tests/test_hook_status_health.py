@@ -52,6 +52,134 @@ def _record_logger(name: str) -> tuple[logging.Logger, _RecordHandler]:
     return logger, handler
 
 
+def _close_logger(logger: logging.Logger) -> None:
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_event"),
+    [
+        ("malformed", "malformed_input"),
+        ("missing", "transcript_missing"),
+        ("unreadable", "transcript_unreadable"),
+    ],
+)
+def test_precompact_structured_input_errors_are_visible_to_health_reader(
+    tmp_path, monkeypatch, case, expected_event
+):
+    hook = _load_hook("pre-compact.py")
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    if case == "malformed":
+        payload = "{"
+    elif case == "missing":
+        payload = json.dumps({"session_id": "precompact-session"})
+    else:
+        transcript = tmp_path / "transcript-directory"
+        transcript.mkdir()
+        payload = json.dumps(
+            {
+                "session_id": "precompact-session",
+                "transcript_path": str(transcript),
+            }
+        )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+    logger = hook._logger()
+    try:
+        hook.main(clock=lambda: 0.0)
+    finally:
+        _close_logger(logger)
+
+    records = [
+        json.loads(line)
+        for line in (memory_home / "scripts" / "logs" / "hooks.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[-1]["event"] == expected_event
+    alerts = _health_module().read_recent_hook_alerts(
+        memory_home,
+        now=datetime.now(UTC),
+    )
+    assert len(alerts) == 1
+    assert alerts[0].component == "pre-compact"
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_event", "is_error"),
+    [
+        (ValueError("capture problem"), "capture_failed", True),
+        (
+            hook_logging.QueueUnavailableError("queue denied"),
+            "queue_unavailable",
+            True,
+        ),
+        ({"status": "created", "job_id": 4}, "capture_succeeded", False),
+    ],
+)
+def test_precompact_structured_capture_outcomes_are_visible(
+    tmp_path, monkeypatch, result, expected_event, is_error
+):
+    hook = _load_hook("pre-compact.py")
+    memory_home = tmp_path / "memory"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "session_id": "precompact-capture",
+                    "transcript_path": str(transcript),
+                    "cwd": str(tmp_path),
+                }
+            )
+        ),
+    )
+
+    @contextmanager
+    def selected(*_args, **_kwargs):
+        yield transcript, SimpleNamespace(turns=(object(),) * 5)
+
+    def enqueue(*_args, **_kwargs):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    helpers = SimpleNamespace(
+        bounded_transcript_slice=selected,
+        require_time_remaining=lambda *_args, **_kwargs: None,
+        enqueue_capture_with_deadline=enqueue,
+        MIN_CAPTURE_REMAINING_SECONDS=0.75,
+    )
+    monkeypatch.setattr(hook, "_live_capture_helpers", lambda: helpers)
+    monkeypatch.setattr(hook, "render_turns", lambda _preview: "context")
+    logger = hook._logger()
+    try:
+        hook.main(clock=lambda: 0.0)
+    finally:
+        _close_logger(logger)
+
+    records = [
+        json.loads(line)
+        for line in (memory_home / "scripts" / "logs" / "hooks.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[-1]["event"] == expected_event
+    alerts = _health_module().read_recent_hook_alerts(
+        memory_home,
+        now=datetime.now(UTC),
+    )
+    assert bool(alerts) is is_error
+
+
 @pytest.mark.parametrize(
     ("hook_name", "source_agent"),
     [("session-end.py", "claude"), ("codex-session-end.py", "codex")],
@@ -218,8 +346,10 @@ def test_real_capture_child_classifies_invalid_queue_directory(
     tmp_path, hook_name, fixture_name, source_agent
 ):
     memory_home = tmp_path / "memory"
-    invalid_queue = tmp_path / "queue-is-a-directory"
-    invalid_queue.mkdir()
+    queue_parent = tmp_path / "read-only-queue-parent"
+    queue_parent.mkdir()
+    queue_parent.chmod(0o500)
+    invalid_queue = queue_parent / "jobs.sqlite3"
     transcript = (
         Path(__file__).resolve().parent / "fixtures" / "transcripts" / fixture_name
     )
@@ -231,21 +361,24 @@ def test_real_capture_child_classifies_invalid_queue_directory(
             "AI_MEMORY_QUEUE_PATH": str(invalid_queue),
         }
     )
-    result = subprocess.run(
-        [sys.executable, str(HOOKS / hook_name)],
-        input=json.dumps(
-            {
-                "session_id": f"real-child-{source_agent}",
-                "transcript_path": str(transcript),
-                "cwd": str(tmp_path),
-            }
-        ),
-        text=True,
-        capture_output=True,
-        timeout=3,
-        env=environment,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(HOOKS / hook_name)],
+            input=json.dumps(
+                {
+                    "session_id": f"real-child-{source_agent}",
+                    "transcript_path": str(transcript),
+                    "cwd": str(tmp_path),
+                }
+            ),
+            text=True,
+            capture_output=True,
+            timeout=3,
+            env=environment,
+            check=False,
+        )
+    finally:
+        queue_parent.chmod(0o700)
 
     assert result.returncode == 0
     assert result.stdout == ""
@@ -297,6 +430,90 @@ def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeyp
     assert len(record["message"]) <= 1_000
     assert "session_id" not in record
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("failure", ["format", "write"])
+def test_hook_log_handler_failure_never_writes_record_to_stdio(
+    tmp_path, monkeypatch, capsys, failure
+):
+    stream = (tmp_path / "hook.log").open("a", encoding="utf-8")
+    handler = hook_logging._HookLogHandler(stream)
+    handler.setFormatter(hook_logging.HookJsonFormatter("session-end"))
+    record = logging.LogRecord(
+        "private-hook",
+        logging.ERROR,
+        __file__,
+        1,
+        "secret /private/tmp/transcript.jsonl",
+        (),
+        None,
+    )
+    if failure == "format":
+        monkeypatch.setattr(
+            handler,
+            "format",
+            lambda _record: (_ for _ in ()).throw(ValueError("format failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            hook_logging.os,
+            "write",
+            lambda *_args: (_ for _ in ()).throw(OSError("disk failed")),
+        )
+    try:
+        handler.emit(record)
+    finally:
+        handler.close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_event"),
+    [
+        (ValueError("database appears in unrelated content"), "capture_failed"),
+        (PermissionError("unrelated permission denied"), "capture_failed"),
+        (
+            hook_logging.QueueUnavailableError("custom queue permission denied"),
+            "queue_unavailable",
+        ),
+    ],
+)
+def test_capture_child_uses_typed_error_classification(
+    monkeypatch, error, expected_event
+):
+    hook = _load_hook("session-end.py")
+    monkeypatch.setattr(
+        hook,
+        "enqueue_hook_input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_input": {"transcript_path": "private"},
+                    "source_agent": "claude",
+                    "trigger": "session_end",
+                    "limits": {},
+                    "capture_token": "token",
+                    "budget_seconds": 1.0,
+                }
+            )
+        ),
+    )
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    hook._capture_child_main()
+
+    envelope = json.loads(output.getvalue())
+    assert envelope["event"] == expected_event
+    assert "database appears" not in output.getvalue()
 
 
 def test_legacy_hook_log_sanitizes_credentials_paths_and_controls(
@@ -461,7 +678,7 @@ def test_recent_hook_alerts_filter_dedupe_redact_and_sort(tmp_path, monkeypatch)
         [
             duplicate,
             duplicate,
-            _error_record(session_id="session-2"),
+            _error_record(message=duplicate["message"], session_id="session-2"),
             _error_record(timestamp=NOW - timedelta(days=2), message="old"),
             _error_record(component="unknown-hook", message="unknown"),
             {**_error_record(message="warning"), "level": "WARNING"},
@@ -471,11 +688,49 @@ def test_recent_hook_alerts_filter_dedupe_redact_and_sort(tmp_path, monkeypatch)
 
     alerts = health.read_recent_hook_alerts(tmp_path, now=NOW)
 
-    assert len(alerts) == 2
+    assert len(alerts) == 1
     assert all(alert.level == "error" for alert in alerts)
     assert all(alert.component == "session-end" for alert in alerts)
     assert secret not in " ".join(alert.message for alert in alerts)
     assert all("\n" not in alert.message for alert in alerts)
+
+
+def test_recent_hook_alerts_caps_results_deterministically(tmp_path):
+    health = _health_module()
+    records = [
+        _error_record(message=f"failure-{index:03d}", session_id=f"session-{index}")
+        for index in range(105)
+    ]
+    _write_hook_log(tmp_path, records)
+
+    first = health.read_recent_hook_alerts(tmp_path, now=NOW)
+    second = health.read_recent_hook_alerts(tmp_path, now=NOW)
+
+    assert len(first) == 100
+    assert first == second
+    assert first[0].message == "failure-104"
+
+
+def test_recent_hook_alerts_computes_redaction_environment_once(
+    tmp_path, monkeypatch
+):
+    health = _health_module()
+    _write_hook_log(
+        tmp_path,
+        [_error_record(message="first"), _error_record(message="second")],
+    )
+    original = health._canonical_redaction_env
+    calls = 0
+
+    def counted_environment():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(health, "_canonical_redaction_env", counted_environment)
+
+    assert len(health.read_recent_hook_alerts(tmp_path, now=NOW)) == 2
+    assert calls == 1
 
 
 def test_recent_hook_alerts_reads_bounded_tail_and_discards_partial_first_line(tmp_path):
@@ -515,6 +770,19 @@ def test_recent_hook_alerts_discards_unterminated_final_record(tmp_path):
 def test_recent_hook_alerts_ignores_pathological_json(tmp_path, malformed):
     health = _health_module()
     _write_hook_log(tmp_path, [malformed])
+
+    assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59"],
+)
+def test_recent_hook_alerts_ignores_timestamp_utc_overflow(tmp_path, timestamp):
+    health = _health_module()
+    record = _error_record()
+    record["timestamp"] = timestamp
+    _write_hook_log(tmp_path, [record])
 
     assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
 

@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.capture import enqueue_hook_input
 from scripts.hook_logging import (
+    classify_capture_error,
     classify_transcript_path,
     configure_hook_logger,
     log_hook_event,
@@ -228,16 +229,13 @@ def _capture_child_main() -> None:
             "job_id": outcome.job_id,
         }
     except Exception as error:
-        text = str(error).casefold()
-        queue_failure = isinstance(error, sqlite3.Error) or any(
-            marker in text for marker in ("queue", "database", "sqlite")
-        )
+        event = classify_capture_error(error)
         response = {
             "status": "error",
-            "event": "queue_unavailable" if queue_failure else "capture_failed",
+            "event": event,
             "message": (
                 "queue unavailable during capture"
-                if queue_failure
+                if event == "queue_unavailable"
                 else "capture failed"
             ),
         }
@@ -1217,17 +1215,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         )
     except Exception as error:
         # Hooks are advisory. A capture failure must never block the host agent.
-        child_event = getattr(error, "event", None)
-        event = (
-            child_event
-            if isinstance(child_event, str)
-            and child_event in {"queue_unavailable", "capture_failed"}
-            else (
-                "queue_unavailable"
-                if isinstance(error, sqlite3.Error)
-                else "capture_failed"
-            )
-        )
+        event = classify_capture_error(error)
         log_hook_event(
             logger,
             logging.ERROR,

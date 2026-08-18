@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,10 @@ _HOOK_EVENTS = frozenset(
 _SOURCE_AGENTS = frozenset({"claude", "codex"})
 MAX_HOOK_CONTEXT_CHARS = 256
 _ABSOLUTE_PATH_START = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|/)")
+
+
+class QueueUnavailableError(PermissionError):
+    """Typed custom queue permission failure for hook classification."""
 
 
 def _safe_context(value: object, env: dict[str, str]) -> str | None:
@@ -159,7 +164,7 @@ class _HookLogHandler(logging.StreamHandler):
             if written != len(payload):
                 raise OSError("incomplete hook log append")
         except Exception:
-            self.handleError(record)
+            return
 
     def close(self) -> None:
         try:
@@ -247,3 +252,26 @@ def classify_transcript_path(path: Path) -> str | None:
     if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o444 == 0:
         return "transcript_unreadable"
     return None
+
+
+def classify_capture_error(error: BaseException) -> str:
+    """Classify only typed capture/queue failures, never message prose."""
+    child_event = getattr(error, "event", None)
+    if isinstance(child_event, str) and child_event in {
+        "queue_unavailable",
+        "capture_failed",
+    }:
+        return child_event
+    traceback = error.__traceback__
+    queue_boundary = False
+    while traceback is not None:
+        module_name = traceback.tb_frame.f_globals.get("__name__")
+        if module_name in {"queue", "scripts.queue"}:
+            queue_boundary = True
+            break
+        traceback = traceback.tb_next
+    if isinstance(error, (sqlite3.Error, QueueUnavailableError)) or (
+        isinstance(error, PermissionError) and queue_boundary
+    ):
+        return "queue_unavailable"
+    return "capture_failed"
