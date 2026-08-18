@@ -597,3 +597,20 @@ def test_automatic_phase_failures_are_best_effort(
     ) is False
     assert "credential-value-must-not-log" not in caplog.text
     assert str(tmp_path) not in caplog.text
+
+
+def test_automatic_phase_failure_survives_raising_logger(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        compile_module,
+        "_config",
+        lambda _home: (_ for _ in ()).throw(OSError("status unavailable")),
+    )
+    monkeypatch.setattr(
+        compile_module.logger,
+        "warning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("filter failed")),
+    )
+
+    assert compile_module._record_automatic_phase(
+        tmp_path, 41, "provider_started"
+    ) is False

@@ -121,7 +121,10 @@ def _record_automatic_phase(
                 run_id, phase, details=details
             )
     except Exception:  # noqa: BLE001 - observability must never block compilation.
-        logger.warning("automatic compile status phase unavailable: %s", phase)
+        try:
+            logger.warning("automatic compile status phase unavailable: %s", phase)
+        except Exception:  # noqa: BLE001,S110 - diagnostics are best-effort.
+            pass
         return False
 
 
