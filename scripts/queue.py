@@ -21,6 +21,7 @@ try:
         ALLOWED_PHASES,
         EventLevel,
         JsonScalar,
+        ProviderName,
         RunState,
         StatusEvent,
         StatusRun,
@@ -46,6 +47,7 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
         ALLOWED_PHASES,
         EventLevel,
         JsonScalar,
+        ProviderName,
         RunState,
         StatusEvent,
         StatusRun,
@@ -95,7 +97,8 @@ SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 5
 AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
 
-_STATUS_SCHEMA_SQL = """
+_STATUS_SCHEMA_STATEMENTS = (
+    """
 CREATE TABLE status_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
@@ -114,8 +117,8 @@ CREATE TABLE status_runs (
     updated_at TEXT NOT NULL,
     completed_at TEXT,
     CHECK ((job_id IS NULL) <> (operation_key IS NULL))
-);
-
+)""",
+    """
 CREATE TABLE status_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES status_runs(id) ON DELETE CASCADE,
@@ -126,11 +129,11 @@ CREATE TABLE status_events (
     message TEXT,
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
-);
-
-CREATE INDEX status_runs_state_updated_idx ON status_runs(state, updated_at DESC);
-CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id);
-"""
+)""",
+    "CREATE INDEX status_runs_state_updated_idx ON status_runs(state, updated_at DESC)",
+    "CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id)",
+)
+_STATUS_SCHEMA_SQL = ";\n".join(_STATUS_SCHEMA_STATEMENTS) + ";"
 
 
 class LeaseOwnershipError(RuntimeError):
@@ -312,8 +315,12 @@ class QueueRepository:
     def close(self) -> None:
         self._connection.close()
 
+    def _migration_version_observed(self, version: int) -> None:
+        """Test seam for synchronizing concurrent migration openers."""
+
     def _migrate(self) -> None:
         version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+        self._migration_version_observed(version)
         if version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"queue schema {version} is newer than supported version {SCHEMA_VERSION}"
@@ -341,14 +348,26 @@ class QueueRepository:
                 raise
         if version == 2:
             try:
-                self._connection.executescript(
-                    f"""
-                    BEGIN IMMEDIATE;
-                    {_STATUS_SCHEMA_SQL}
-                    PRAGMA user_version = 3;
-                    COMMIT;
-                    """
-                )
+                self._connection.execute("BEGIN IMMEDIATE")
+                locked_version = self._connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+                if locked_version == SCHEMA_VERSION:
+                    self._connection.execute("COMMIT")
+                    return
+                if locked_version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"queue schema {locked_version} is newer than supported "
+                        f"version {SCHEMA_VERSION}"
+                    )
+                if locked_version != 2:
+                    raise RuntimeError(
+                        f"queue schema changed from 2 to {locked_version} during migration"
+                    )
+                for statement in _STATUS_SCHEMA_STATEMENTS:
+                    self._connection.execute(statement)
+                self._connection.execute("PRAGMA user_version = 3")
+                self._connection.execute("COMMIT")
                 return
             except BaseException:
                 if self._connection.in_transaction:
@@ -495,7 +514,7 @@ class QueueRepository:
         phase: str,
         *,
         level: EventLevel,
-        provider: str | None,
+        provider: ProviderName | None,
         attempt: int | None,
         message: str | None,
         details: Mapping[str, JsonScalar] | None,
@@ -523,7 +542,7 @@ class QueueRepository:
         phase: str,
         *,
         level: EventLevel = "info",
-        provider: str | None = None,
+        provider: ProviderName | None = None,
         attempt: int | None = None,
         message: str | None = None,
         details: Mapping[str, JsonScalar] | None = None,
@@ -610,7 +629,7 @@ class QueueRepository:
         phase: str,
         *,
         level: EventLevel = "info",
-        provider: str | None = None,
+        provider: ProviderName | None = None,
         attempt: int | None = None,
         message: str | None = None,
         details: Mapping[str, JsonScalar] | None = None,
@@ -648,7 +667,7 @@ class QueueRepository:
         summary: str | None = None,
         error: str | None = None,
         level: EventLevel = "info",
-        provider: str | None = None,
+        provider: ProviderName | None = None,
         attempt: int | None = None,
         message: str | None = None,
         details: Mapping[str, JsonScalar] | None = None,
@@ -785,6 +804,8 @@ class QueueRepository:
                     now=now_dt,
                     redaction_env=self._redaction_env,
                 )
+            else:
+                self._ensure_job_run_unlocked(row["id"])
             result = EnqueueResult(self._job(row), created)
             self._connection.execute(
                 "COMMIT" if owns_transaction else "RELEASE enqueue_capture_status"

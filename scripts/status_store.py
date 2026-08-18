@@ -20,10 +20,12 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
 
 RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead"]
 EventLevel = Literal["info", "warning", "error"]
+ProviderName = Literal["codex", "claude"]
 type JsonScalar = str | int | float | bool | None
 
 _RUN_STATES = frozenset(get_args(RunState))
 _EVENT_LEVELS = frozenset(get_args(EventLevel))
+_PROVIDER_NAMES = frozenset(get_args(ProviderName))
 
 ALLOWED_PHASES = frozenset(
     {
@@ -175,7 +177,7 @@ class StatusEvent:
     run_id: int
     phase: str
     level: EventLevel
-    provider: str | None
+    provider: ProviderName | None
     attempt: int | None
     message: str | None
     details: Mapping[str, JsonScalar]
@@ -187,6 +189,8 @@ class StatusEvent:
             raise ValueError(f"invalid status phase: {self.phase!r}")
         if self.level not in _EVENT_LEVELS:
             raise ValueError(f"invalid status event level: {self.level!r}")
+        if self.provider is not None and self.provider not in _PROVIDER_NAMES:
+            raise ValueError(f"invalid status event provider: {self.provider!r}")
         if self.attempt is not None and (
             isinstance(self.attempt, bool)
             or not isinstance(self.attempt, int)
@@ -393,7 +397,7 @@ def append_event_unlocked(
     *,
     now: datetime,
     level: EventLevel = "info",
-    provider: str | None = None,
+    provider: ProviderName | None = None,
     attempt: int | None = None,
     message: str | None = None,
     details: Mapping[str, JsonScalar] | None = None,
@@ -445,7 +449,7 @@ def transition_run_unlocked(
     error: str | None = None,
     completed_at: datetime | None = None,
     level: EventLevel = "info",
-    provider: str | None = None,
+    provider: ProviderName | None = None,
     attempt: int | None = None,
     message: str | None = None,
     details: Mapping[str, JsonScalar] | None = None,

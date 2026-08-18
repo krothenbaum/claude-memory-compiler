@@ -3,17 +3,22 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import get_args
 
 import pytest
+from transcripts import NormalizedSession, Turn
 
+import scripts.queue as queue_module
 from scripts.queue import QueueRepository
 from scripts.status_store import (
     ALLOWED_PHASES,
     EventLevel,
+    ProviderName,
     RunState,
     StatusEvent,
     StatusRun,
@@ -23,6 +28,20 @@ from scripts.status_store import (
 )
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
+
+
+def _version_2_session() -> NormalizedSession:
+    return NormalizedSession(
+        agent="claude",
+        session_id="session-41",
+        project="memory",
+        cwd="/memory",
+        timestamp=NOW.isoformat(),
+        trigger="session_end",
+        turns=(Turn("user", "legacy capture"),),
+        source_path="/memory/source.jsonl",
+        source_hash="hash-41",
+    )
 
 
 def _create_version_2_queue(path, *, incompatible_status_view: bool = False) -> None:
@@ -172,6 +191,66 @@ def test_claiming_a_migrated_active_job_creates_its_status_timeline(tmp_path):
             "queued",
             "worker_claimed",
         ]
+
+
+def test_deduplicated_enqueue_lazily_adds_status_to_a_migrated_active_job(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_version_2_queue(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE jobs SET status = 'pending', attempt_count = 0, completed_at = NULL"
+    )
+    connection.commit()
+    connection.close()
+
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        result = repository.enqueue_capture(_version_2_session())
+
+        assert result.created is False
+        assert result.job_id == 41
+        assert repository.get_job(41).payload_json == "{}"
+        run = repository.status_run_for_job(41)
+        assert run.state == "queued"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "queued"
+        ]
+        assert repository._connection.execute(
+            "SELECT count(*) FROM status_runs WHERE job_id = 41"
+        ).fetchone()[0] == 1
+
+        repository.append_job_event(41, "codex_started", provider="codex")
+        assert repository.status_run_for_job(41).phase == "codex_started"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "queued",
+            "codex_started",
+        ]
+
+
+def test_concurrent_version_2_openers_apply_status_migration_once(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    _create_version_2_queue(path)
+    both_observed_v2 = threading.Barrier(2)
+
+    def synchronize_version_read(self, version):
+        if version == 2:
+            both_observed_v2.wait(timeout=2)
+
+    monkeypatch.setattr(
+        queue_module.QueueRepository,
+        "_migration_version_observed",
+        synchronize_version_read,
+    )
+
+    def open_repository(_):
+        with QueueRepository(path, sync_usage=False) as repository:
+            return repository._connection.execute("PRAGMA user_version").fetchone()[0]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        versions = list(executor.map(open_repository, range(2)))
+
+    assert versions == [3, 3]
+    with QueueRepository(path, sync_usage=False) as repository:
+        assert {"status_runs", "status_events"} <= _table_names(repository._connection)
 
 
 def test_fresh_queue_contains_version_3_status_schema(tmp_path):
@@ -449,6 +528,8 @@ def test_runtime_status_vocabularies_match_the_literal_types():
         assert _status_run(state=state).state == state
     for level in get_args(EventLevel):
         assert _status_event(level=level).level == level
+    for provider in get_args(ProviderName):
+        assert _status_event(provider=provider).provider == provider
 
 
 def test_allowed_phases_cover_flush_and_compile_lifecycles():
@@ -610,6 +691,15 @@ def test_status_event_rejects_invalid_attempt(attempt):
         _status_event(attempt=attempt)
 
 
+@pytest.mark.parametrize(
+    "provider",
+    ["", "system", "openai", "credential-value-never-persist"],
+)
+def test_status_event_rejects_unapproved_provider_names(provider):
+    with pytest.raises(ValueError, match="provider"):
+        _status_event(provider=provider)
+
+
 def test_status_records_normalize_and_redact_all_persisted_text():
     secret = "credential-value-never-persist"
     env = {"OPENAI_API_KEY": secret}
@@ -682,6 +772,70 @@ def test_operation_runs_are_idempotent_and_have_a_queryable_timeline(tmp_path):
             "provider_started",
         ]
         assert repository.status_events(first.id)[-1].message == "Calling [REDACTED] now"
+
+
+def test_operation_writer_rejects_unapproved_provider_before_persistence(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    secret = "credential-value-never-persist"
+    with QueueRepository(
+        path,
+        clock=lambda: NOW,
+        redaction_env={"OPENAI_API_KEY": secret},
+        sync_usage=False,
+    ) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:provider",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+
+        with pytest.raises(ValueError, match="provider"):
+            repository.append_operation_event(
+                run.id,
+                "provider_started",
+                provider=secret,
+            )
+
+        unchanged = repository.status_run_for_operation(run.operation_key)
+        assert unchanged is not None
+        assert unchanged.phase == "reserved"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "reserved"
+        ]
+
+        with pytest.raises(ValueError, match="provider"):
+            repository.transition_operation_run(
+                run.id,
+                "running",
+                "provider_started",
+                provider=secret,
+            )
+        assert repository.status_run_for_operation(run.operation_key) == unchanged
+
+
+def test_status_event_readback_rejects_an_unapproved_provider(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:invalid-readback",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+        repository._connection.execute(
+            """
+            INSERT INTO status_events (
+                run_id, phase, level, provider, details_json, created_at
+            ) VALUES (?, 'provider_started', 'info', ?, '{}', ?)
+            """,
+            (run.id, "provider-secret", NOW.isoformat()),
+        )
+
+        with pytest.raises(ValueError, match="provider"):
+            repository.status_events(run.id)
 
 
 def test_operation_transition_updates_summary_error_and_completion_atomically(tmp_path):
