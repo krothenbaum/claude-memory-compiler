@@ -16,11 +16,16 @@ if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.
     sys.exit(0)
 
 _raw_queue_override = os.environ.get("AI_MEMORY_QUEUE_PATH")
-_INVALID_QUEUE_OVERRIDE = "AI_MEMORY_QUEUE_PATH" in os.environ and (
-    not isinstance(_raw_queue_override, str)
-    or not _raw_queue_override.strip()
-    or not Path(_raw_queue_override).expanduser().is_absolute()
-)
+_INVALID_QUEUE_OVERRIDE = False
+if "AI_MEMORY_QUEUE_PATH" in os.environ:
+    try:
+        _INVALID_QUEUE_OVERRIDE = (
+            not isinstance(_raw_queue_override, str)
+            or not _raw_queue_override.strip()
+            or not Path(_raw_queue_override).expanduser().is_absolute()
+        )
+    except (OSError, RuntimeError, ValueError):
+        _INVALID_QUEUE_OVERRIDE = True
 if _INVALID_QUEUE_OVERRIDE:
     os.environ.pop("AI_MEMORY_QUEUE_PATH", None)
 del _raw_queue_override

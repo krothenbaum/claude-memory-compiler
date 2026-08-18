@@ -209,7 +209,11 @@ def test_malformed_hook_input_records_precise_error_event(
 )
 @pytest.mark.parametrize(
     "configured_queue",
-    ["", "relative/private-queue.sqlite3"],
+    [
+        "",
+        "relative/private-queue.sqlite3",
+        "~definitely-no-such-user/jobs.sqlite3",
+    ],
 )
 def test_hook_quarantines_invalid_queue_override_before_scripts_import(
     tmp_path, hook_name, configured_queue
@@ -271,7 +275,7 @@ def test_internal_job_guard_precedes_invalid_queue_quarantine(tmp_path, hook_nam
     environment.update(
         {
             "AI_MEMORY_HOME": str(memory_home),
-            "AI_MEMORY_QUEUE_PATH": "relative/private-queue.sqlite3",
+            "AI_MEMORY_QUEUE_PATH": "~definitely-no-such-user/jobs.sqlite3",
             "AI_MEMORY_INTERNAL_JOB": "1",
         }
     )
