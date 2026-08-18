@@ -8,7 +8,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -354,9 +354,21 @@ class HealthAlert:
             raise ValueError(f"invalid health alert level: {self.level!r}")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("health alert timestamps must be timezone-aware")
-        message = normalize_event_message(self.message, redaction_env)
+        env = redaction_env or os.environ
+        try:
+            component = _validate_identity_text(
+                "health alert component",
+                self.component,
+                max_chars=MAX_OPERATION_IDENTITY_CHARS,
+                allow_empty=False,
+                redaction_env=env,
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("health alert component is unsafe") from error
+        message = normalize_event_message(self.message, env)
         if message is None:
             raise ValueError("health alert message must not be empty")
+        object.__setattr__(self, "component", component)
         object.__setattr__(self, "message", message)
 
 
@@ -846,10 +858,25 @@ def _synthetic_run_from_job(row: sqlite3.Row) -> StatusRun:
         id=-job_id,
         job_id=job_id,
         operation_key=None,
-        kind=row["kind"],
-        source_agent=row["source_agent"],
-        session_id=row["session_id"],
-        project=row["project"],
+        kind=_safe_projection_identity(
+            "kind", row["kind"], max_chars=64, allowed=_RUN_KINDS
+        ),
+        source_agent=_safe_projection_identity(
+            "source_agent",
+            row["source_agent"],
+            max_chars=32,
+            allowed=_SOURCE_AGENTS,
+        ),
+        session_id=_safe_projection_identity(
+            "session_id",
+            row["session_id"],
+            max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        ),
+        project=_safe_projection_identity(
+            "project",
+            row["project"],
+            max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        ),
         state=state,
         phase=phase,
         summary=summary_by_state[state],
@@ -862,6 +889,53 @@ def _synthetic_run_from_job(row: sqlite3.Row) -> StatusRun:
     )
 
 
+def _safe_projection_identity(
+    field: str,
+    value: object,
+    *,
+    max_chars: int,
+    allowed: frozenset[str] | None = None,
+) -> str:
+    if not isinstance(value, str) or (allowed is not None and value not in allowed):
+        return "unknown"
+    try:
+        return _validate_identity_text(
+            field,
+            value,
+            max_chars=max_chars,
+            allow_empty=False,
+            redaction_env=os.environ,
+        )
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _safe_projection_run(run: StatusRun) -> StatusRun:
+    return replace(
+        run,
+        kind=_safe_projection_identity(
+            "kind", run.kind, max_chars=64, allowed=_RUN_KINDS
+        ),
+        source_agent=_safe_projection_identity(
+            "source_agent",
+            run.source_agent,
+            max_chars=32,
+            allowed=_SOURCE_AGENTS,
+        ),
+        session_id=_safe_projection_identity(
+            "session_id",
+            run.session_id,
+            max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        ),
+        project=_safe_projection_identity(
+            "project",
+            run.project,
+            max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        ),
+        redaction_env=os.environ,
+    )
+
+
 def _read_runs(
     connection: sqlite3.Connection,
     tables: frozenset[str],
@@ -869,7 +943,7 @@ def _read_runs(
     runs: list[StatusRun] = []
     if "status_runs" in tables:
         runs.extend(
-            status_run_from_row(row, redaction_env=os.environ)
+            _safe_projection_run(status_run_from_row(row, redaction_env=os.environ))
             for row in connection.execute("SELECT * FROM status_runs")
         )
         legacy_rows = connection.execute(
@@ -922,7 +996,7 @@ def project_compile_status(
     probes: CompileReadinessProbes,
 ) -> CompileStatus:
     """Purely project compile readiness from injected operational probes."""
-    if compile_run is not None:
+    if compile_run is not None and compile_run.state in _ACTIVE_RUN_STATES:
         summary = (
             compile_run.summary
             or compile_run.error
@@ -934,6 +1008,10 @@ def project_compile_status(
             run=compile_run,
             ready=False,
         )
+
+    def with_last_result(status: CompileStatus) -> CompileStatus:
+        return replace(status, run=compile_run) if compile_run is not None else status
+
     reservation = probes.reservation_state()
     if reservation is not None:
         reservation_state = {
@@ -942,55 +1020,71 @@ def project_compile_status(
             "queue_wait": "retrying",
             "read_wait": "retrying",
         }.get(reservation, "reserved")
-        return CompileStatus(
-            state=reservation_state,
-            summary=(
-                "Automatic compile is waiting to retry"
-                if reservation_state == "retrying"
-                else "Automatic compile is reserved"
+        return with_last_result(
+            CompileStatus(
+                state=reservation_state,
+                summary=(
+                    "Automatic compile is waiting to retry"
+                    if reservation_state == "retrying"
+                    else "Automatic compile is reserved"
+                ),
             ),
         )
     local_now = probes.local_now()
     if local_now.tzinfo is None or local_now.utcoffset() is None:
         raise ValueError("compile readiness time must be timezone-aware")
     if local_now.hour < 16:
-        return CompileStatus(
-            state="before_window",
-            summary="Next automatic compile window begins at 16:00",
+        return with_last_result(
+            CompileStatus(
+                state="before_window",
+                summary="Next automatic compile window begins at 16:00",
+            )
         )
     if queue_active_count < 0:
         raise ValueError("queue active count must be nonnegative")
     if queue_active_count:
-        return CompileStatus(
-            state="waiting_queue",
-            summary=f"Waiting for {queue_active_count} flush job(s)",
+        return with_last_result(
+            CompileStatus(
+                state="waiting_queue",
+                summary=f"Waiting for {queue_active_count} flush job(s)",
+            )
         )
     session_count = probes.session_count()
     if session_count < 0:
-        return CompileStatus(
-            state="unavailable",
-            summary="Interactive session count is unavailable",
+        return with_last_result(
+            CompileStatus(
+                state="unavailable",
+                summary="Interactive session count is unavailable",
+            )
         )
     if session_count:
-        return CompileStatus(
-            state="waiting_sessions",
-            summary=f"Waiting for {session_count} interactive session(s) to close",
+        return with_last_result(
+            CompileStatus(
+                state="waiting_sessions",
+                summary=f"Waiting for {session_count} interactive session(s) to close",
+            )
         )
     daily_state = probes.daily_state()
     if daily_state == "covered":
-        return CompileStatus(
-            state="complete",
-            summary="Today's captured content is compiled",
+        return with_last_result(
+            CompileStatus(
+                state="complete",
+                summary="Today's captured content is compiled",
+            )
         )
     if daily_state == "uncompiled":
-        return CompileStatus(
-            state="ready",
-            summary="Automatic compile is ready",
-            ready=True,
+        return with_last_result(
+            CompileStatus(
+                state="ready",
+                summary="Automatic compile is ready",
+                ready=True,
+            )
         )
-    return CompileStatus(
-        state="unavailable",
-        summary="Today's compile state is unavailable",
+    return with_last_result(
+        CompileStatus(
+            state="unavailable",
+            summary="Today's compile state is unavailable",
+        )
     )
 
 
@@ -1197,7 +1291,9 @@ def read_run_details(queue_path: Path, run_id: int) -> RunDetails:
             ).fetchone()
             if row is None:
                 raise KeyError(run_id)
-            run = status_run_from_row(row, redaction_env=os.environ)
+            run = _safe_projection_run(
+                status_run_from_row(row, redaction_env=os.environ)
+            )
             events = tuple(
                 status_event_from_row(event, redaction_env=os.environ)
                 for event in connection.execute(

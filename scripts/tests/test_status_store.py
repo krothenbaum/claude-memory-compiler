@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 import subprocess
@@ -17,6 +18,7 @@ from transcripts import NormalizedSession, Turn
 
 import scripts.queue as queue_module
 import scripts.status_store as status_store_module
+import scripts.utils as utils_module
 from scripts.queue import QueueRepository
 from scripts.status_store import (
     ALLOWED_PHASES,
@@ -1590,6 +1592,88 @@ def test_version_2_queue_is_synthesized_without_migration_or_writes(tmp_path):
         connection.close()
 
 
+def test_legacy_projection_replaces_unsafe_identity_and_excludes_it_from_search(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "legacy-private.sqlite3"
+    secret = "credential-value-never-display"
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
+    _create_version_2_queue(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET kind = ?, source_agent = ?, session_id = ?, project = ?
+            WHERE id = 41
+            """,
+            (
+                f"capture-{secret}",
+                "claude\ncontrol",
+                "s" * 300,
+                f"project-{secret}",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+    legacy = snapshot.recent[0]
+
+    assert legacy.kind == "unknown"
+    assert legacy.source_agent == "unknown"
+    assert legacy.session_id == "unknown"
+    assert legacy.project == "unknown"
+    for query in (secret, "control", "s" * 100):
+        searched = status_store_module.read_snapshot(
+            path,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+            query=query,
+        )
+        assert searched.active == ()
+        assert searched.attention == ()
+        assert searched.recent == ()
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        "hook\nprivate",
+        "x" * 257,
+        "component-credential-value-never-display",
+    ],
+)
+def test_health_alert_rejects_unsafe_components(component, monkeypatch):
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", "credential-value-never-display")
+
+    with pytest.raises(ValueError, match="component"):
+        status_store_module.HealthAlert(
+            created_at=READ_NOW,
+            level="error",
+            message="Hook failed",
+            component=component,
+        )
+
+
+def test_health_alert_redacts_configured_secrets_by_default(monkeypatch):
+    secret = "credential-value-never-display"
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
+
+    alert = status_store_module.HealthAlert(
+        created_at=READ_NOW,
+        level="error",
+        message=f"Hook exposed {secret}",
+    )
+
+    assert alert.message == "Hook exposed [REDACTED]"
+
+
 def test_snapshot_synthesizes_uninstrumented_v3_jobs_without_payload_search(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     with QueueRepository(path, sync_usage=False) as repository:
@@ -1681,6 +1765,66 @@ def test_load_observer_state_rejects_oversized_or_nonprivate_files(tmp_path):
     )
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO unavailable")
+def test_load_observer_state_rejects_fifo_without_opening_it(tmp_path, monkeypatch):
+    path = tmp_path / "status-view.json"
+    os.mkfifo(path, 0o600)
+    real_open = utils_module.os.open
+
+    def reject_fifo_open(candidate, *args, **kwargs):
+        if Path(candidate) == path:
+            pytest.fail("observer reader attempted to open a FIFO")
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "open", reject_fifo_open)
+
+    assert status_store_module.load_observer_state(path) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+def test_load_observer_state_rejects_target_swapped_before_open(tmp_path, monkeypatch):
+    path = tmp_path / "status-view.json"
+    backup = tmp_path / "original.json"
+    replacement = tmp_path / "replacement.json"
+    path.write_text('{"version":1,"acknowledged_run_ids":[1]}')
+    replacement.write_text('{"version":1,"acknowledged_run_ids":[99]}')
+    path.chmod(0o600)
+    replacement.chmod(0o600)
+    real_open = utils_module.os.open
+    swapped = False
+
+    def swap_before_open(candidate, *args, **kwargs):
+        nonlocal swapped
+        if Path(candidate) == path and not swapped:
+            swapped = True
+            path.rename(backup)
+            replacement.rename(path)
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "open", swap_before_open)
+
+    assert status_store_module.load_observer_state(path) == (
+        status_store_module.ObserverState.empty()
+    )
+    assert json.loads(backup.read_text())["acknowledged_run_ids"] == [1]
+
+
+def test_load_observer_state_rejects_symlink_without_following(tmp_path):
+    target = tmp_path / "actual.json"
+    target.write_text('{"version":1,"acknowledged_run_ids":[7]}')
+    target.chmod(0o600)
+    link = tmp_path / "status-view.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    assert status_store_module.load_observer_state(link) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
 def test_acknowledge_run_atomically_writes_private_exact_state(tmp_path):
     path = tmp_path / "scripts" / "status-view.json"
 
@@ -1713,6 +1857,74 @@ def test_acknowledge_run_refuses_unsafe_existing_target(tmp_path):
         status_store_module.acknowledge_run(link, 1)
 
     assert target.read_text() == '{"version":1,"acknowledged_run_ids":[]}'
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptors required")
+def test_atomic_observer_write_rejects_parent_swap_and_preserves_prior_state(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "safe" / "scripts"
+    parent.mkdir(parents=True)
+    target = parent / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    moved_parent = tmp_path / "moved-scripts"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    real_open = utils_module.os.open
+    swapped = False
+
+    def swap_parent_before_open(candidate, flags, *args, **kwargs):
+        nonlocal swapped
+        if (
+            Path(candidate) == parent
+            and flags & getattr(os, "O_DIRECTORY", 0)
+            and not swapped
+        ):
+            swapped = True
+            parent.rename(moved_parent)
+            parent.symlink_to(attacker, target_is_directory=True)
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "open", swap_parent_before_open)
+
+    with pytest.raises((OSError, ValueError)):
+        status_store_module.acknowledge_run(target, 2)
+
+    assert json.loads((moved_parent / target.name).read_text()) == {
+        "version": 1,
+        "acknowledged_run_ids": [1],
+    }
+    assert not (attacker / target.name).exists()
+
+
+@pytest.mark.parametrize("changed_identity_call", [2, 3, 4])
+def test_atomic_observer_write_rejects_temp_or_destination_identity_swap(
+    tmp_path, monkeypatch, changed_identity_call
+):
+    target = tmp_path / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    prior = target.read_bytes()
+    real_same_identity = utils_module._same_file_identity
+    calls = 0
+
+    def changed_identity(first, second):
+        nonlocal calls
+        calls += 1
+        if calls == changed_identity_call:
+            return False
+        return real_same_identity(first, second)
+
+    monkeypatch.setattr(utils_module, "_same_file_identity", changed_identity)
+    replacement = b'{"version":1,"acknowledged_run_ids":[1,2]}'
+
+    with pytest.raises(ValueError, match="identity changed"):
+        utils_module.atomic_write_private_file(
+            target,
+            replacement,
+            max_bytes=status_store_module.MAX_OBSERVER_STATE_BYTES,
+        )
+
+    assert target.read_bytes() == prior
 
 
 def test_acknowledge_run_supports_synthetic_legacy_run_identifiers(tmp_path):
@@ -1768,8 +1980,8 @@ def test_compile_readiness_uses_pure_injected_probes(
     assert status.ready is (expected == "ready")
 
 
-def test_compile_status_prefers_the_authoritative_compile_run():
-    failed = _status_run(
+def test_compile_status_prefers_an_active_authoritative_compile_run():
+    running = _status_run(
         id=91,
         job_id=None,
         operation_key="compile:91",
@@ -1777,11 +1989,11 @@ def test_compile_status_prefers_the_authoritative_compile_run():
         source_agent="system",
         session_id="2026-08-18",
         project="memory",
-        state="failed",
-        phase="failed",
-        summary=None,
-        error="Validation failed",
-        completed_at=READ_NOW,
+        state="running",
+        phase="validation_started",
+        summary="Validating staged changes",
+        error=None,
+        completed_at=None,
     )
     probes = status_store_module.CompileReadinessProbes(
         local_now=lambda: pytest.fail("compile run should avoid readiness probes"),
@@ -1791,14 +2003,87 @@ def test_compile_status_prefers_the_authoritative_compile_run():
     )
 
     status = status_store_module.project_compile_status(
-        compile_run=failed,
+        compile_run=running,
         queue_active_count=0,
         probes=probes,
     )
 
-    assert status.state == "failed"
-    assert status.summary == "Validation failed"
-    assert status.run == failed
+    assert status.state == "running"
+    assert status.summary == "Validating staged changes"
+    assert status.run == running
+
+
+@pytest.mark.parametrize("terminal_state", ["succeeded", "failed"])
+def test_old_terminal_compile_run_does_not_suppress_current_readiness(terminal_state):
+    terminal = _status_run(
+        id=92,
+        job_id=None,
+        operation_key="compile:yesterday",
+        kind="compile",
+        source_agent="system",
+        session_id="2026-08-17",
+        project="memory",
+        state=terminal_state,
+        phase=terminal_state,
+        summary="Yesterday's compile",
+        error="Yesterday failed" if terminal_state == "failed" else None,
+        started_at=READ_NOW - timedelta(days=1),
+        updated_at=READ_NOW - timedelta(days=1),
+        completed_at=READ_NOW - timedelta(days=1),
+    )
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        session_count=lambda: 0,
+        daily_state=lambda: "uncompiled",
+        reservation_state=lambda: None,
+    )
+
+    status = status_store_module.project_compile_status(
+        compile_run=terminal,
+        queue_active_count=0,
+        probes=probes,
+    )
+
+    assert status.state == "ready"
+    assert status.ready is True
+    assert status.run == terminal
+
+
+def test_old_terminal_compile_run_does_not_suppress_queue_or_session_waits():
+    terminal = _status_run(
+        id=93,
+        job_id=None,
+        operation_key="compile:old",
+        kind="compile",
+        source_agent="system",
+        session_id="2026-08-10",
+        project="memory",
+        state="succeeded",
+        phase="succeeded",
+        completed_at=READ_NOW - timedelta(days=8),
+        started_at=READ_NOW - timedelta(days=8),
+        updated_at=READ_NOW - timedelta(days=8),
+    )
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        session_count=lambda: 2,
+        daily_state=lambda: "uncompiled",
+        reservation_state=lambda: None,
+    )
+
+    waiting_queue = status_store_module.project_compile_status(
+        compile_run=terminal,
+        queue_active_count=3,
+        probes=probes,
+    )
+    waiting_sessions = status_store_module.project_compile_status(
+        compile_run=terminal,
+        queue_active_count=0,
+        probes=probes,
+    )
+
+    assert waiting_queue.state == "waiting_queue"
+    assert waiting_sessions.state == "waiting_sessions"
 
 
 def test_snapshot_reads_active_compile_reservation_without_queue_mutation(tmp_path):
