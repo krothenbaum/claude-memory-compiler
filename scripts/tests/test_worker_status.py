@@ -5,12 +5,12 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from providers import ProviderResult, ProviderRouter, TaskKind
 from transcripts import NormalizedSession, Turn
 from worker import MemoryWorker
 
 from scripts.queue import Job, QueueRepository
-
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 
@@ -50,14 +50,21 @@ def _session(tmp_path, *, session_id="session-1"):
     )
 
 
-def _router_factory(codex, claude):
-    def factory(attempt_callback, attempt_start_callback):
+def _status_router_factory(codex, claude):
+    def factory(attempt_start_callback, attempt_callback):
         return ProviderRouter(
             codex,
             claude,
             attempt_start_callback=attempt_start_callback,
             attempt_callback=attempt_callback,
         )
+
+    return factory
+
+
+def _legacy_router_factory(codex, claude):
+    def factory(attempt_callback):
+        return ProviderRouter(codex, claude, attempt_callback=attempt_callback)
 
     return factory
 
@@ -78,7 +85,7 @@ def _claim(repository, owner="worker", now=NOW, lease_seconds=60) -> Job:
     return job
 
 
-def test_direct_codex_success_emits_exact_phases_and_summary(tmp_path):
+def test_full_status_factory_codex_success_emits_exact_phases_and_summary(tmp_path):
     text = "x" * 1_234
     codex = DeterministicProvider(
         "codex",
@@ -99,7 +106,7 @@ def test_direct_codex_success_emits_exact_phases_and_summary(tmp_path):
         job = _claim(repository)
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda job, saved: writes.append((job.id, saved)),
             clock=lambda: NOW,
             owner="worker",
@@ -160,7 +167,7 @@ def test_claude_fallback_emits_warning_then_success_and_fallback_summary(tmp_pat
         job = _claim(repository)
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda *_: None,
             clock=lambda: NOW,
             owner="worker",
@@ -210,7 +217,7 @@ def test_both_provider_failures_emit_error_then_retry(tmp_path):
         job = _claim(repository)
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda *_: (_ for _ in ()).throw(
                 AssertionError("daily writer must not run")
             ),
@@ -254,7 +261,7 @@ def test_daily_writer_failure_retries_after_write_started_without_success(tmp_pa
         job = _claim(repository)
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda *_: (_ for _ in ()).throw(OSError("disk full")),
             clock=lambda: NOW,
             owner="worker",
@@ -301,7 +308,7 @@ def test_stale_attempt_rejection_stops_later_provider_events(tmp_path):
         writes = []
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda *_: writes.append(True),
             clock=lambda: NOW,
             owner="worker",
@@ -350,7 +357,7 @@ def test_nonownership_status_failure_is_logged_without_conflicting_terminal_stat
         repository.append_job_event = fail_start
         worker = MemoryWorker(
             repository,
-            router_factory=_router_factory(codex, claude),
+            status_router_factory=_status_router_factory(codex, claude),
             daily_writer=lambda *_: None,
             clock=lambda: NOW,
             owner="worker",
@@ -368,3 +375,160 @@ def test_nonownership_status_failure_is_logged_without_conflicting_terminal_stat
         ]
         assert repository.get_job(queued.job_id).status == "succeeded"
         assert "Failed to append codex_started status event" in caplog.text
+
+
+def test_router_construction_modes_have_deliberate_exact_timelines(tmp_path):
+    expected_by_mode = {
+        "direct": [
+            "queued",
+            "worker_claimed",
+            "daily_log_write_started",
+            "succeeded",
+        ],
+        "legacy": [
+            "queued",
+            "worker_claimed",
+            "codex_succeeded",
+            "daily_log_write_started",
+            "succeeded",
+        ],
+        "full": [
+            "queued",
+            "worker_claimed",
+            "codex_started",
+            "codex_succeeded",
+            "daily_log_write_started",
+            "succeeded",
+        ],
+    }
+
+    for mode, expected in expected_by_mode.items():
+        codex = DeterministicProvider(
+            "codex",
+            ProviderResult(
+                "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+            ),
+        )
+        claude = DeterministicProvider(
+            "claude",
+            ProviderResult(
+                "claude", "sonnet", TaskKind.EXTRACT, "success", text="unused"
+            ),
+        )
+        with QueueRepository(
+            tmp_path / f"{mode}.sqlite3", clock=lambda: NOW, sync_usage=False
+        ) as repository:
+            queued = repository.enqueue_capture(_session(tmp_path, session_id=mode))
+            job = _claim(repository)
+            if mode == "direct":
+                worker = MemoryWorker(
+                    repository,
+                    ProviderRouter(codex, claude),
+                    daily_writer=lambda *_: None,
+                    clock=lambda: NOW,
+                    owner="worker",
+                )
+            elif mode == "legacy":
+                worker = MemoryWorker(
+                    repository,
+                    router_factory=_legacy_router_factory(codex, claude),
+                    daily_writer=lambda *_: None,
+                    clock=lambda: NOW,
+                    owner="worker",
+                )
+            else:
+                worker = MemoryWorker(
+                    repository,
+                    status_router_factory=_status_router_factory(codex, claude),
+                    daily_writer=lambda *_: None,
+                    clock=lambda: NOW,
+                    owner="worker",
+                )
+
+            assert asyncio.run(worker.process(job)) is True
+            assert _phases(repository, queued.job_id) == expected
+
+
+def test_worker_rejects_ambiguous_router_construction(tmp_path):
+    result = ProviderResult(
+        "codex", "luna", TaskKind.EXTRACT, "success", text="daily"
+    )
+    codex = DeterministicProvider("codex", result)
+    claude = DeterministicProvider("claude", result)
+    direct = ProviderRouter(codex, claude)
+    legacy = _legacy_router_factory(codex, claude)
+    full = _status_router_factory(codex, claude)
+
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, sync_usage=False
+    ) as repository:
+        with pytest.raises(ValueError, match="exactly one router construction mode"):
+            MemoryWorker(repository)
+        with pytest.raises(ValueError, match="exactly one router construction mode"):
+            MemoryWorker(repository, direct, router_factory=legacy)
+        with pytest.raises(ValueError, match="exactly one router construction mode"):
+            MemoryWorker(repository, router_factory=legacy, status_router_factory=full)
+
+
+def test_default_worker_selects_full_status_factory(tmp_path, monkeypatch):
+    import worker as worker_module
+
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+
+    worker, repository = worker_module._default_worker()
+    try:
+        assert worker.router is None
+        assert worker.router_factory is None
+        assert worker.status_router_factory is not None
+    finally:
+        repository.close()
+
+
+def test_record_attempt_failure_after_end_event_retries_once_without_success(
+    tmp_path
+):
+    codex = DeterministicProvider(
+        "codex",
+        ProviderResult(
+            "codex", "luna", TaskKind.EXTRACT, "success", text="must not write"
+        ),
+    )
+    claude = DeterministicProvider(
+        "claude",
+        ProviderResult("claude", "sonnet", TaskKind.EXTRACT, "success", text="unused"),
+    )
+
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3", clock=lambda: NOW, max_attempts=2, sync_usage=False
+    ) as repository:
+        queued = repository.enqueue_capture(_session(tmp_path))
+        job = _claim(repository)
+
+        def fail_attempt(*_args, **_kwargs):
+            raise sqlite3.OperationalError("attempt storage unavailable")
+
+        repository.record_attempt = fail_attempt
+        worker = MemoryWorker(
+            repository,
+            status_router_factory=_status_router_factory(codex, claude),
+            daily_writer=lambda *_: (_ for _ in ()).throw(
+                AssertionError("daily writer must not run")
+            ),
+            clock=lambda: NOW,
+            owner="worker",
+        )
+
+        assert asyncio.run(worker.process(job)) is False
+
+        phases = _phases(repository, queued.job_id)
+        assert phases == [
+            "queued",
+            "worker_claimed",
+            "codex_started",
+            "codex_succeeded",
+            "retry_wait",
+        ]
+        assert phases.count("retry_wait") == 1
+        assert "succeeded" not in phases
+        assert repository.get_job(queued.job_id).status == "failed"

@@ -1549,6 +1549,8 @@ class FakeProvider:
         self.result = result
         self.text_requests = []
         self.workspace_requests = []
+        self._model: str | None = None
+        self._task_models: dict[TaskKind, str] = {}
 
     async def generate_text(self, request):
         self.text_requests.append(request)
@@ -1650,7 +1652,7 @@ def test_router_orders_start_and_end_callbacks_for_codex_success(
 
     events = []
     codex = FakeProvider(success_result("codex", "done"))
-    setattr(codex, "_task_models", {TaskKind.QUERY: "codex-model"})
+    codex._task_models = {TaskKind.QUERY: "codex-model"}
     claude = FakeProvider(success_result("claude", "unused"))
 
     def sync_started(provider, model, task):
@@ -1693,9 +1695,9 @@ def test_router_orders_callbacks_for_codex_failure_then_fresh_claude_success(
 
     events = []
     codex = FakeProvider(capacity_result("full"))
-    setattr(codex, "_task_models", {TaskKind.QUERY: "codex-model"})
+    codex._task_models = {TaskKind.QUERY: "codex-model"}
     claude = FakeProvider(success_result("claude", "done"))
-    setattr(claude, "_model", "claude-model")
+    claude._model = "claude-model"
 
     def sync_started(provider, model, task):
         events.append(("started", provider, model, task))
@@ -1730,6 +1732,51 @@ def test_router_orders_callbacks_for_codex_failure_then_fresh_claude_success(
     ]
     assert codex.text_requests == [text_request]
     assert claude.text_requests == [text_request]
+
+
+def test_router_start_callback_sync_exception_prevents_provider_call(text_request):
+    import providers
+
+    codex = FakeProvider(success_result("codex", "must not run"))
+    claude = FakeProvider(success_result("claude", "must not run"))
+
+    def fail_start(_provider, _model, _task):
+        raise RuntimeError("start callback failed")
+
+    with pytest.raises(RuntimeError, match="start callback failed"):
+        _run(
+            providers.ProviderRouter(
+                codex, claude, attempt_start_callback=fail_start
+            ).generate_text(text_request)
+        )
+
+    assert codex.text_requests == []
+    assert claude.text_requests == []
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("async start failed"), asyncio.CancelledError()]
+)
+def test_router_start_callback_async_failure_prevents_provider_call(
+    text_request, failure
+):
+    import providers
+
+    codex = FakeProvider(success_result("codex", "must not run"))
+    claude = FakeProvider(success_result("claude", "must not run"))
+
+    async def fail_start(_provider, _model, _task):
+        raise failure
+
+    with pytest.raises(type(failure), match=str(failure) or None):
+        _run(
+            providers.ProviderRouter(
+                codex, claude, attempt_start_callback=fail_start
+            ).generate_text(text_request)
+        )
+
+    assert codex.text_requests == []
+    assert claude.text_requests == []
 
 
 def test_router_returns_failed_result_when_both_providers_fail(text_request):

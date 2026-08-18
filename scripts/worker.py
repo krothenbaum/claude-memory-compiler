@@ -79,6 +79,10 @@ class TextRouter(Protocol):
     async def generate_text(self, request: TextRequest) -> RoutedResult: ...
 
 
+LegacyRouterFactory = Callable[[AttemptCallback], TextRouter]
+StatusRouterFactory = Callable[[AttemptStartCallback, AttemptCallback], TextRouter]
+
+
 class SingletonDrainLock(ExclusiveFileLock):
     """Cross-platform OS file lock; file contents are diagnostic only."""
 
@@ -87,14 +91,19 @@ class SingletonDrainLock(ExclusiveFileLock):
 
 
 class MemoryWorker:
-    """Claim and process jobs while preserving retry and attempt history."""
+    """Claim jobs while preserving retries and the selected status fidelity.
+
+    A direct router emits no provider phases. A legacy factory emits attempt-end
+    phases. A status factory emits both attempt-start and attempt-end phases.
+    """
 
     def __init__(
         self,
         queue: QueueRepository,
-        router: object | None = None,
+        router: TextRouter | None = None,
         *,
-        router_factory: Callable[..., object] | None = None,
+        router_factory: LegacyRouterFactory | None = None,
+        status_router_factory: StatusRouterFactory | None = None,
         daily_writer: Callable[[Job, str], object] = daily_writer_boundary,
         clock: Callable[[], datetime] = _utc_now,
         owner: str | None = None,
@@ -119,11 +128,16 @@ class MemoryWorker:
             raise ValueError("max_idle_sleep_seconds must be positive")
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
-        if (router is None) == (router_factory is None):
-            raise ValueError("provide exactly one of router or router_factory")
+        construction_modes = sum(
+            candidate is not None
+            for candidate in (router, router_factory, status_router_factory)
+        )
+        if construction_modes != 1:
+            raise ValueError("provide exactly one router construction mode")
         self.queue = queue
         self.router = router
         self.router_factory = router_factory
+        self.status_router_factory = status_router_factory
         self.daily_writer = daily_writer
         self.clock = clock
         self.owner = owner or str(uuid.uuid4())
@@ -285,35 +299,21 @@ class MemoryWorker:
             self.queue.record_attempt(job.id, attempt)
 
     def _build_router(self, job: Job) -> TextRouter:
-        if self.router_factory is None:
-            if self.router is None:  # Defensive: constructor validates this.
-                raise RuntimeError("worker router is unavailable")
-            return cast(TextRouter, self.router)
+        async def attempt_callback(attempt: ProviderResult) -> None:
+            await self._provider_ended(job, attempt)
 
-        attempt_callback: AttemptCallback = lambda attempt: self._provider_ended(
-            job, attempt
-        )
-        start_callback: AttemptStartCallback = (
-            lambda provider, model, task: self._provider_started(
-                job, provider, model, task
-            )
-        )
-        try:
-            signature = inspect.signature(self.router_factory)
-        except (TypeError, ValueError):
-            return cast(
-                TextRouter, self.router_factory(attempt_callback, start_callback)
-            )
-        try:
-            signature.bind(attempt_callback, start_callback)
-        except TypeError:
-            # Compatibility for existing factories that only accept attempt-end
-            # persistence. Live production uses both callbacks.
-            signature.bind(attempt_callback)
-            return cast(TextRouter, self.router_factory(attempt_callback))
-        return cast(
-            TextRouter, self.router_factory(attempt_callback, start_callback)
-        )
+        if self.status_router_factory is not None:
+            async def start_callback(
+                provider: ProviderName, model: str, task: TaskKind
+            ) -> None:
+                await self._provider_started(job, provider, model, task)
+
+            return self.status_router_factory(start_callback, attempt_callback)
+        if self.router_factory is not None:
+            return self.router_factory(attempt_callback)
+        if self.router is None:  # Defensive: constructor validates this.
+            raise RuntimeError("worker router is unavailable")
+        return self.router
 
     async def _run_serialized_with_lease(
         self,
@@ -381,7 +381,10 @@ class MemoryWorker:
                 cwd=Path(job.cwd or ROOT),
                 timeout_seconds=self.provider_timeout_seconds,
             )
-            eagerly_persisted = self.router_factory is not None
+            eagerly_persisted = (
+                self.router_factory is not None
+                or self.status_router_factory is not None
+            )
             router = self._build_router(job)
             result = cast(
                 RoutedResult,
@@ -496,7 +499,7 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     claude = ClaudeProvider(model=config.claude_model)
     worker = MemoryWorker(
         repository,
-        router_factory=lambda callback, start_callback: ProviderRouter(
+        status_router_factory=lambda start_callback, callback: ProviderRouter(
             codex,
             claude,
             attempt_start_callback=start_callback,

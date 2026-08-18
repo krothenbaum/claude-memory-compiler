@@ -1403,7 +1403,10 @@ def test_worker_crash_after_append_before_queue_complete_retries_without_duplica
     job.lease_owner = "worker"
 
     class Queue:
-        completes = 0
+        def __init__(self):
+            self.completes = 0
+            self.summaries = []
+            self.simulated_crashes = 0
 
         def renew(self, *_args):
             return True
@@ -1411,9 +1414,11 @@ def test_worker_crash_after_append_before_queue_complete_retries_without_duplica
         def record_attempt(self, *_args):
             return None
 
-        def complete(self, *_args):
+        def complete(self, *_args, summary=None):
             self.completes += 1
+            self.summaries.append(summary)
             if self.completes == 1:
+                self.simulated_crashes += 1
                 raise RuntimeError("crash after append")
 
         def get_job(self, _job_id):
@@ -1429,6 +1434,8 @@ def test_worker_crash_after_append_before_queue_complete_retries_without_duplica
 
     content = next((tmp_path / "daily").glob("*.md")).read_text(encoding="utf-8")
     assert queue.completes == 2
+    assert queue.summaries == ["Saved 9 characters", "Saved 9 characters"]
+    assert queue.simulated_crashes == 1
     assert content.count("crash-gap") == 1
 
 
