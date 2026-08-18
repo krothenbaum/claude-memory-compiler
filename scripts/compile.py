@@ -112,13 +112,17 @@ def _record_automatic_phase(
 ) -> bool:
     if run_id is None:
         return False
-    config = _config(home)
-    with QueueRepository(
-        config.queue_path, memory_home=home, sync_usage=False
-    ) as repository:
-        return repository.record_active_auto_compile_phase(
-            run_id, phase, details=details
-        )
+    try:
+        config = _config(home)
+        with QueueRepository(
+            config.queue_path, memory_home=home, sync_usage=False
+        ) as repository:
+            return repository.record_active_auto_compile_phase(
+                run_id, phase, details=details
+            )
+    except Exception:  # noqa: BLE001 - observability must never block compilation.
+        logger.warning("automatic compile status phase unavailable: %s", phase)
+        return False
 
 
 def _article_paths(home: Path) -> tuple[str, ...]:

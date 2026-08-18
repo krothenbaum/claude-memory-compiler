@@ -570,3 +570,30 @@ def test_trusted_automatic_status_run_id_is_parsed():
             "AI_MEMORY_STATUS_RUN_ID": "42",
         }
     ) == 42
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "staging_started",
+        "provider_started",
+        "validation_started",
+        "apply_started",
+    ],
+)
+def test_automatic_phase_failures_are_best_effort(
+    monkeypatch, tmp_path, phase, caplog
+):
+    def fail_config(_home):
+        raise OSError("credential-value-must-not-log")
+
+    monkeypatch.setattr(compile_module, "_config", fail_config)
+
+    assert compile_module._record_automatic_phase(
+        tmp_path,
+        41,
+        phase,
+        details={"changed_files": 2} if phase == "apply_started" else None,
+    ) is False
+    assert "credential-value-must-not-log" not in caplog.text
+    assert str(tmp_path) not in caplog.text
