@@ -2970,5 +2970,61 @@ def test_bounded_snapshot_rejects_invalid_max_runs(tmp_path):
                 tmp_path / "missing.sqlite3",
                 now=READ_NOW,
                 observer_state=status_store_module.ObserverState.empty(),
-                max_runs=maximum,
+            max_runs=maximum,
+        )
+
+
+def test_bounded_legacy_ack_priority_keeps_older_unacknowledged_attention(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        for job_id in range(1, 5):
+            timestamp = (READ_NOW - timedelta(minutes=job_id)).isoformat()
+            repository._connection.execute(
+                """INSERT INTO jobs(id,kind,source_agent,session_id,project,cwd,trigger,
+                source_path,source_hash,payload_json,status,attempt_count,available_at,
+                created_at,updated_at,completed_at) VALUES(?, 'capture','claude',?,
+                'legacy','/tmp','end','/tmp/x',?,'{}','dead',1,?,?,?,?)""",
+                (job_id, f"s-{job_id}", f"h-{job_id}", timestamp, timestamp, timestamp, timestamp),
             )
+        repository._connection.commit()
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState(1, frozenset({-1, -2, -3})),
+        max_runs=2,
+    )
+    assert -4 in {run.id for run in snapshot.attention}
+    assert sum(map(len, (snapshot.active, snapshot.attention, snapshot.recent))) <= 2
+    assert snapshot.has_more
+
+
+def test_bounded_attention_reserves_modern_and_legacy_sources(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        for index in range(3):
+            _insert_projection_run(
+                repository._connection,
+                run_id=100 + index,
+                state="failed",
+                phase="failed",
+                updated_at=READ_NOW - timedelta(seconds=index),
+                project="modern",
+            )
+            timestamp = (READ_NOW - timedelta(days=1, seconds=index)).isoformat()
+            repository._connection.execute(
+                """INSERT INTO jobs(id,kind,source_agent,session_id,project,cwd,trigger,
+                source_path,source_hash,payload_json,status,attempt_count,available_at,
+                created_at,updated_at,completed_at) VALUES(?, 'capture','claude',?,
+                'legacy','/tmp','end','/tmp/x',?,'{}','dead',1,?,?,?,?)""",
+                (index + 1, f"l-{index}", f"lh-{index}", timestamp, timestamp, timestamp, timestamp),
+            )
+        repository._connection.commit()
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        max_runs=2,
+    )
+    assert {run.id > 0 for run in snapshot.attention} == {True, False}
+    assert len(snapshot.attention) == 2
+    assert snapshot.has_more

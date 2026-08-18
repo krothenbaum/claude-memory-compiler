@@ -1045,17 +1045,17 @@ def _read_runs(
             status_sql += " AND " + (
                 "safe_status_match(kind,source_agent,session_id,project,state,phase,summary)=1"
             )
+        modern_ack = (
+            "id NOT IN (" + ",".join("?" for _ in acknowledged_run_ids) + ")"
+            if acknowledged_run_ids
+            else "1=1"
+        )
         status_sql += (
-            " ORDER BY CASE WHEN state IN ('failed','dead') AND id NOT IN ("
-            + (",".join("?" for _ in acknowledged_run_ids) or "NULL")
-            + ") THEN 0 "
+            " ORDER BY CASE WHEN state IN ('failed','dead') AND " + modern_ack + " THEN 0 "
             "WHEN state IN ('queued','running','retrying') THEN 1 ELSE 2 END, "
             "julianday(updated_at) DESC, id DESC"
         )
         status_parameters = (*status_parameters, *sorted(acknowledged_run_ids))
-        if max_runs is not None:
-            status_sql += " LIMIT ?"
-            status_parameters = (*status_parameters, max_runs + 1)
         runs.extend(
             _safe_projection_run(status_run_from_row(row, redaction_env=os.environ))
             for row in connection.execute(status_sql, status_parameters)
@@ -1079,14 +1079,17 @@ def _read_runs(
             legacy_parameters = (cutoff,)
         if needle:
             legacy_sql += " AND safe_legacy_match(jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,jobs.status)=1"
+        legacy_ack = (
+            "(-jobs.id) NOT IN (" + ",".join("?" for _ in acknowledged_run_ids) + ")"
+            if acknowledged_run_ids
+            else "1=1"
+        )
         legacy_sql += (
-            " ORDER BY CASE WHEN jobs.status IN ('failed','dead') THEN 0 "
+            " ORDER BY CASE WHEN jobs.status IN ('failed','dead') AND " + legacy_ack + " THEN 0 "
             "WHEN jobs.status IN ('pending','leased') THEN 1 ELSE 2 END, "
             "julianday(jobs.updated_at) DESC, jobs.id DESC"
         )
-        if max_runs is not None:
-            legacy_sql += " LIMIT ?"
-            legacy_parameters = (*legacy_parameters, max_runs + 1)
+        legacy_parameters = (*legacy_parameters, *sorted(acknowledged_run_ids))
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     else:
         legacy_sql = """
@@ -1104,14 +1107,17 @@ def _read_runs(
             legacy_parameters = (cutoff,)
         if needle:
             legacy_sql += " AND safe_legacy_match(kind,source_agent,session_id,project,status)=1"
+        legacy_ack = (
+            "(-id) NOT IN (" + ",".join("?" for _ in acknowledged_run_ids) + ")"
+            if acknowledged_run_ids
+            else "1=1"
+        )
         legacy_sql += (
-            " ORDER BY CASE WHEN status IN ('failed','dead') THEN 0 "
+            " ORDER BY CASE WHEN status IN ('failed','dead') AND " + legacy_ack + " THEN 0 "
             "WHEN status IN ('pending','leased') THEN 1 ELSE 2 END, "
             "julianday(updated_at) DESC, id DESC"
         )
-        if max_runs is not None:
-            legacy_sql += " LIMIT ?"
-            legacy_parameters = (*legacy_parameters, max_runs + 1)
+        legacy_parameters = (*legacy_parameters, *sorted(acknowledged_run_ids))
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
     return tuple(runs)
@@ -1457,15 +1463,29 @@ def read_snapshot(
         targets: list[list[StatusRun]] = [[], [], []]
         nonempty = [index for index, source in enumerate(sources) if source]
         initial = nonempty if max_runs >= len(nonempty) else nonempty[:max_runs]
+        def fair_take(source: tuple[StatusRun, ...], count: int) -> list[StatusRun]:
+            if count <= 0:
+                return []
+            modern = [run for run in source if run.id > 0]
+            legacy = [run for run in source if run.id < 0]
+            chosen: list[StatusRun] = []
+            if count >= 2 and modern and legacy:
+                chosen.extend((modern[0], legacy[0]))
+            remaining_candidates = [run for run in source if run not in chosen]
+            chosen.extend(remaining_candidates[: count - len(chosen)])
+            return sorted(chosen, key=_run_sort_key, reverse=True)
+
         for index in initial:
-            targets[index].append(sources[index][0])
+            targets[index] = fair_take(sources[index], 1)
         remaining = max_runs - len(initial)
         for index in (0, 1, 2):
             if remaining <= 0:
                 break
-            extra = sources[index][len(targets[index]): len(targets[index]) + remaining]
-            targets[index].extend(extra)
-            remaining -= len(extra)
+            desired = len(targets[index]) + remaining
+            replacement = fair_take(sources[index], desired)
+            added = len(replacement) - len(targets[index])
+            targets[index] = replacement
+            remaining -= added
         attention, active, recent = map(tuple, targets)
     return StatusSnapshot(
         active=active,
