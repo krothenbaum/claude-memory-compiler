@@ -832,6 +832,7 @@ def _open_read_only_database(queue_path: Path) -> sqlite3.Connection:
             resolved,
             f"status database path is unsafe: {resolved}",
         ) from error
+    resolved = expected_identity.path
     try:
         connection = sqlite3.connect(
             f"{resolved.as_uri()}?mode=ro",
@@ -1017,7 +1018,8 @@ def _read_runs(
         if not all_history:
             status_sql += (
                 " WHERE state IN ('queued', 'running', 'retrying', 'failed', 'dead')"
-                " OR (state = 'succeeded' AND updated_at >= ?)"
+                " OR (state = 'succeeded'"
+                " AND julianday(updated_at) >= julianday(?))"
             )
             status_parameters = (cutoff,)
         runs.extend(
@@ -1037,7 +1039,8 @@ def _read_runs(
         if not all_history:
             legacy_sql += (
                 " AND (jobs.status IN ('pending', 'leased', 'failed', 'dead')"
-                " OR (jobs.status = 'succeeded' AND jobs.updated_at >= ?))"
+                " OR (jobs.status = 'succeeded'"
+                " AND julianday(jobs.updated_at) >= julianday(?)))"
             )
             legacy_parameters = (cutoff,)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
@@ -1051,12 +1054,34 @@ def _read_runs(
         if not all_history:
             legacy_sql += (
                 " WHERE status IN ('pending', 'leased', 'failed', 'dead')"
-                " OR (status = 'succeeded' AND updated_at >= ?)"
+                " OR (status = 'succeeded'"
+                " AND julianday(updated_at) >= julianday(?))"
             )
             legacy_parameters = (cutoff,)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
     return tuple(runs)
+
+
+def _read_latest_compile_run(
+    connection: sqlite3.Connection,
+    tables: frozenset[str],
+) -> StatusRun | None:
+    if "status_runs" not in tables:
+        return None
+    row = connection.execute(
+        """
+        SELECT * FROM status_runs
+        WHERE kind = 'compile'
+        ORDER BY julianday(updated_at) DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return _safe_projection_run(
+        status_run_from_row(row, redaction_env=os.environ)
+    )
 
 
 def _matches_query(run: StatusRun, query: str) -> bool:
@@ -1290,6 +1315,7 @@ def read_snapshot(
             now=now,
             all_history=bool(query.strip()),
         )
+        latest_compile_run = _read_latest_compile_run(connection, tables)
         queue_active_count, reservation_state = _read_compile_database_state(
             connection, tables, now
         )
@@ -1343,7 +1369,10 @@ def read_snapshot(
             reverse=True,
         )
     )
-    compile_runs = tuple(run for run in runs if run.kind == "compile")
+    compile_runs_by_id = {run.id: run for run in runs if run.kind == "compile"}
+    if latest_compile_run is not None:
+        compile_runs_by_id[latest_compile_run.id] = latest_compile_run
+    compile_runs = tuple(compile_runs_by_id.values())
     compile_run = max(compile_runs, key=_run_sort_key) if compile_runs else None
     compile_status = project_compile_status(
         compile_run=compile_run,

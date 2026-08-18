@@ -1553,6 +1553,46 @@ def test_default_snapshot_filters_old_successes_in_sql(tmp_path, monkeypatch):
     assert [run.id for run in searched.recent] == [6]
 
 
+def test_recent_sql_filter_includes_equivalent_exact_boundary_timestamps(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            UPDATE status_runs
+            SET updated_at = ?, completed_at = ?
+            WHERE id = 5
+            """,
+            (
+                "2026-08-11T18:00:00+00:00",
+                "2026-08-11T18:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE status_runs
+            SET updated_at = ?, completed_at = ?
+            WHERE id = 6
+            """,
+            (
+                "2026-08-11T11:00:00-07:00",
+                "2026-08-11T11:00:00-07:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert {run.id for run in snapshot.recent} >= {5, 6}
+
+
 def test_snapshot_injects_health_alerts_without_mutating_them(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     _create_projection_queue(path)
@@ -2460,6 +2500,40 @@ def test_observer_state_path_uses_a_dedicated_private_runtime_directory(tmp_path
     )
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/var").is_symlink(),
+    reason="macOS /var alias required",
+)
+def test_macos_var_alias_supports_private_state_and_custom_queue(tmp_path):
+    actual_root = tmp_path.resolve()
+    try:
+        relative = actual_root.relative_to("/private/var")
+    except ValueError:
+        pytest.skip("temporary directory is not under /private/var")
+    alias_root = Path("/var") / relative
+    state_path = status_store_module.observer_state_path(alias_root)
+
+    state = status_store_module.acknowledge_run(state_path, 7)
+
+    assert state.acknowledged_run_ids == {7}
+    assert status_store_module.load_observer_state(
+        status_store_module.observer_state_path(actual_root)
+    ) == state
+
+    actual_queue = actual_root / "custom" / "jobs.sqlite3"
+    with QueueRepository(actual_queue, sync_usage=False):
+        pass
+    alias_queue = Path("/var") / actual_queue.relative_to("/private/var")
+
+    snapshot = status_store_module.read_snapshot(
+        alias_queue,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert snapshot.active == ()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits required")
 def test_observer_state_private_child_allows_normal_repository_scripts_acl(tmp_path):
     scripts = tmp_path / "scripts"
@@ -2476,30 +2550,49 @@ def test_observer_state_private_child_allows_normal_repository_scripts_acl(tmp_p
 
 def test_concurrent_acknowledgments_do_not_lose_run_ids(tmp_path, monkeypatch):
     path = status_store_module.observer_state_path(tmp_path)
-    original_load = status_store_module.load_observer_state
-    both_loaded = threading.Barrier(2)
+    original_load = status_store_module._load_observer_state_unlocked
+    first_loaded = threading.Event()
+    release_first = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
 
     def synchronized_load(candidate):
+        nonlocal calls
         state = original_load(candidate)
-        both_loaded.wait(timeout=5)
+        with calls_lock:
+            calls += 1
+            position = calls
+        if position == 1:
+            first_loaded.set()
+            assert release_first.wait(timeout=5)
         return state
 
-    monkeypatch.setattr(status_store_module, "load_observer_state", synchronized_load)
+    monkeypatch.setattr(
+        status_store_module,
+        "_load_observer_state_unlocked",
+        synchronized_load,
+    )
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(
-            executor.map(
-                lambda run_id: status_store_module.acknowledge_run(path, run_id),
-                (11, 19),
-            )
-        )
-    monkeypatch.setattr(status_store_module, "load_observer_state", original_load)
+        first = executor.submit(status_store_module.acknowledge_run, path, 11)
+        assert first_loaded.wait(timeout=5)
+        second = executor.submit(status_store_module.acknowledge_run, path, 19)
+        release_first.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+    monkeypatch.setattr(
+        status_store_module,
+        "_load_observer_state_unlocked",
+        original_load,
+    )
 
     assert sorted(len(result.acknowledged_run_ids) for result in results) == [1, 2]
     assert set().union(*(result.acknowledged_run_ids for result in results)) == {
         11,
         19,
     }
-    assert original_load(path).acknowledged_run_ids == {11, 19}
+    assert status_store_module.load_observer_state(path).acknowledged_run_ids == {
+        11,
+        19,
+    }
 
 
 def test_acknowledgments_are_deterministically_pruned_and_keep_current_id(tmp_path):
@@ -2658,6 +2751,40 @@ def test_old_terminal_compile_run_does_not_suppress_queue_or_session_waits():
 
     assert waiting_queue.state == "waiting_queue"
     assert waiting_sessions.state == "waiting_sessions"
+
+
+def test_snapshot_keeps_old_compile_metadata_outside_recent(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        _insert_projection_run(
+            repository._connection,
+            run_id=99,
+            state="succeeded",
+            phase="succeeded",
+            updated_at=READ_NOW - timedelta(days=8),
+            project="memory",
+            summary="Updated 6 articles",
+            kind="compile",
+        )
+        repository._connection.commit()
+    monkeypatch.setattr(status_store_module, "_default_session_count", lambda: 0)
+    monkeypatch.setattr(
+        status_store_module,
+        "_default_daily_state",
+        lambda _path, _now: "uncompiled",
+    )
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert snapshot.compile.state == "ready"
+    assert snapshot.compile.run is not None
+    assert snapshot.compile.run.id == 99
+    assert snapshot.compile.run.summary == "Updated 6 articles"
+    assert all(run.id != 99 for run in snapshot.recent)
 
 
 def test_snapshot_reads_active_compile_reservation_without_queue_mutation(tmp_path):

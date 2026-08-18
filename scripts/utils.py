@@ -134,11 +134,19 @@ def _validate_private_regular_file(info: os.stat_result, path: Path) -> None:
         raise ValueError(f"state path must be a private regular file: {path}")
 
 
+def _canonicalize_secure_path(path: Path | str) -> Path:
+    """Resolve ancestor aliases while preserving the immediate parent and target."""
+    lexical = Path(os.path.abspath(Path(path).expanduser()))
+    parent = lexical.parent
+    canonical_ancestor = parent.parent.resolve(strict=False)
+    return canonical_ancestor / parent.name / lexical.name
+
+
 def read_private_bounded_file(path: Path | str, *, max_bytes: int) -> bytes | None:
     """Read a small owner-only regular file, retaining its verified descriptor."""
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
-    target = Path(os.path.abspath(Path(path).expanduser()))
+    target = _canonicalize_secure_path(path)
     if _PRIVATE_STATE_DIR_FD_SUPPORTED:
         return _read_private_bounded_file_posix(target, max_bytes=max_bytes)
     return _read_private_bounded_file_fallback(target, max_bytes=max_bytes)
@@ -326,7 +334,7 @@ def _validate_windows_inherited_directory(path: Path) -> None:
 
 def inspect_secure_read_file(path: Path | str) -> SecureReadIdentity:
     """Validate and identity-pin a private file for a later read-only consumer."""
-    target = Path(os.path.abspath(Path(path).expanduser()))
+    target = _canonicalize_secure_path(path)
     parent = target.parent
     _validate_no_linked_ancestors(parent)
     parent_before = parent.lstat()
@@ -691,7 +699,7 @@ def atomic_write_private_file(
         raise ValueError("max_bytes must be positive")
     if len(data) > max_bytes:
         raise ValueError(f"state payload exceeds {max_bytes} bytes")
-    target = Path(os.path.abspath(Path(path).expanduser()))
+    target = _canonicalize_secure_path(path)
     if _PRIVATE_STATE_DIR_FD_SUPPORTED:
         _atomic_write_private_file_posix(target, data, max_bytes=max_bytes)
     else:  # pragma: no cover - exercised on descriptor-limited platforms.
@@ -1437,7 +1445,7 @@ class ExclusiveFileLock:
 @contextmanager
 def secure_private_state_lock(state_path: Path | str) -> Iterator[None]:
     """Serialize one private-state mutation inside its secured directory."""
-    target = Path(os.path.abspath(Path(state_path).expanduser()))
+    target = _canonicalize_secure_path(state_path)
     _prepare_private_state_parent(target.parent)
     lock_path = target.parent / ".status-view.lock"
     lock = ExclusiveFileLock(lock_path)
