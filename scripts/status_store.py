@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, get_args
 
 try:
     from .privacy import normalize_persistence_reason
@@ -20,8 +22,8 @@ RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead
 EventLevel = Literal["info", "warning", "error"]
 type JsonScalar = str | int | float | bool | None
 
-_RUN_STATES = frozenset({"queued", "running", "retrying", "succeeded", "failed", "dead"})
-_EVENT_LEVELS = frozenset({"info", "warning", "error"})
+_RUN_STATES = frozenset(get_args(RunState))
+_EVENT_LEVELS = frozenset(get_args(EventLevel))
 
 ALLOWED_PHASES = frozenset(
     {
@@ -70,6 +72,14 @@ def normalize_status_reason(
     if value is None:
         return None
     return normalize_persistence_reason(value, env)
+
+
+def normalize_event_message(
+    value: object | None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Normalize optional informational text without fabricating an error."""
+    return normalize_summary(value, env)
 
 
 def normalize_summary(
@@ -177,9 +187,324 @@ class StatusEvent:
             raise ValueError(f"invalid status phase: {self.phase!r}")
         if self.level not in _EVENT_LEVELS:
             raise ValueError(f"invalid status event level: {self.level!r}")
+        if self.attempt is not None and (
+            isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or self.attempt < 1
+        ):
+            raise ValueError("status event attempt must be a positive integer")
         object.__setattr__(
             self,
             "message",
-            normalize_status_reason(self.message, redaction_env or {}),
+            normalize_event_message(self.message, redaction_env),
         )
         object.__setattr__(self, "details", normalize_details(self.details))
+
+
+def _stored_time(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("status timestamps must be timezone-aware")
+    return value.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def _loaded_time(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("persisted status timestamp must be timezone-aware")
+    return parsed.astimezone(UTC)
+
+
+def status_run_from_row(
+    row: sqlite3.Row,
+    *,
+    redaction_env: Mapping[str, str] | None = None,
+) -> StatusRun:
+    """Build and validate an immutable run from a SQLite row."""
+    started_at = _loaded_time(row["started_at"])
+    updated_at = _loaded_time(row["updated_at"])
+    if started_at is None or updated_at is None:
+        raise ValueError("persisted status run is missing a required timestamp")
+    return StatusRun(
+        id=row["id"],
+        job_id=row["job_id"],
+        operation_key=row["operation_key"],
+        kind=row["kind"],
+        source_agent=row["source_agent"],
+        session_id=row["session_id"],
+        project=row["project"],
+        state=row["state"],
+        phase=row["phase"],
+        summary=row["summary"],
+        error=row["error"],
+        started_at=started_at,
+        updated_at=updated_at,
+        completed_at=_loaded_time(row["completed_at"]),
+        redaction_env=redaction_env,
+    )
+
+
+def status_event_from_row(
+    row: sqlite3.Row,
+    *,
+    redaction_env: Mapping[str, str] | None = None,
+) -> StatusEvent:
+    """Build and validate an immutable event from a SQLite row."""
+    created_at = _loaded_time(row["created_at"])
+    if created_at is None:
+        raise ValueError("persisted status event is missing its timestamp")
+    details = json.loads(row["details_json"])
+    if not isinstance(details, dict):
+        raise TypeError("persisted status event details must be a JSON object")
+    return StatusEvent(
+        id=row["id"],
+        run_id=row["run_id"],
+        phase=row["phase"],
+        level=row["level"],
+        provider=row["provider"],
+        attempt=row["attempt"],
+        message=row["message"],
+        details=details,
+        created_at=created_at,
+        redaction_env=redaction_env,
+    )
+
+
+def create_job_run_unlocked(
+    connection: sqlite3.Connection,
+    *,
+    job_id: int,
+    kind: str,
+    source_agent: str,
+    session_id: str,
+    project: str,
+    now: datetime,
+    redaction_env: Mapping[str, str] | None = None,
+) -> int:
+    """Create a queued job run using the caller's existing transaction."""
+    candidate = StatusRun(
+        id=0,
+        job_id=job_id,
+        operation_key=None,
+        kind=kind,
+        source_agent=source_agent,
+        session_id=session_id,
+        project=project,
+        state="queued",
+        phase="queued",
+        summary=None,
+        error=None,
+        started_at=now,
+        updated_at=now,
+        completed_at=None,
+        redaction_env=redaction_env,
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO status_runs (
+            job_id, kind, source_agent, session_id, project, state, phase,
+            summary, error, started_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.job_id,
+            candidate.kind,
+            candidate.source_agent,
+            candidate.session_id,
+            candidate.project,
+            candidate.state,
+            candidate.phase,
+            candidate.summary,
+            candidate.error,
+            _stored_time(candidate.started_at),
+            _stored_time(candidate.updated_at),
+            None,
+        ),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError("created status run has no identifier")
+    return cursor.lastrowid
+
+
+def create_operation_run_unlocked(
+    connection: sqlite3.Connection,
+    *,
+    operation_key: str,
+    kind: str,
+    source_agent: str,
+    session_id: str,
+    project: str,
+    phase: str,
+    now: datetime,
+    redaction_env: Mapping[str, str] | None = None,
+) -> int:
+    """Create a queued non-job run using the caller's transaction."""
+    if not operation_key.strip():
+        raise ValueError("operation_key must not be empty")
+    candidate = StatusRun(
+        id=0,
+        job_id=None,
+        operation_key=operation_key,
+        kind=kind,
+        source_agent=source_agent,
+        session_id=session_id,
+        project=project,
+        state="queued",
+        phase=phase,
+        summary=None,
+        error=None,
+        started_at=now,
+        updated_at=now,
+        completed_at=None,
+        redaction_env=redaction_env,
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO status_runs (
+            operation_key, kind, source_agent, session_id, project, state, phase,
+            summary, error, started_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.operation_key,
+            candidate.kind,
+            candidate.source_agent,
+            candidate.session_id,
+            candidate.project,
+            candidate.state,
+            candidate.phase,
+            candidate.summary,
+            candidate.error,
+            _stored_time(candidate.started_at),
+            _stored_time(candidate.updated_at),
+            None,
+        ),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError("created status run has no identifier")
+    return cursor.lastrowid
+
+
+def append_event_unlocked(
+    connection: sqlite3.Connection,
+    run_id: int,
+    phase: str,
+    *,
+    now: datetime,
+    level: EventLevel = "info",
+    provider: str | None = None,
+    attempt: int | None = None,
+    message: str | None = None,
+    details: Mapping[str, JsonScalar] | None = None,
+    redaction_env: Mapping[str, str] | None = None,
+) -> int:
+    """Append a validated event using the caller's existing transaction."""
+    candidate = StatusEvent(
+        id=0,
+        run_id=run_id,
+        phase=phase,
+        level=level,
+        provider=provider,
+        attempt=attempt,
+        message=message,
+        details={} if details is None else details,
+        created_at=now,
+        redaction_env=redaction_env,
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO status_events (
+            run_id, phase, level, provider, attempt, message, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.run_id,
+            candidate.phase,
+            candidate.level,
+            candidate.provider,
+            candidate.attempt,
+            candidate.message,
+            json.dumps(dict(candidate.details), sort_keys=True, separators=(",", ":")),
+            _stored_time(candidate.created_at),
+        ),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError("created status event has no identifier")
+    return cursor.lastrowid
+
+
+def transition_run_unlocked(
+    connection: sqlite3.Connection,
+    run_id: int,
+    state: RunState,
+    phase: str,
+    *,
+    now: datetime,
+    summary: str | None = None,
+    error: str | None = None,
+    completed_at: datetime | None = None,
+    level: EventLevel = "info",
+    provider: str | None = None,
+    attempt: int | None = None,
+    message: str | None = None,
+    details: Mapping[str, JsonScalar] | None = None,
+    redaction_env: Mapping[str, str] | None = None,
+) -> None:
+    """Update a run and append its matching event in the caller's transaction."""
+    row = connection.execute(
+        "SELECT * FROM status_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        raise KeyError(run_id)
+    existing = status_run_from_row(row, redaction_env=redaction_env)
+    candidate = StatusRun(
+        id=existing.id,
+        job_id=existing.job_id,
+        operation_key=existing.operation_key,
+        kind=existing.kind,
+        source_agent=existing.source_agent,
+        session_id=existing.session_id,
+        project=existing.project,
+        state=state,
+        phase=phase,
+        summary=summary,
+        error=error,
+        started_at=existing.started_at,
+        updated_at=now,
+        completed_at=completed_at,
+        redaction_env=redaction_env,
+    )
+    connection.execute(
+        """
+        UPDATE status_runs
+        SET state = ?, phase = ?, summary = ?, error = ?, updated_at = ?,
+            completed_at = ?
+        WHERE id = ?
+        """,
+        (
+            candidate.state,
+            candidate.phase,
+            candidate.summary,
+            candidate.error,
+            _stored_time(candidate.updated_at),
+            (
+                _stored_time(candidate.completed_at)
+                if candidate.completed_at is not None
+                else None
+            ),
+            candidate.id,
+        ),
+    )
+    append_event_unlocked(
+        connection,
+        run_id,
+        phase,
+        now=now,
+        level=level,
+        provider=provider,
+        attempt=attempt,
+        message=message,
+        details=details,
+        redaction_env=redaction_env,
+    )

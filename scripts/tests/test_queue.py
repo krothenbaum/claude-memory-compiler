@@ -73,6 +73,12 @@ def test_same_agent_session_and_hash_deduplicates(repository, tmp_path):
     assert second.created is False
     assert second.job_id == first.job_id
     assert repository.count_jobs() == 1
+    run = repository.status_run_for_job(first.job_id)
+    assert run.job_id == first.job_id
+    assert run.state == "queued"
+    assert run.phase == "queued"
+    assert run.started_at == NOW
+    assert [event.phase for event in repository.status_events(run.id)] == ["queued"]
 
 
 def test_same_session_id_from_different_agents_is_distinct(repository, tmp_path):
@@ -115,6 +121,13 @@ def test_claim_is_atomic_and_cannot_be_claimed_twice(tmp_path):
         assert claimed is not None and claimed.id == job_id
         assert claimed.status == "leased"
         assert claimed.attempt_count == 1
+        run = first.status_run_for_job(job_id)
+        assert run.state == "running"
+        assert run.phase == "worker_claimed"
+        assert [event.phase for event in first.status_events(run.id)] == [
+            "queued",
+            "worker_claimed",
+        ]
         assert second.claim_next("worker-b", NOW, 120) is None
 
 
@@ -159,7 +172,30 @@ def test_recover_stale_makes_expired_lease_retryable(repository, tmp_path):
     assert recovered.status == "failed"
     assert recovered.lease_owner is None
     assert recovered.lease_expires_at is None
+    run = repository.status_run_for_job(job_id)
+    assert run.state == "retrying"
+    assert run.phase == "recovery_pending"
+    assert run.error == "worker lease expired"
+    assert run.completed_at is None
+    assert repository.status_events(run.id)[-1].phase == "recovery_pending"
     assert repository.claim_next("new-worker", NOW + timedelta(seconds=31), 30).id == job_id
+
+
+def test_recover_stale_dead_letters_jobs_at_the_attempt_limit(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, max_attempts=1) as repository:
+        job_id = repository.enqueue_capture(session(tmp_path)).job_id
+        repository.claim_next("dead-worker", NOW, 30)
+
+        assert repository.recover_stale(NOW + timedelta(seconds=31)) == 1
+
+        run = repository.status_run_for_job(job_id)
+        assert repository.get_job(job_id).status == "dead"
+        assert run.state == "dead"
+        assert run.phase == "dead"
+        assert run.error == "worker lease expired"
+        assert run.completed_at == NOW + timedelta(seconds=31)
+        assert repository.status_events(run.id)[-1].phase == "dead"
 
 
 def test_retry_respects_backoff_and_owner(repository, tmp_path):
@@ -171,6 +207,16 @@ def test_retry_respects_backoff_and_owner(repository, tmp_path):
         repository.retry(job_id, "other", "no", available)
     repository.retry(job_id, "worker", "both failed", available)
 
+    run = repository.status_run_for_job(job_id)
+    assert run.state == "retrying"
+    assert run.phase == "retry_wait"
+    assert run.error == "both failed"
+    assert run.summary == "both failed"
+    retry_event = repository.status_events(run.id)[-1]
+    assert retry_event.phase == "retry_wait"
+    assert retry_event.level == "warning"
+    assert retry_event.details == {"retry_at": available.isoformat(timespec="microseconds")}
+
     assert repository.claim_next("worker", NOW + timedelta(minutes=4), 30) is None
     assert repository.claim_next("worker", available, 30).id == job_id
 
@@ -180,10 +226,15 @@ def test_complete_and_dead_letter_transitions(tmp_path):
     with QueueRepository(path, clock=lambda: NOW, max_attempts=2) as repository:
         success_id = repository.enqueue_capture(session(tmp_path, session_id="ok")).job_id
         repository.claim_next("worker", NOW, 30)
-        repository.complete(success_id, "worker")
+        repository.complete(success_id, "worker", summary="Saved 1,842 characters")
         succeeded = repository.get_job(success_id)
         assert succeeded.status == "succeeded"
         assert succeeded.completed_at == NOW
+        success_run = repository.status_run_for_job(success_id)
+        assert success_run.state == "succeeded"
+        assert success_run.phase == "succeeded"
+        assert success_run.summary == "Saved 1,842 characters"
+        assert success_run.completed_at == NOW
 
         dead_id = repository.enqueue_capture(session(tmp_path, session_id="dead")).job_id
         repository.claim_next("worker", NOW, 30)
@@ -194,6 +245,42 @@ def test_complete_and_dead_letter_transitions(tmp_path):
         assert dead.status == "dead"
         assert dead.completed_at == NOW
         assert dead.last_error == "second"
+        dead_run = repository.status_run_for_job(dead_id)
+        assert dead_run.state == "dead"
+        assert dead_run.phase == "dead"
+        assert dead_run.error == "second"
+        assert dead_run.summary == "second"
+        assert dead_run.completed_at == NOW
+
+
+def test_status_event_failure_rolls_back_queue_completion(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository.claim_next("worker", NOW, 30)
+    repository._connection.execute(
+        """
+        CREATE TRIGGER reject_succeeded_status_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'succeeded'
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled status insert failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="controlled status insert failure"):
+        repository.complete(job_id, "worker", summary="must roll back")
+
+    job = repository.get_job(job_id)
+    run = repository.status_run_for_job(job_id)
+    assert job.status == "leased"
+    assert job.lease_owner == "worker"
+    assert run.state == "running"
+    assert run.phase == "worker_claimed"
+    assert run.summary is None
+    assert [event.phase for event in repository.status_events(run.id)] == [
+        "queued",
+        "worker_claimed",
+    ]
 
 
 def test_queue_database_and_sidecars_are_owner_only_with_typical_umask(tmp_path):

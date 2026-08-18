@@ -17,6 +17,20 @@ from typing import Callable, Literal, Mapping, TypeAlias
 try:
     from .privacy import normalize_persistence_reason
     from .providers import ProviderResult
+    from .status_store import (
+        ALLOWED_PHASES,
+        EventLevel,
+        JsonScalar,
+        RunState,
+        StatusEvent,
+        StatusRun,
+        append_event_unlocked,
+        create_job_run_unlocked,
+        create_operation_run_unlocked,
+        status_event_from_row,
+        status_run_from_row,
+        transition_run_unlocked,
+    )
     from .transcripts import NormalizedSession, render_turns
     from .usage import (
         UnsafeUsagePathError,
@@ -28,6 +42,20 @@ try:
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from privacy import normalize_persistence_reason
     from providers import ProviderResult
+    from status_store import (
+        ALLOWED_PHASES,
+        EventLevel,
+        JsonScalar,
+        RunState,
+        StatusEvent,
+        StatusRun,
+        append_event_unlocked,
+        create_job_run_unlocked,
+        create_operation_run_unlocked,
+        status_event_from_row,
+        status_run_from_row,
+        transition_run_unlocked,
+    )
     from transcripts import NormalizedSession, render_turns
     from usage import (
         UnsafeUsagePathError,
@@ -388,13 +416,275 @@ class QueueRepository:
                 COMMIT;
                 """
             )
+        except BaseException as error:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            if (
+                isinstance(error, sqlite3.OperationalError)
+                and self._connection.execute("PRAGMA user_version").fetchone()[0]
+                == SCHEMA_VERSION
+            ):
+                return
+            raise
+
+    def _now(self) -> datetime:
+        return _datetime(self._clock())
+
+    def status_run_for_job(self, job_id: int) -> StatusRun:
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return status_run_from_row(row, redaction_env=self._redaction_env)
+
+    def _ensure_job_run_unlocked(self, job_id: int) -> StatusRun:
+        """Create status history lazily for an active pre-v3 queue job."""
+        try:
+            return self.status_run_for_job(job_id)
+        except KeyError:
+            job = self._connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise
+            started_at = _loaded_time(job["created_at"])
+            if started_at is None:
+                raise ValueError("queue job is missing its creation timestamp")
+            run_id = create_job_run_unlocked(
+                self._connection,
+                job_id=job["id"],
+                kind=job["kind"],
+                source_agent=job["source_agent"],
+                session_id=job["session_id"],
+                project=job["project"],
+                now=started_at,
+                redaction_env=self._redaction_env,
+            )
+            append_event_unlocked(
+                self._connection,
+                run_id,
+                "queued",
+                now=started_at,
+                redaction_env=self._redaction_env,
+            )
+            return self.status_run_for_job(job_id)
+
+    def status_run_for_operation(self, operation_key: str) -> StatusRun | None:
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE operation_key = ?", (operation_key,)
+        ).fetchone()
+        return (
+            status_run_from_row(row, redaction_env=self._redaction_env)
+            if row is not None
+            else None
+        )
+
+    def status_events(self, run_id: int) -> tuple[StatusEvent, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM status_events WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        return tuple(
+            status_event_from_row(row, redaction_env=self._redaction_env)
+            for row in rows
+        )
+
+    def _append_run_event(
+        self,
+        run: StatusRun,
+        phase: str,
+        *,
+        level: EventLevel,
+        provider: str | None,
+        attempt: int | None,
+        message: str | None,
+        details: Mapping[str, JsonScalar] | None,
+    ) -> None:
+        transition_run_unlocked(
+            self._connection,
+            run.id,
+            run.state,
+            phase,
+            now=self._now(),
+            summary=run.summary,
+            error=run.error,
+            completed_at=run.completed_at,
+            level=level,
+            provider=provider,
+            attempt=attempt,
+            message=message,
+            details=details,
+            redaction_env=self._redaction_env,
+        )
+
+    def append_job_event(
+        self,
+        job_id: int,
+        phase: str,
+        *,
+        level: EventLevel = "info",
+        provider: str | None = None,
+        attempt: int | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self.status_run_for_job(job_id)
+            self._append_run_event(
+                run,
+                phase,
+                level=level,
+                provider=provider,
+                attempt=attempt,
+                message=message,
+                details=details,
+            )
+            self._connection.execute("COMMIT")
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
             raise
 
-    def _now(self) -> datetime:
-        return _datetime(self._clock())
+    def create_operation_run(
+        self,
+        operation_key: str,
+        *,
+        kind: str,
+        source_agent: str,
+        session_id: str,
+        project: str,
+        phase: str = "reserved",
+    ) -> StatusRun:
+        if phase not in ALLOWED_PHASES:
+            raise ValueError(f"invalid status phase: {phase!r}")
+        if not operation_key.strip():
+            raise ValueError("operation_key must not be empty")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.status_run_for_operation(operation_key)
+            if existing is not None:
+                identity = (kind, source_agent, session_id, project)
+                persisted_identity = (
+                    existing.kind,
+                    existing.source_agent,
+                    existing.session_id,
+                    existing.project,
+                )
+                if persisted_identity != identity:
+                    raise ValueError("operation_key is already used by another operation")
+                self._connection.execute("COMMIT")
+                return existing
+            now = self._now()
+            run_id = create_operation_run_unlocked(
+                self._connection,
+                operation_key=operation_key,
+                kind=kind,
+                source_agent=source_agent,
+                session_id=session_id,
+                project=project,
+                phase=phase,
+                now=now,
+                redaction_env=self._redaction_env,
+            )
+            append_event_unlocked(
+                self._connection,
+                run_id,
+                phase,
+                now=now,
+                redaction_env=self._redaction_env,
+            )
+            created = self.status_run_for_operation(operation_key)
+            if created is None:  # Defensive: insert and readback share a transaction.
+                raise RuntimeError("created operation status could not be read back")
+            self._connection.execute("COMMIT")
+            return created
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def append_operation_event(
+        self,
+        run_id: int,
+        phase: str,
+        *,
+        level: EventLevel = "info",
+        provider: str | None = None,
+        attempt: int | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            run = status_run_from_row(row, redaction_env=self._redaction_env)
+            self._append_run_event(
+                run,
+                phase,
+                level=level,
+                provider=provider,
+                attempt=attempt,
+                message=message,
+                details=details,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def transition_operation_run(
+        self,
+        run_id: int,
+        state: RunState,
+        phase: str,
+        *,
+        summary: str | None = None,
+        error: str | None = None,
+        level: EventLevel = "info",
+        provider: str | None = None,
+        attempt: int | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        now = self._now()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT id FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            transition_run_unlocked(
+                self._connection,
+                run_id,
+                state,
+                phase,
+                now=now,
+                summary=summary,
+                error=error,
+                completed_at=(
+                    now if state in {"succeeded", "failed", "dead"} else None
+                ),
+                level=level,
+                provider=provider,
+                attempt=attempt,
+                message=message,
+                details=details,
+                redaction_env=self._redaction_env,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     @property
     def queue_id(self) -> str:
@@ -427,7 +717,8 @@ class QueueRepository:
         )
 
     def enqueue_capture(self, session: NormalizedSession) -> EnqueueResult:
-        now = _stored_time(self._now())
+        now_dt = self._now()
+        now = _stored_time(now_dt)
         payload = json.dumps(
             {
                 "timestamp": session.timestamp,
@@ -437,39 +728,75 @@ class QueueRepository:
             sort_keys=True,
             separators=(",", ":"),
         )
-        cursor = self._connection.execute(
-            """
-            INSERT OR IGNORE INTO jobs (
-                kind, source_agent, session_id, project, cwd, trigger, source_path,
-                source_hash, payload_json, status, attempt_count, available_at,
-                created_at, updated_at
-            ) VALUES ('capture', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-            """,
-            (
-                session.agent,
-                session.session_id,
-                session.project,
-                session.cwd,
-                session.trigger,
-                session.source_path,
-                session.source_hash,
-                payload,
-                now,
-                now,
-                now,
-            ),
-        )
-        created = cursor.rowcount == 1
-        row = self._connection.execute(
-            """
-            SELECT * FROM jobs
-            WHERE kind = 'capture' AND source_agent = ? AND session_id = ? AND source_hash = ?
-            """,
-            (session.agent, session.session_id, session.source_hash),
-        ).fetchone()
-        if row is None:  # Defensive: the insert/select are on one connection.
-            raise RuntimeError("enqueued capture could not be read back")
-        return EnqueueResult(self._job(row), created)
+        owns_transaction = not self._connection.in_transaction
+        if owns_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute("SAVEPOINT enqueue_capture_status")
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT OR IGNORE INTO jobs (
+                    kind, source_agent, session_id, project, cwd, trigger, source_path,
+                    source_hash, payload_json, status, attempt_count, available_at,
+                    created_at, updated_at
+                ) VALUES ('capture', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    session.agent,
+                    session.session_id,
+                    session.project,
+                    session.cwd,
+                    session.trigger,
+                    session.source_path,
+                    session.source_hash,
+                    payload,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = self._connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE kind = 'capture' AND source_agent = ? AND session_id = ?
+                    AND source_hash = ?
+                """,
+                (session.agent, session.session_id, session.source_hash),
+            ).fetchone()
+            if row is None:  # Defensive: insert and readback share this transaction.
+                raise RuntimeError("enqueued capture could not be read back")
+            if created:
+                run_id = create_job_run_unlocked(
+                    self._connection,
+                    job_id=row["id"],
+                    kind=row["kind"],
+                    source_agent=row["source_agent"],
+                    session_id=row["session_id"],
+                    project=row["project"],
+                    now=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+                append_event_unlocked(
+                    self._connection,
+                    run_id,
+                    "queued",
+                    now=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+            result = EnqueueResult(self._job(row), created)
+            self._connection.execute(
+                "COMMIT" if owns_transaction else "RELEASE enqueue_capture_status"
+            )
+            return result
+        except BaseException:
+            if owns_transaction and self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            elif self._connection.in_transaction:
+                self._connection.execute("ROLLBACK TO enqueue_capture_status")
+                self._connection.execute("RELEASE enqueue_capture_status")
+            raise
 
     def claim_next(
         self,
@@ -510,6 +837,15 @@ class QueueRepository:
             claimed = self._connection.execute(
                 "SELECT * FROM jobs WHERE id = ?", (row["id"],)
             ).fetchone()
+            run = self._ensure_job_run_unlocked(row["id"])
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "running",
+                "worker_claimed",
+                now=now_dt,
+                redaction_env=self._redaction_env,
+            )
             self._connection.execute("COMMIT")
             return self._job(claimed)
         except BaseException:
@@ -648,19 +984,44 @@ class QueueRepository:
         """Recover and project usage after the caller owns worker singleton."""
         self._sync_usage_records()
 
-    def complete(self, job_id: int, owner: str) -> None:
-        now = _stored_time(self._now())
-        cursor = self._connection.execute(
-            """
-            UPDATE jobs
-            SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
-                last_error = NULL, updated_at = ?, completed_at = ?
-            WHERE id = ? AND status = 'leased' AND lease_owner = ?
-            """,
-            (now, now, job_id, owner),
-        )
-        if cursor.rowcount != 1:
-            raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+    def complete(
+        self,
+        job_id: int,
+        owner: str,
+        *,
+        summary: str | None = None,
+    ) -> None:
+        now_dt = self._now()
+        now = _stored_time(now_dt)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = NULL, updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                """,
+                (now, now, job_id, owner),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self._ensure_job_run_unlocked(job_id)
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "succeeded",
+                "succeeded",
+                now=now_dt,
+                summary=summary,
+                completed_at=now_dt,
+                redaction_env=self._redaction_env,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def retry(
         self,
@@ -680,8 +1041,11 @@ class QueueRepository:
             ).fetchone()
             if row is None:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
-            now = _stored_time(self._now())
+            now_dt = self._now()
+            now = _stored_time(now_dt)
             dead = row["attempt_count"] >= self.max_attempts
+            normalized_error = normalize_persistence_reason(error, self._redaction_env)
+            retry_at = _stored_time(available_at)
             cursor = self._connection.execute(
                 """
                 UPDATE jobs
@@ -691,8 +1055,8 @@ class QueueRepository:
                 """,
                 (
                     "dead" if dead else "failed",
-                    _stored_time(available_at),
-                    normalize_persistence_reason(error, self._redaction_env),
+                    retry_at,
+                    normalized_error,
                     now,
                     now if dead else None,
                     job_id,
@@ -701,6 +1065,21 @@ class QueueRepository:
             )
             if cursor.rowcount != 1:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self._ensure_job_run_unlocked(job_id)
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "dead" if dead else "retrying",
+                "dead" if dead else "retry_wait",
+                now=now_dt,
+                summary=normalized_error,
+                error=normalized_error,
+                completed_at=now_dt if dead else None,
+                level="error" if dead else "warning",
+                message=normalized_error,
+                details=None if dead else {"retry_at": retry_at},
+                redaction_env=self._redaction_env,
+            )
             self._connection.execute("COMMIT")
         except BaseException:
             if self._connection.in_transaction:
@@ -708,19 +1087,58 @@ class QueueRepository:
             raise
 
     def recover_stale(self, now: datetime | str | int | float) -> int:
-        now_value = _stored_time(now)
-        cursor = self._connection.execute(
-            """
-            UPDATE jobs
-            SET status = CASE WHEN attempt_count >= ? THEN 'dead' ELSE 'failed' END,
-                available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-                last_error = 'worker lease expired', updated_at = ?,
-                completed_at = CASE WHEN attempt_count >= ? THEN ? ELSE NULL END
-            WHERE status = 'leased' AND lease_expires_at <= ?
-            """,
-            (self.max_attempts, now_value, now_value, self.max_attempts, now_value, now_value),
-        )
-        return cursor.rowcount
+        now_dt = _datetime(now)
+        now_value = _stored_time(now_dt)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            stale = self._connection.execute(
+                """
+                SELECT id, attempt_count FROM jobs
+                WHERE status = 'leased' AND lease_expires_at <= ?
+                ORDER BY id
+                """,
+                (now_value,),
+            ).fetchall()
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET status = CASE WHEN attempt_count >= ? THEN 'dead' ELSE 'failed' END,
+                    available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = 'worker lease expired', updated_at = ?,
+                    completed_at = CASE WHEN attempt_count >= ? THEN ? ELSE NULL END
+                WHERE status = 'leased' AND lease_expires_at <= ?
+                """,
+                (
+                    self.max_attempts,
+                    now_value,
+                    now_value,
+                    self.max_attempts,
+                    now_value,
+                    now_value,
+                ),
+            )
+            for job in stale:
+                dead = job["attempt_count"] >= self.max_attempts
+                run = self._ensure_job_run_unlocked(job["id"])
+                transition_run_unlocked(
+                    self._connection,
+                    run.id,
+                    "dead" if dead else "retrying",
+                    "dead" if dead else "recovery_pending",
+                    now=now_dt,
+                    summary="worker lease expired",
+                    error="worker lease expired",
+                    completed_at=now_dt if dead else None,
+                    level="error" if dead else "warning",
+                    message="worker lease expired",
+                    redaction_env=self._redaction_env,
+                )
+            self._connection.execute("COMMIT")
+            return cursor.rowcount
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def get_job(self, job_id: int) -> Job:
         row = self._connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()

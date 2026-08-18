@@ -6,12 +6,15 @@ import sys
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 from scripts.queue import QueueRepository
 from scripts.status_store import (
     ALLOWED_PHASES,
+    EventLevel,
+    RunState,
     StatusEvent,
     StatusRun,
     normalize_details,
@@ -146,6 +149,29 @@ def test_version_2_migration_preserves_jobs_and_attempts(tmp_path):
             )
         ] == [(73, 41, "codex", "success")]
         assert {"status_runs", "status_events"} <= _table_names(repository._connection)
+
+
+def test_claiming_a_migrated_active_job_creates_its_status_timeline(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_version_2_queue(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE jobs SET status = 'pending', attempt_count = 0, completed_at = NULL"
+    )
+    connection.commit()
+    connection.close()
+
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        claimed = repository.claim_next("worker", NOW, 30)
+
+        assert claimed is not None
+        run = repository.status_run_for_job(claimed.id)
+        assert run.state == "running"
+        assert run.phase == "worker_claimed"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "queued",
+            "worker_claimed",
+        ]
 
 
 def test_fresh_queue_contains_version_3_status_schema(tmp_path):
@@ -418,6 +444,13 @@ def test_status_domain_types_are_immutable_and_copy_event_details():
     assert event.details == {"chars_saved": 120}
 
 
+def test_runtime_status_vocabularies_match_the_literal_types():
+    for state in get_args(RunState):
+        assert _status_run(state=state).state == state
+    for level in get_args(EventLevel):
+        assert _status_event(level=level).level == level
+
+
 def test_allowed_phases_cover_flush_and_compile_lifecycles():
     assert ALLOWED_PHASES == frozenset(
         {
@@ -571,6 +604,12 @@ def test_status_event_rejects_invalid_level(level):
         _status_event(level=level)
 
 
+@pytest.mark.parametrize("attempt", [0, -1, True, "1"])
+def test_status_event_rejects_invalid_attempt(attempt):
+    with pytest.raises(ValueError, match="attempt"):
+        _status_event(attempt=attempt)
+
+
 def test_status_records_normalize_and_redact_all_persisted_text():
     secret = "credential-value-never-persist"
     env = {"OPENAI_API_KEY": secret}
@@ -590,6 +629,115 @@ def test_status_records_normalize_and_redact_all_persisted_text():
         assert "[REDACTED]" in text
         assert "\n" not in text
         assert len(text) == 1_000
+
+
+def test_optional_event_message_normalizes_whitespace_to_none():
+    assert _status_event(message=" \n\t ").message is None
+
+
+def test_operation_runs_are_idempotent_and_have_a_queryable_timeline(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(
+        path,
+        clock=lambda: NOW,
+        redaction_env={"OPENAI_API_KEY": "operation-secret"},
+        sync_usage=False,
+    ) as repository:
+        first = repository.create_operation_run(
+            "auto-compile:2026-08-18:abc",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+        second = repository.create_operation_run(
+            "auto-compile:2026-08-18:abc",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+
+        assert first == second
+        assert first.operation_key is not None
+        assert repository.status_run_for_operation(first.operation_key) == first
+        assert [event.phase for event in repository.status_events(first.id)] == [
+            "reserved"
+        ]
+
+        repository.append_operation_event(
+            first.id,
+            "provider_started",
+            provider="codex",
+            attempt=1,
+            message="  Calling operation-secret\nnow  ",
+            details={"elapsed_ms": 0},
+        )
+        running = repository.status_run_for_operation(first.operation_key)
+        assert running is not None
+        assert running.phase == "provider_started"
+        assert running.state == "queued"
+        assert [event.phase for event in repository.status_events(first.id)] == [
+            "reserved",
+            "provider_started",
+        ]
+        assert repository.status_events(first.id)[-1].message == "Calling [REDACTED] now"
+
+
+def test_operation_transition_updates_summary_error_and_completion_atomically(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:def",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+
+        assert run.operation_key is not None
+        repository.transition_operation_run(
+            run.id,
+            "succeeded",
+            "succeeded",
+            summary=" Updated 6 articles ",
+            message="Compile complete",
+            details={"changed_files": 6},
+        )
+
+        completed = repository.status_run_for_operation(run.operation_key)
+        assert completed is not None
+        assert completed.state == "succeeded"
+        assert completed.phase == "succeeded"
+        assert completed.summary == "Updated 6 articles"
+        assert completed.error is None
+        assert completed.completed_at == NOW
+        terminal = repository.status_events(run.id)[-1]
+        assert terminal.phase == "succeeded"
+        assert terminal.message == "Compile complete"
+        assert terminal.details == {"changed_files": 6}
+
+
+def test_idempotent_operation_creation_still_validates_requested_phase(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        repository.create_operation_run(
+            "auto-compile:2026-08-18:phase",
+            kind="compile",
+            source_agent="system",
+            session_id="2026-08-18",
+            project="memory",
+        )
+
+        with pytest.raises(ValueError, match="phase"):
+            repository.create_operation_run(
+                "auto-compile:2026-08-18:phase",
+                kind="compile",
+                source_agent="system",
+                session_id="2026-08-18",
+                project="memory",
+                phase="provider_output",
+            )
 
 
 def test_details_accept_only_safe_scalar_json_metadata():
