@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -1920,6 +1921,193 @@ def test_observer_write_rejects_writable_parent_and_preserves_prior(tmp_path):
         status_store_module.acknowledge_run(target, 2)
 
     assert target.read_bytes() == prior
+
+
+def _force_windows_observer_fallback(
+    monkeypatch,
+    *,
+    validate_directory,
+    validate_file,
+    secure_directory=lambda _path, *, owner_only: None,
+    secure_file=lambda _descriptor, _path: None,
+):
+    monkeypatch.setattr(utils_module, "_PRIVATE_STATE_DIR_FD_SUPPORTED", False)
+    monkeypatch.setattr(utils_module, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(
+        utils_module,
+        "_validate_windows_owner_only_directory",
+        validate_directory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        utils_module,
+        "_validate_windows_owner_only_file_descriptor",
+        validate_file,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        utils_module,
+        "_secure_windows_runtime_directory",
+        secure_directory,
+    )
+    monkeypatch.setattr(utils_module, "_secure_windows_runtime_file", secure_file)
+
+
+def test_windows_observer_read_rejects_nonprivate_parent_acl(tmp_path, monkeypatch):
+    parent = tmp_path / "scripts"
+    parent.mkdir()
+    target = parent / "status-view.json"
+    target.write_text('{"version":1,"acknowledged_run_ids":[1]}')
+    target.chmod(0o600)
+    _force_windows_observer_fallback(
+        monkeypatch,
+        validate_directory=lambda _path: (_ for _ in ()).throw(
+            PermissionError("directory ACL is not owner-only")
+        ),
+        validate_file=lambda *_: pytest.fail("unsafe parent should stop file open"),
+    )
+
+    assert status_store_module.load_observer_state(target) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+def test_windows_observer_read_rejects_nonprivate_file_acl(tmp_path, monkeypatch):
+    parent = tmp_path / "scripts"
+    parent.mkdir()
+    target = parent / "status-view.json"
+    target.write_text('{"version":1,"acknowledged_run_ids":[1]}')
+    target.chmod(0o600)
+    _force_windows_observer_fallback(
+        monkeypatch,
+        validate_directory=lambda _path: None,
+        validate_file=lambda *_: (_ for _ in ()).throw(
+            PermissionError("file ACL is not owner-only")
+        ),
+    )
+
+    assert status_store_module.load_observer_state(target) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+@pytest.mark.parametrize("unsafe_boundary", ["parent", "file"])
+def test_windows_observer_write_rejects_unsafe_acl_and_preserves_prior(
+    tmp_path, monkeypatch, unsafe_boundary
+):
+    parent = tmp_path / "scripts"
+    parent.mkdir()
+    target = parent / "status-view.json"
+    status_store_module.acknowledge_run(target, 1)
+    prior = target.read_bytes()
+
+    def validate_directory(_path):
+        if unsafe_boundary == "parent":
+            raise PermissionError("directory ACL is not owner-only")
+
+    def validate_file(_descriptor, _path):
+        if unsafe_boundary == "file":
+            raise PermissionError("file ACL is not owner-only")
+
+    _force_windows_observer_fallback(
+        monkeypatch,
+        validate_directory=validate_directory,
+        validate_file=validate_file,
+    )
+
+    with pytest.raises(PermissionError, match="ACL is not owner-only"):
+        status_store_module.acknowledge_run(target, 2)
+
+    assert target.read_bytes() == prior
+
+
+def test_windows_observer_write_secures_new_parent_temp_and_final_file(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "memory" / "scripts" / "status-view.json"
+    secured_directories: list[tuple[Path, bool]] = []
+    secured_files: list[Path] = []
+    validated_directories: list[Path] = []
+    validated_files: list[Path] = []
+    _force_windows_observer_fallback(
+        monkeypatch,
+        validate_directory=lambda path: validated_directories.append(Path(path)),
+        validate_file=lambda _descriptor, path: validated_files.append(Path(path)),
+        secure_directory=lambda path, *, owner_only: secured_directories.append(
+            (Path(path), owner_only)
+        ),
+        secure_file=lambda _descriptor, path: secured_files.append(Path(path)),
+    )
+
+    state = status_store_module.acknowledge_run(target, 7)
+
+    assert state.acknowledged_run_ids == {7}
+    assert secured_directories == [(target.parent, True)]
+    assert any(path.suffix == ".tmp" for path in secured_files)
+    assert target.parent in validated_directories
+    assert target in validated_files
+    assert status_store_module.load_observer_state(target) == state
+
+
+class _ObserverAclApi:
+    def __init__(self, *, owner_only: bool):
+        self.owner_only = owner_only
+        self.closed: list[str] = []
+
+    def open_directory(self, _path):
+        return "directory"
+
+    def open_file(self, _path, *, access):
+        assert access
+        return "file"
+
+    def close(self, handle):
+        self.closed.append(handle)
+
+    def identity(self, _handle):
+        return (1, 10)
+
+    def is_reparse(self, _handle):
+        return False
+
+    def inspect(self, _handle):
+        return SimpleNamespace(is_owner_only=self.owner_only)
+
+
+def test_windows_observer_directory_acl_validator_rejects_broad_access(
+    tmp_path, monkeypatch
+):
+    import scripts.windows_acl as windows_acl
+
+    api = _ObserverAclApi(owner_only=False)
+    monkeypatch.setattr(windows_acl, "_active_api", lambda _api: api)
+
+    with pytest.raises(PermissionError, match="directory ACL is not owner-only"):
+        utils_module._validate_windows_owner_only_directory(tmp_path)
+
+    assert api.closed == ["directory"]
+
+
+def test_windows_observer_file_acl_validator_rejects_broad_access(
+    tmp_path, monkeypatch
+):
+    import scripts.windows_acl as windows_acl
+
+    api = _ObserverAclApi(owner_only=False)
+    monkeypatch.setattr(windows_acl, "_active_api", lambda _api: api)
+    monkeypatch.setattr(
+        utils_module,
+        "msvcrt",
+        SimpleNamespace(get_osfhandle=lambda _descriptor: "borrowed"),
+    )
+
+    with pytest.raises(PermissionError, match="file ACL is not owner-only"):
+        utils_module._validate_windows_owner_only_file_descriptor(
+            7,
+            tmp_path / "status-view.json",
+        )
+
+    assert api.closed == ["file"]
 
 
 def test_acknowledge_run_atomically_writes_private_exact_state(tmp_path):

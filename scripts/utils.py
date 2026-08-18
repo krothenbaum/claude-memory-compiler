@@ -225,6 +225,8 @@ def _read_private_bounded_file_fallback(
         _validate_private_regular_file(opened, target)
         if not _same_file_identity(before, opened):
             raise ValueError(f"state path identity changed while opening: {target}")
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
         visible = target.lstat()
         _validate_private_regular_file(visible, target)
         if not _same_file_identity(opened, visible):
@@ -264,13 +266,19 @@ def _validate_no_linked_ancestors(path: Path) -> None:
 
 def _prepare_private_state_parent(parent: Path) -> os.stat_result:
     _validate_no_linked_ancestors(parent)
+    created = False
     try:
         info = parent.lstat()
     except FileNotFoundError:
         parent.mkdir(parents=True, mode=0o700)
+        created = True
         _validate_no_linked_ancestors(parent)
         info = parent.lstat()
     _validate_private_state_directory(info, parent)
+    if _windows_acl_required():
+        if created:
+            _secure_windows_runtime_directory(parent, owner_only=True)
+        _validate_windows_owner_only_directory(parent)
     return info
 
 
@@ -278,6 +286,8 @@ def _inspect_private_state_parent(parent: Path) -> os.stat_result:
     _validate_no_linked_ancestors(parent)
     info = parent.lstat()
     _validate_private_state_directory(info, parent)
+    if _windows_acl_required():
+        _validate_windows_owner_only_directory(parent)
     return info
 
 
@@ -491,6 +501,8 @@ def _restore_private_state_fallback(target: Path, prior_bytes: bytes | None) -> 
         restored = target.lstat()
         if (restored.st_dev, restored.st_ino) != (opened.st_dev, opened.st_ino):
             raise ValueError("state restoration identity changed after replacement")
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
         _fsync_directory(target.parent)
     finally:
         os.close(descriptor)
@@ -546,9 +558,14 @@ def _atomic_write_private_file_fallback(
             raise ValueError("state destination identity changed before replacement")
         os.replace(temporary, target)
         destination = target.lstat()
-        if not _same_file_identity(temporary_opened, destination):
+        try:
+            if not _same_file_identity(temporary_opened, destination):
+                raise ValueError("state destination identity changed after replacement")
+            if _windows_acl_required():
+                _validate_windows_owner_only_file_descriptor(descriptor, target)
+        except BaseException:
             _restore_private_state_fallback(target, prior_bytes)
-            raise ValueError("state destination identity changed after replacement")
+            raise
         _fsync_directory(parent)
     finally:
         os.close(descriptor)
@@ -738,6 +755,100 @@ def _open_runtime_directory_nofollow(path: Path) -> int | None:
 
 def _windows_acl_required() -> bool:
     return os.name == "nt"
+
+
+def _validate_windows_owner_only_directory(path: Path) -> None:
+    try:
+        from scripts.windows_acl import _active_api
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import _active_api
+
+    api = _active_api(None)
+    try:
+        handle = api.open_directory(path)
+    except Exception as error:
+        raise PermissionError(f"could not open Windows state directory: {path}") from error
+    try:
+        if api.is_reparse(handle):
+            raise PermissionError(f"Windows state directory is a reparse point: {path}")
+        identity = api.identity(handle)
+        try:
+            state = api.inspect(handle)
+        except Exception as error:
+            raise PermissionError(
+                f"could not inspect Windows state directory ACL: {path}"
+            ) from error
+        if not state.is_owner_only:
+            raise PermissionError(
+                f"Windows state directory ACL is not owner-only: {path}"
+            )
+        try:
+            observed = api.open_directory(path)
+        except Exception as error:
+            raise PermissionError(
+                f"could not reopen Windows state directory: {path}"
+            ) from error
+        try:
+            if api.is_reparse(observed) or api.identity(observed) != identity:
+                raise PermissionError(
+                    f"Windows state directory identity changed: {path}"
+                )
+            if not api.inspect(observed).is_owner_only:
+                raise PermissionError(
+                    f"Windows state directory ACL is not owner-only: {path}"
+                )
+        finally:
+            api.close(observed)
+    finally:
+        api.close(handle)
+
+
+def _validate_windows_owner_only_file_descriptor(descriptor: int, path: Path) -> None:
+    try:
+        from scripts.windows_acl import _FILE_SECURITY_ACCESS, _active_api
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import _FILE_SECURITY_ACCESS, _active_api
+
+    if msvcrt is None:
+        raise PermissionError("Windows file-handle API is unavailable")
+    api = _active_api(None)
+    try:
+        borrowed = msvcrt.get_osfhandle(descriptor)
+        identity = api.identity(borrowed)
+    except Exception as error:
+        raise PermissionError(
+            f"could not inspect retained Windows state file: {path}"
+        ) from error
+    try:
+        handle = api.open_file(path, access=_FILE_SECURITY_ACCESS)
+    except Exception as error:
+        raise PermissionError(f"could not open Windows state file: {path}") from error
+    try:
+        if api.is_reparse(handle) or api.identity(handle) != identity:
+            raise PermissionError(f"Windows state file identity changed: {path}")
+        try:
+            state = api.inspect(handle)
+        except Exception as error:
+            raise PermissionError(
+                f"could not inspect Windows state file ACL: {path}"
+            ) from error
+        if not state.is_owner_only:
+            raise PermissionError(f"Windows state file ACL is not owner-only: {path}")
+        try:
+            observed = api.open_file(path, access=_FILE_SECURITY_ACCESS)
+        except Exception as error:
+            raise PermissionError(f"could not reopen Windows state file: {path}") from error
+        try:
+            if api.is_reparse(observed) or api.identity(observed) != identity:
+                raise PermissionError(f"Windows state file identity changed: {path}")
+            if not api.inspect(observed).is_owner_only:
+                raise PermissionError(
+                    f"Windows state file ACL is not owner-only: {path}"
+                )
+        finally:
+            api.close(observed)
+    finally:
+        api.close(handle)
 
 
 def _secure_windows_runtime_directory(path: Path, *, owner_only: bool) -> None:
