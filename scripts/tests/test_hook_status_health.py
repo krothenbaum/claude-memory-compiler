@@ -329,6 +329,86 @@ def test_legacy_hook_log_sanitizes_credentials_paths_and_controls(
     assert len(record["message"]) <= 1_000
 
 
+@pytest.mark.parametrize(
+    ("message", "forbidden"),
+    [
+        (
+            'RuntimeError opening "/Users/alice/My Project/secret transcript.jsonl": denied',
+            "secret transcript.jsonl",
+        ),
+        (
+            "RuntimeError opening /Users/alice/My Project/secret transcript.jsonl, denied",
+            "My Project",
+        ),
+        (
+            r"RuntimeError opening 'C:\Users\alice\My Project\secret transcript.jsonl': denied",
+            "secret transcript.jsonl",
+        ),
+        (
+            r"RuntimeError opening C:\Users\alice\My Project\secret transcript.jsonl; denied",
+            "My Project",
+        ),
+        (
+            r"RuntimeError opening \\server\private share\secret-transcript.jsonl",
+            "server",
+        ),
+    ],
+)
+def test_legacy_hook_log_scrubs_spaced_and_unc_absolute_paths(
+    tmp_path, message, forbidden
+):
+    logger = hook_logging.configure_hook_logger(
+        f"legacy-path-{abs(hash(message))}",
+        "pre-compact",
+        tmp_path,
+    )
+    try:
+        logger.error("%s", message)
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    record = json.loads(
+        (tmp_path / "scripts" / "logs" / "hooks.log").read_text(encoding="utf-8")
+    )
+    assert record["message"].startswith("RuntimeError")
+    assert "[PATH]" in record["message"]
+    assert forbidden not in record["message"]
+    assert "\n" not in record["message"]
+    assert len(record["message"]) <= 1_000
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["line\nsecret", "tab\tsecret", "repeated   space secret"],
+)
+def test_legacy_hook_log_redacts_whitespace_normalized_credentials(
+    tmp_path, monkeypatch, secret
+):
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
+    logger = hook_logging.configure_hook_logger(
+        f"legacy-secret-{abs(hash(secret))}",
+        "pre-compact",
+        tmp_path,
+    )
+    try:
+        logger.error("RuntimeError credential=%s", secret)
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    record = json.loads(
+        (tmp_path / "scripts" / "logs" / "hooks.log").read_text(encoding="utf-8")
+    )
+    canonical_secret = " ".join(secret.split())
+    assert canonical_secret not in record["message"]
+    assert "[REDACTED]" in record["message"]
+    assert "\n" not in record["message"]
+    assert "\t" not in record["message"]
+
+
 def _health_module():
     return importlib.import_module("scripts.status_health")
 

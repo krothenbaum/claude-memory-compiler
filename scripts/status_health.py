@@ -37,6 +37,14 @@ _MAX_TAIL_BYTES = 1_000_000
 _MAX_CONTEXT_CHARS = 256
 
 
+def _canonical_redaction_env() -> dict[str, str]:
+    return {
+        name: canonical
+        for name, value in os.environ.items()
+        if (canonical := " ".join(value.split()))
+    }
+
+
 def _safe_message(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -44,7 +52,7 @@ def _safe_message(value: object) -> str | None:
         character if ord(character) >= 32 and ord(character) != 127 else " "
         for character in value
     )
-    normalized = normalize_persistence_reason(text, os.environ)
+    normalized = normalize_persistence_reason(text, _canonical_redaction_env())
     return normalized if normalized else None
 
 
@@ -55,7 +63,7 @@ def _safe_session_id(value: object) -> str | None:
         ord(character) < 32 or ord(character) == 127 for character in value
     ):
         return None
-    if normalize_persistence_reason(value, os.environ) != value:
+    if normalize_persistence_reason(value, _canonical_redaction_env()) != value:
         return None
     return value
 

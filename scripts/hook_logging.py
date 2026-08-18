@@ -32,10 +32,7 @@ _HOOK_EVENTS = frozenset(
 )
 _SOURCE_AGENTS = frozenset({"claude", "codex"})
 MAX_HOOK_CONTEXT_CHARS = 256
-_POSIX_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/(?:[^\s/]+/)*[^\s]+")
-_WINDOWS_ABSOLUTE_PATH = re.compile(
-    r"(?i)(?<![\w])(?:[a-z]:\\)(?:[^\\\s]+\\)*[^\\\s]+"
-)
+_ABSOLUTE_PATH_START = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|/)")
 
 
 def _safe_context(value: object, env: dict[str, str]) -> str | None:
@@ -45,7 +42,7 @@ def _safe_context(value: object, env: dict[str, str]) -> str | None:
         ord(character) < 32 or ord(character) == 127 for character in value
     ):
         return None
-    if normalize_persistence_reason(value, env) != value:
+    if normalize_persistence_reason(value, _canonical_redaction_env(env)) != value:
         return None
     return value
 
@@ -55,16 +52,50 @@ def _safe_event_message(value: object, env: dict[str, str]) -> str:
         character if ord(character) >= 32 and ord(character) != 127 else " "
         for character in str(value)
     )
-    return normalize_persistence_reason(text, env)
+    canonical = " ".join(text.split())
+    return normalize_persistence_reason(canonical, _canonical_redaction_env(env))
+
+
+def _canonical_redaction_env(env: dict[str, str]) -> dict[str, str]:
+    return {
+        name: canonical
+        for name, value in env.items()
+        if (canonical := " ".join(value.split()))
+    }
+
+
+def _scrub_absolute_paths(value: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    while match := _ABSOLUTE_PATH_START.search(value, cursor):
+        start = match.start()
+        quoted_start = start > 0 and value[start - 1] in {'"', "'"}
+        replacement_start = start - 1 if quoted_start else start
+        parts.append(value[cursor:replacement_start])
+        parts.append("[PATH]")
+        if quoted_start:
+            quote = value[start - 1]
+            closing = value.find(quote, match.end())
+            cursor = len(value) if closing < 0 else closing + 1
+        else:
+            cursor = len(value)
+        if cursor >= len(value):
+            break
+    if not parts:
+        return value
+    parts.append(value[cursor:])
+    return "".join(parts)
 
 
 def _safe_legacy_message(value: object, env: dict[str, str]) -> str:
     raw = str(value)
     canonical = " ".join(raw.split())
-    redacted = normalize_persistence_reason(canonical, env)
-    contains_path = bool(
-        _POSIX_ABSOLUTE_PATH.search(raw) or _WINDOWS_ABSOLUTE_PATH.search(raw)
+    redacted = normalize_persistence_reason(
+        canonical,
+        _canonical_redaction_env(env),
     )
+    path_safe = _scrub_absolute_paths(raw)
+    contains_path = path_safe != raw
     contains_control = any(
         (ord(character) < 32 and character not in "\n\r\t")
         or ord(character) == 127
@@ -77,8 +108,6 @@ def _safe_legacy_message(value: object, env: dict[str, str]) -> str:
         and not contains_control
     ):
         return raw
-    path_safe = _WINDOWS_ABSOLUTE_PATH.sub("[PATH]", raw)
-    path_safe = _POSIX_ABSOLUTE_PATH.sub("[PATH]", path_safe)
     return _safe_event_message(path_safe, env)
 
 
