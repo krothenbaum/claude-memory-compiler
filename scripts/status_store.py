@@ -455,6 +455,7 @@ class StatusSnapshot:
     recent: tuple[StatusRun, ...]
     compile: CompileStatus
     health_alerts: tuple[HealthAlert, ...]
+    has_more: bool = False
 
 
 class StatusReadError(RuntimeError):
@@ -1010,9 +1011,15 @@ def _read_runs(
     now: datetime,
     all_history: bool,
     max_runs: int | None,
+    query: str,
+    acknowledged_run_ids: frozenset[int],
 ) -> tuple[StatusRun, ...]:
     runs: list[StatusRun] = []
     cutoff = _stored_time(now.astimezone(UTC) - _RECENT_WINDOW)
+    needle = " ".join(query.split()).casefold()
+    def safe_match(*values: object) -> int:
+        return int(any(needle in (normalize_summary(value, os.environ) or "").casefold() for value in values))
+    connection.create_function("safe_status_match", -1, safe_match, deterministic=True)
     if "status_runs" in tables:
         status_sql = "SELECT * FROM status_runs"
         status_parameters: tuple[object, ...] = ()
@@ -1023,11 +1030,18 @@ def _read_runs(
                 " AND julianday(updated_at) >= julianday(?))"
             )
             status_parameters = (cutoff,)
+        if needle:
+            status_sql += (" AND " if " WHERE " in status_sql else " WHERE ") + (
+                "safe_status_match(kind,source_agent,session_id,project,state,phase,summary)=1"
+            )
         status_sql += (
-            " ORDER BY CASE WHEN state IN ('failed','dead') THEN 0 "
+            " ORDER BY CASE WHEN state IN ('failed','dead') AND id NOT IN ("
+            + (",".join("?" for _ in acknowledged_run_ids) or "NULL")
+            + ") THEN 0 "
             "WHEN state IN ('queued','running','retrying') THEN 1 ELSE 2 END, "
             "julianday(updated_at) DESC, id DESC"
         )
+        status_parameters = (*status_parameters, *sorted(acknowledged_run_ids))
         if max_runs is not None:
             status_sql += " LIMIT ?"
             status_parameters = (*status_parameters, max_runs)
@@ -1052,6 +1066,8 @@ def _read_runs(
                 " AND julianday(jobs.updated_at) >= julianday(?)))"
             )
             legacy_parameters = (cutoff,)
+        if needle:
+            legacy_sql += " AND safe_status_match(jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,jobs.status,NULL,NULL)=1"
         legacy_sql += (
             " ORDER BY CASE WHEN jobs.status IN ('failed','dead') THEN 0 "
             "WHEN jobs.status IN ('pending','leased') THEN 1 ELSE 2 END, "
@@ -1075,6 +1091,8 @@ def _read_runs(
                 " AND julianday(updated_at) >= julianday(?))"
             )
             legacy_parameters = (cutoff,)
+        if needle:
+            legacy_sql += (" AND " if " WHERE " in legacy_sql else " WHERE ") + "safe_status_match(kind,source_agent,session_id,project,status,NULL,NULL)=1"
         legacy_sql += (
             " ORDER BY CASE WHEN status IN ('failed','dead') THEN 0 "
             "WHEN status IN ('pending','leased') THEN 1 ELSE 2 END, "
@@ -1345,6 +1363,8 @@ def read_snapshot(
             now=now,
             all_history=bool(query.strip()),
             max_runs=max_runs,
+            query=query,
+            acknowledged_run_ids=observer_state.acknowledged_run_ids,
         )
         latest_compile_run = _read_latest_compile_run(connection, tables)
         queue_active_count, reservation_state = _read_compile_database_state(
@@ -1360,9 +1380,7 @@ def read_snapshot(
     finally:
         connection.close()
 
-    matching = tuple(run for run in runs if _matches_query(run, query))
-    if max_runs is not None:
-        matching = matching[:max_runs]
+    matching = tuple(sorted((run for run in runs if _matches_query(run, query)), key=_run_sort_key, reverse=True))
     active = tuple(
         sorted(
             (run for run in matching if run.state in _ACTIVE_RUN_STATES),
@@ -1421,12 +1439,29 @@ def read_snapshot(
             reservation_state=lambda: reservation_state,
         ),
     )
+    has_more = False
+    if max_runs is not None:
+        has_more = len(active) + len(attention) + len(recent) > max_runs
+        quotas = (max(1, max_runs * 2 // 5), max(1, max_runs * 2 // 5))
+        chosen_attention = list(attention[: quotas[0]])
+        chosen_active = list(active[: quotas[1]])
+        remaining = max_runs - len(chosen_attention) - len(chosen_active)
+        chosen_recent = list(recent[: max(0, remaining)])
+        remaining = max_runs - len(chosen_attention) - len(chosen_active) - len(chosen_recent)
+        for source, target in ((attention, chosen_attention), (active, chosen_active), (recent, chosen_recent)):
+            if remaining <= 0:
+                break
+            extra = source[len(target): len(target) + remaining]
+            target.extend(extra)
+            remaining -= len(extra)
+        attention, active, recent = tuple(chosen_attention), tuple(chosen_active), tuple(chosen_recent)
     return StatusSnapshot(
         active=active,
         attention=attention,
         recent=recent,
         compile=compile_status,
         health_alerts=tuple(health_alerts),
+        has_more=has_more,
     )
 
 

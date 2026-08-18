@@ -169,6 +169,7 @@ class StatusDashboard(App[None]):
         self._render_dirty = False
         self._refresh_generation = 0
         self._detail_generation = 0
+        self._details_run_id: int | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="app-header")
@@ -321,7 +322,7 @@ class StatusDashboard(App[None]):
         scroll_y = run_list.scroll_y
         await run_list.remove_children()
         rendered_count = 0
-        truncated = False
+        truncated = self.snapshot.has_more
         for label, runs in (
             ("ACTIVE", self.snapshot.active),
             ("NEEDS ATTENTION", self.snapshot.attention),
@@ -390,6 +391,7 @@ class StatusDashboard(App[None]):
         target = self.query_one("#details", Static)
         if self.selected_run_id is None:
             target.update(Text("No runs"))
+            self._details_run_id = None
             return
         selected_run_id = self.selected_run_id
         self._detail_generation += 1
@@ -433,6 +435,7 @@ class StatusDashboard(App[None]):
         if not details.timeline_available:
             lines.append("Fine-grained timeline unavailable")
         target.update(Text("\n".join(lines)))
+        self._details_run_id = selected_run_id
 
     async def action_refresh(self) -> None:
         await self.refresh_snapshot()
@@ -470,8 +473,12 @@ class StatusDashboard(App[None]):
     def action_previous_run(self) -> None:
         self._move_selection(-1)
 
-    def action_details(self) -> None:
+    async def action_details(self) -> None:
         if not self.has_class("compact") or self.selected_run_id is None:
+            return
+        selected = self.selected_run_id
+        await self._render_details()
+        if selected != self.selected_run_id or self._details_run_id != selected:
             return
         details = self.query_one("#details", Static).render()
         overlay = DetailsOverlay(Text(str(details)))
