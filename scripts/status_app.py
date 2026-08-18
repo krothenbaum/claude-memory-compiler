@@ -112,10 +112,10 @@ class StatusDashboard(App[None]):
     StatusDashboard.nocolor .run-row.selected { text-style: bold; }
     StatusDashboard.nocolor #runs-pane,
     StatusDashboard.nocolor #details-pane,
-    StatusDashboard.nocolor #compile-panel { border: round ansi_bright_black; }
-    StatusDashboard.nocolor #compile-panel.selected { border: round ansi_bright_black; text-style: bold; }
-    StatusDashboard.nocolor Footer { color: $text; background: $surface; }
-    StatusDashboard.nocolor DetailsOverlay { background: $surface; color: $text; }
+    StatusDashboard.nocolor #compile-panel { border: round #808080; }
+    StatusDashboard.nocolor #compile-panel.selected { border: round #808080; text-style: bold; }
+    StatusDashboard.nocolor Footer { color: $text; background: transparent; }
+    DetailsOverlay.nocolor #details-overlay { border: round #808080; color: $text; background: transparent; }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -166,7 +166,9 @@ class StatusDashboard(App[None]):
         self.filter_query = ""
         self._spinner_frame = 0
         self._render_lock = asyncio.Lock()
+        self._render_dirty = False
         self._refresh_generation = 0
+        self._detail_generation = 0
 
     def compose(self) -> ComposeResult:
         yield Static(id="app-header")
@@ -259,8 +261,11 @@ class StatusDashboard(App[None]):
                 query=self.filter_query,
                 health_alerts=self._health_loader(),
                 memory_home=self.memory_home,
+                max_runs=MAX_RENDERED_RUNS,
             )
         except (StatusReadError, sqlite3.Error, OSError, ValueError) as error:
+            if generation != self._refresh_generation:
+                return
             if self._is_busy_error(error):
                 self.query_one("#delayed-banner", Static).display = True
                 if self.snapshot is None:
@@ -286,8 +291,15 @@ class StatusDashboard(App[None]):
         await self._render_snapshot()
 
     async def _render_snapshot(self) -> None:
+        if self._render_lock.locked():
+            self._render_dirty = True
+            return
         async with self._render_lock:
-            await self._render_snapshot_unlocked()
+            while True:
+                self._render_dirty = False
+                await self._render_snapshot_unlocked()
+                if not self._render_dirty:
+                    break
 
     @staticmethod
     def _row_id(run_id: int) -> str:
@@ -379,12 +391,19 @@ class StatusDashboard(App[None]):
         if self.selected_run_id is None:
             target.update(Text("No runs"))
             return
+        selected_run_id = self.selected_run_id
+        self._detail_generation += 1
+        generation = self._detail_generation
         try:
             details = await asyncio.to_thread(
-                self._details_reader, self.queue_path, self.selected_run_id
+                self._details_reader, self.queue_path, selected_run_id
             )
         except (KeyError, OSError, StatusReadError, ValueError):
+            if generation != self._detail_generation or selected_run_id != self.selected_run_id:
+                return
             target.update(Text("Details unavailable"))
+            return
+        if generation != self._detail_generation or selected_run_id != self.selected_run_id:
             return
         run = details.run
         lines = [
@@ -455,7 +474,10 @@ class StatusDashboard(App[None]):
         if not self.has_class("compact") or self.selected_run_id is None:
             return
         details = self.query_one("#details", Static).render()
-        self.push_screen(DetailsOverlay(Text(str(details))))
+        overlay = DetailsOverlay(Text(str(details)))
+        if self.no_color:
+            overlay.add_class("nocolor")
+        self.push_screen(overlay)
 
     def action_filter(self) -> None:
         field = self.query_one("#filter-input", Input)

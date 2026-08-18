@@ -1009,6 +1009,7 @@ def _read_runs(
     *,
     now: datetime,
     all_history: bool,
+    max_runs: int | None,
 ) -> tuple[StatusRun, ...]:
     runs: list[StatusRun] = []
     cutoff = _stored_time(now.astimezone(UTC) - _RECENT_WINDOW)
@@ -1022,6 +1023,14 @@ def _read_runs(
                 " AND julianday(updated_at) >= julianday(?))"
             )
             status_parameters = (cutoff,)
+        status_sql += (
+            " ORDER BY CASE WHEN state IN ('failed','dead') THEN 0 "
+            "WHEN state IN ('queued','running','retrying') THEN 1 ELSE 2 END, "
+            "julianday(updated_at) DESC, id DESC"
+        )
+        if max_runs is not None:
+            status_sql += " LIMIT ?"
+            status_parameters = (*status_parameters, max_runs)
         runs.extend(
             _safe_projection_run(status_run_from_row(row, redaction_env=os.environ))
             for row in connection.execute(status_sql, status_parameters)
@@ -1043,6 +1052,14 @@ def _read_runs(
                 " AND julianday(jobs.updated_at) >= julianday(?)))"
             )
             legacy_parameters = (cutoff,)
+        legacy_sql += (
+            " ORDER BY CASE WHEN jobs.status IN ('failed','dead') THEN 0 "
+            "WHEN jobs.status IN ('pending','leased') THEN 1 ELSE 2 END, "
+            "julianday(jobs.updated_at) DESC, jobs.id DESC"
+        )
+        if max_runs is not None:
+            legacy_sql += " LIMIT ?"
+            legacy_parameters = (*legacy_parameters, max_runs)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     else:
         legacy_sql = """
@@ -1058,6 +1075,14 @@ def _read_runs(
                 " AND julianday(updated_at) >= julianday(?))"
             )
             legacy_parameters = (cutoff,)
+        legacy_sql += (
+            " ORDER BY CASE WHEN status IN ('failed','dead') THEN 0 "
+            "WHEN status IN ('pending','leased') THEN 1 ELSE 2 END, "
+            "julianday(updated_at) DESC, id DESC"
+        )
+        if max_runs is not None:
+            legacy_sql += " LIMIT ?"
+            legacy_parameters = (*legacy_parameters, max_runs)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
     return tuple(runs)
@@ -1298,10 +1323,15 @@ def read_snapshot(
     query: str = "",
     health_alerts: tuple[HealthAlert, ...] = (),
     memory_home: Path | None = None,
+    max_runs: int | None = None,
 ) -> StatusSnapshot:
     """Read and group status without creating, migrating, or mutating the queue."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("snapshot time must be timezone-aware")
+    if max_runs is not None and (
+        isinstance(max_runs, bool) or not isinstance(max_runs, int) or not 1 <= max_runs <= 10_000
+    ):
+        raise ValueError("max_runs must be between 1 and 10000")
     resolved = Path(os.path.abspath(queue_path.expanduser()))
     connection = _open_read_only_database(resolved)
     try:
@@ -1314,6 +1344,7 @@ def read_snapshot(
             tables,
             now=now,
             all_history=bool(query.strip()),
+            max_runs=max_runs,
         )
         latest_compile_run = _read_latest_compile_run(connection, tables)
         queue_active_count, reservation_state = _read_compile_database_state(
@@ -1330,6 +1361,8 @@ def read_snapshot(
         connection.close()
 
     matching = tuple(run for run in runs if _matches_query(run, query))
+    if max_runs is not None:
+        matching = matching[:max_runs]
     active = tuple(
         sorted(
             (run for run in matching if run.state in _ACTIVE_RUN_STATES),
