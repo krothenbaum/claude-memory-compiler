@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
-from pathlib import Path
 import stat
+from datetime import UTC, datetime
+from pathlib import Path
 
 try:
     from .privacy import normalize_persistence_reason
@@ -61,7 +61,7 @@ class HookJsonFormatter(logging.Formatter):
         self.component = component
 
     def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.fromtimestamp(record.created, timezone.utc)
+        timestamp = datetime.fromtimestamp(record.created, UTC)
         event = getattr(record, "hook_event", "hook_log")
         if event not in _HOOK_EVENTS:
             event = "hook_log"
@@ -116,6 +116,11 @@ def _remove_owned_handlers(logger: logging.Logger) -> None:
             handler.close()
 
 
+def _handler_log_path(handler: logging.Handler) -> Path | None:
+    value = getattr(handler, "_memory_log_path", None)
+    return Path(value) if isinstance(value, str) else None
+
+
 def configure_hook_logger(
     logger_name: str,
     label: str,
@@ -129,7 +134,7 @@ def configure_hook_logger(
         for handler in logger.handlers
         if getattr(handler, "_memory_hook_file", False)
     ]
-    if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
+    if len(tagged) == 1 and _handler_log_path(tagged[0]) == target:
         return logger
 
     _remove_owned_handlers(logger)

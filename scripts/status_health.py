@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import json
 import os
-from pathlib import Path
 import stat
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Final
 
 try:
@@ -64,7 +64,7 @@ def _loaded_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:

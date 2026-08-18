@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import logging
 import os
-from pathlib import Path
 import sqlite3
 import sys
 import time
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
@@ -20,12 +20,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.transcripts import parse_codex_transcript
 from scripts.hook_logging import (
     classify_transcript_path,
     configure_hook_logger,
     log_hook_event,
 )
+from scripts.transcripts import parse_codex_transcript
 
 
 MAX_TURNS = 30

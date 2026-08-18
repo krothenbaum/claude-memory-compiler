@@ -69,9 +69,9 @@ def test_malformed_hook_input_records_precise_error_event(
     assert len(handler.records) == 1
     record = handler.records[0]
     assert record.levelno == logging.ERROR
-    assert getattr(record, "hook_event") == "malformed_input"
-    assert getattr(record, "source_agent") == source_agent
-    assert getattr(record, "session_id") is None
+    assert record.hook_event == "malformed_input"
+    assert record.source_agent == source_agent
+    assert record.session_id is None
 
 
 @pytest.mark.parametrize(
@@ -102,9 +102,9 @@ def test_missing_transcript_records_error_without_exposing_path(
 
     record = handler.records[0]
     assert record.levelno == logging.ERROR
-    assert getattr(record, "hook_event") == "transcript_missing"
-    assert getattr(record, "source_agent") == source_agent
-    assert getattr(record, "session_id") == "session-missing"
+    assert record.hook_event == "transcript_missing"
+    assert record.source_agent == source_agent
+    assert record.session_id == "session-missing"
     assert str(secret_path) not in record.getMessage()
 
 
@@ -137,8 +137,8 @@ def test_nonregular_transcript_records_unreadable_event(
 
     record = handler.records[0]
     assert record.levelno == logging.ERROR
-    assert getattr(record, "hook_event") == "transcript_unreadable"
-    assert getattr(record, "session_id") == "session-unreadable"
+    assert record.hook_event == "transcript_unreadable"
+    assert record.session_id == "session-unreadable"
 
 
 def test_pre_enqueue_failure_records_capture_failed_with_session(tmp_path, monkeypatch):
@@ -171,8 +171,8 @@ def test_pre_enqueue_failure_records_capture_failed_with_session(tmp_path, monke
     hook.main(clock=lambda: 0.0)
 
     record = handler.records[-1]
-    assert getattr(record, "hook_event") == "capture_failed"
-    assert getattr(record, "session_id") == "session-before-queue"
+    assert record.hook_event == "capture_failed"
+    assert record.session_id == "session-before-queue"
 
 
 def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
@@ -204,7 +204,7 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
 
     hook.main(clock=lambda: 0.0)
 
-    assert getattr(handler.records[-1], "hook_event") == "queue_unavailable"
+    assert handler.records[-1].hook_event == "queue_unavailable"
 
 
 def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeypatch):
@@ -348,5 +348,5 @@ def test_recent_hook_alerts_rejects_naive_now(tmp_path):
     with pytest.raises(ValueError, match="timezone-aware"):
         health.read_recent_hook_alerts(
             tmp_path,
-            now=datetime(2026, 8, 18, 18, 0),
+            now=NOW.replace(tzinfo=None),
         )
