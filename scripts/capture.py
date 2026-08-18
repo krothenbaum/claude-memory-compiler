@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import datetime
 import hashlib
 import os
-from pathlib import Path
 import platform
 import shutil
 import sqlite3
@@ -16,8 +13,11 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Callable, Literal, Mapping
-
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -26,7 +26,6 @@ if str(ROOT) not in sys.path:
 from scripts.config import load_config
 from scripts.queue import EnqueueResult, Job, QueueRepository
 from scripts.transcripts import parse_claude_transcript, parse_codex_transcript
-
 
 CAPTURE_DB_BUSY_TIMEOUT_MS = 250
 SNAPSHOT_LINK_RETRY_ATTEMPTS = 3
