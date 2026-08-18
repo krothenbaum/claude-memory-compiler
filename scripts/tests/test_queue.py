@@ -12,6 +12,8 @@ import threading
 import pytest
 
 from providers import ProviderResult, TaskKind
+import scripts.queue as queue_module
+import scripts.utils as utils_module
 from scripts.queue import LeaseOwnershipError, QueueRepository
 from transcripts import NormalizedSession, Turn
 
@@ -537,6 +539,80 @@ def test_queue_database_and_sidecars_are_owner_only_with_typical_umask(tmp_path)
             assert all(stat.S_IMODE(candidate.stat().st_mode) == 0o600 for candidate in present)
     finally:
         os.umask(previous)
+
+
+def test_windows_queue_secures_main_wal_shm_and_dashboard_accepts(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    secured: list[Path] = []
+    monkeypatch.setattr(queue_module, "_windows_acl_required", lambda: True, raising=False)
+    monkeypatch.setattr(
+        queue_module,
+        "_secure_windows_queue_file",
+        lambda candidate: secured.append(Path(candidate)),
+        raising=False,
+    )
+
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False):
+        present = tuple(
+            candidate
+            for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+            if candidate.exists()
+        )
+        assert len(present) == 3
+        assert set(present) <= set(secured)
+
+        monkeypatch.setattr(utils_module, "_PRIVATE_STATE_DIR_FD_SUPPORTED", False)
+        monkeypatch.setattr(utils_module, "_windows_acl_required", lambda: True)
+        monkeypatch.setattr(
+            utils_module,
+            "_validate_windows_inherited_directory",
+            lambda _parent: None,
+        )
+
+        def validate_secured(_descriptor, candidate):
+            assert Path(candidate) in secured
+
+        monkeypatch.setattr(
+            utils_module,
+            "_validate_windows_owner_only_file_descriptor",
+            validate_secured,
+        )
+        identities = tuple(
+            utils_module.inspect_secure_read_file(candidate) for candidate in present
+        )
+
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False):
+        reopened = tuple(
+            candidate
+            for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+            if candidate.exists()
+        )
+        assert len(reopened) == 3
+        assert set(reopened) <= set(secured)
+
+    assert {identity.path for identity in identities} == set(present)
+    assert all(secured.count(candidate) >= 2 for candidate in reopened)
+
+
+def test_windows_queue_acl_failure_rejects_insecure_sidecar(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    monkeypatch.setattr(queue_module, "_windows_acl_required", lambda: True, raising=False)
+
+    def reject_wal(candidate):
+        if str(candidate).endswith("-wal"):
+            raise PermissionError("could not establish owner-only queue ACL")
+
+    monkeypatch.setattr(
+        queue_module,
+        "_secure_windows_queue_file",
+        reject_wal,
+        raising=False,
+    )
+
+    with pytest.raises(PermissionError, match="owner-only queue ACL"):
+        QueueRepository(path, clock=lambda: NOW, sync_usage=False)
 
 
 def test_queue_rejects_symlink_database_target(tmp_path):

@@ -235,6 +235,24 @@ _VERSION_1_TO_2_STATEMENTS = (
 )
 
 
+def _windows_acl_required() -> bool:
+    return os.name == "nt"
+
+
+def _secure_windows_queue_file(path: Path) -> None:
+    try:
+        from .windows_acl import secure_windows_file_descriptor
+    except ImportError:  # Direct execution with scripts/ on sys.path.
+        from windows_acl import secure_windows_file_descriptor
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        secure_windows_file_descriptor(descriptor, path)
+    finally:
+        os.close(descriptor)
+
+
 class LeaseOwnershipError(RuntimeError):
     """Raised when a worker mutates a lease it does not own."""
 
@@ -387,6 +405,8 @@ class QueueRepository:
         if info.st_nlink != 1:
             raise ValueError(f"queue path must not be hard-linked: {path}")
         path.chmod(0o600)
+        if _windows_acl_required():
+            _secure_windows_queue_file(path)
 
     def _prepare_private_database_files(self) -> None:
         candidates = [self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")]
