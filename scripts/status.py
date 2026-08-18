@@ -283,13 +283,13 @@ def _render_snapshot(
     )
 
 
-def _run_dashboard(*, no_color: bool) -> int:
+def _run_dashboard(*, no_color: bool, env: Mapping[str, str]) -> int:
     module_name = f"{__package__}.status_app" if __package__ else "status_app"
     run_dashboard = cast(
         Callable[..., int | None],
         importlib.import_module(module_name).run_dashboard,
     )
-    result = run_dashboard(no_color=no_color)
+    result = run_dashboard(no_color=no_color, env=env)
     return 0 if result is None else int(result)
 
 
@@ -318,7 +318,7 @@ def main(
     stream = sys.stdout if output is None else output
     if not args.snapshot:
         try:
-            return _run_dashboard(no_color=args.no_color)
+            return _run_dashboard(no_color=args.no_color, env=source_env)
         except (OSError, RuntimeError, ValueError) as error:
             diagnostic = _safe_terminal_text(error)
             _write_output(

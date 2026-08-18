@@ -390,13 +390,19 @@ def test_terminal_width_truncates_rows_deterministically(tmp_path, monkeypatch):
 def test_default_mode_lazy_loads_interactive_dashboard(monkeypatch):
     import status as status_cli
 
+    explicit_env = {
+        "AI_MEMORY_HOME": "/memory/root",
+        "AI_MEMORY_QUEUE_PATH": "/memory/runtime/jobs.sqlite3",
+    }
     calls = []
     module = ModuleType("status_app")
-    module.__dict__["run_dashboard"] = lambda *, no_color: calls.append(no_color) or 7
+    module.__dict__["run_dashboard"] = (
+        lambda *, no_color, env: calls.append((no_color, env)) or 7
+    )
     monkeypatch.setitem(sys.modules, "status_app", module)
 
-    assert status_cli.main(["--no-color"]) == 7
-    assert calls == [True]
+    assert status_cli.main(["--no-color"], env=explicit_env) == 7
+    assert calls == [(True, explicit_env)]
 
 
 @pytest.mark.parametrize(

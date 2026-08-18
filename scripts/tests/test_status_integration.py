@@ -121,8 +121,8 @@ def test_dashboard_refresh_loads_health_and_passes_it_to_projection(tmp_path):
     health_calls = []
     projection_calls = []
 
-    def read_health(root, *, now):
-        health_calls.append((root, now))
+    def read_health():
+        health_calls.append(())
         return (alert,)
 
     def read_projection(path, **kwargs):
@@ -149,11 +149,42 @@ def test_dashboard_refresh_loads_health_and_passes_it_to_projection(tmp_path):
 
     asyncio.run(exercise())
 
-    assert health_calls == [(tmp_path, NOW)]
-    assert projection_calls[0][0] == tmp_path / "jobs.sqlite3"
-    assert projection_calls[0][1]["health_alerts"] == (alert,)
-    assert projection_calls[0][1]["memory_home"] == tmp_path
-    assert projection_calls[0][1]["max_runs"] == 200
+    assert health_calls and all(call == () for call in health_calls)
+    assert projection_calls
+    assert all(call[0] == tmp_path / "jobs.sqlite3" for call in projection_calls)
+    assert all(call[1]["health_alerts"] == (alert,) for call in projection_calls)
+    assert all(call[1]["memory_home"] == tmp_path for call in projection_calls)
+    assert all(call[1]["max_runs"] == 200 for call in projection_calls)
+
+
+def test_dashboard_default_health_loader_captures_memory_home_and_clock(
+    tmp_path, monkeypatch
+):
+    from scripts import status_app
+
+    calls = []
+    monkeypatch.setattr(
+        status_app,
+        "read_recent_hook_alerts",
+        lambda root, *, now: calls.append((root, now)) or (),
+    )
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **kwargs: _empty_snapshot(
+            health_alerts=kwargs["health_alerts"]
+        ),
+        observer_loader=lambda _path: ObserverState.empty(),
+        clock=lambda: NOW,
+    )
+
+    async def exercise() -> None:
+        async with dashboard.run_test() as pilot:
+            await pilot.pause()
+            assert dashboard.snapshot is not None
+
+    asyncio.run(exercise())
+    assert calls and all(call == (tmp_path, NOW) for call in calls)
 
 
 def test_dashboard_health_failure_is_bounded_and_refreshes_without_alerts(tmp_path):
@@ -168,7 +199,7 @@ def test_dashboard_health_failure_is_bounded_and_refreshes_without_alerts(tmp_pa
         memory_home=tmp_path,
         snapshot_reader=read_projection,
         observer_loader=lambda _path: ObserverState.empty(),
-        health_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        health_loader=lambda: (_ for _ in ()).throw(
             ValueError("invalid health data")
         ),
         clock=lambda: NOW,
@@ -180,7 +211,7 @@ def test_dashboard_health_failure_is_bounded_and_refreshes_without_alerts(tmp_pa
             assert dashboard.snapshot is not None
 
     asyncio.run(exercise())
-    assert observed == [()]
+    assert observed and all(alerts == () for alerts in observed)
 
 
 def test_public_dashboard_runner_composes_all_read_only_dependencies(
@@ -199,10 +230,20 @@ def test_public_dashboard_runner_composes_all_read_only_dependencies(
         def run(self):
             return None
 
-    monkeypatch.setattr(status_app, "load_config", lambda _env: config)
+    explicit_env = {
+        "AI_MEMORY_HOME": str(tmp_path),
+        "AI_MEMORY_QUEUE_PATH": str(queue_path),
+    }
+    loaded = []
+    monkeypatch.setattr(
+        status_app,
+        "load_config",
+        lambda env: loaded.append(env) or config,
+    )
     monkeypatch.setattr(status_app, "StatusDashboard", Dashboard)
 
-    assert status_app.run_dashboard(no_color=True) == 0
+    assert status_app.run_dashboard(no_color=True, env=explicit_env) == 0
+    assert loaded == [explicit_env]
     assert constructed == [
         (
             (queue_path,),
@@ -212,7 +253,6 @@ def test_public_dashboard_runner_composes_all_read_only_dependencies(
                 "details_reader": status_app.read_run_details,
                 "observer_loader": status_app.load_observer_state,
                 "acknowledger": status_app.acknowledge_run,
-                "health_loader": status_app.read_recent_hook_alerts,
                 "no_color": True,
             },
         )
@@ -367,7 +407,7 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
                 snapshot_reader=project_snapshot,
                 details_reader=read_run_details,
                 observer_loader=lambda _path: ObserverState.empty(),
-                health_loader=lambda *_args, **_kwargs: (),
+                health_loader=lambda: (),
                 clock=lambda: current[0],
             )
             worker_task = None
@@ -395,7 +435,7 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
                 snapshot_reader=project_snapshot,
                 details_reader=read_run_details,
                 observer_loader=lambda _path: ObserverState.empty(),
-                health_loader=lambda *_args, **_kwargs: (),
+                health_loader=lambda: (),
                 clock=lambda: current[0],
             )
             assert reopened_dashboard is not dashboard

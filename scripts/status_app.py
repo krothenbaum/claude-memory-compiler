@@ -6,7 +6,7 @@ import asyncio
 import importlib
 import os
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
@@ -51,7 +51,7 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
 
 SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
-HealthLoader = Callable[..., tuple[HealthAlert, ...]]
+HealthLoader = Callable[[], tuple[HealthAlert, ...]]
 MAX_RENDERED_RUNS = 200
 
 
@@ -150,7 +150,7 @@ class StatusDashboard(App[None]):
         observer_loader: Callable[[Path], ObserverState] = load_observer_state,
         acknowledger: Callable[[Path, int], ObserverState] = acknowledge_run,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        health_loader: HealthLoader = read_recent_hook_alerts,
+        health_loader: HealthLoader | None = None,
         no_color: bool | None = None,
     ) -> None:
         super().__init__()
@@ -161,7 +161,9 @@ class StatusDashboard(App[None]):
         self._observer_loader = observer_loader
         self._acknowledger = acknowledger
         self._clock = clock
-        self._health_loader = health_loader
+        self._health_loader = health_loader or (
+            lambda: read_recent_hook_alerts(self.memory_home, now=self._clock())
+        )
         self.no_color = bool(no_color or "NO_COLOR" in os.environ)
         self.observer_path = observer_state_path(self.memory_home)
         try:
@@ -263,11 +265,7 @@ class StatusDashboard(App[None]):
         generation = self._refresh_generation
         current = self._clock()
         try:
-            health_alerts = await asyncio.to_thread(
-                self._health_loader,
-                self.memory_home,
-                now=current,
-            )
+            health_alerts = await asyncio.to_thread(self._health_loader)
         except (OSError, RuntimeError, ValueError):
             health_alerts = ()
         try:
@@ -549,9 +547,14 @@ class StatusDashboard(App[None]):
         self.notify("↑/↓ or j/k select · Enter details · / filter · a acknowledge · q quit")
 
 
-def run_dashboard(*, no_color: bool) -> int:
+def run_dashboard(
+    *,
+    no_color: bool,
+    env: Mapping[str, str] | None = None,
+) -> int:
     """Run the default read-only dashboard and return after a clean exit."""
-    config = load_config(os.environ)
+    source_env = os.environ if env is None else env
+    config = load_config(source_env)
     StatusDashboard(
         config.queue_path,
         memory_home=config.root_dir,
@@ -559,7 +562,6 @@ def run_dashboard(*, no_color: bool) -> int:
         details_reader=read_run_details,
         observer_loader=load_observer_state,
         acknowledger=acknowledge_run,
-        health_loader=read_recent_hook_alerts,
-        no_color=no_color,
+        no_color=no_color or "NO_COLOR" in source_env,
     ).run()
     return 0
