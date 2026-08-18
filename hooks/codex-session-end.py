@@ -7,6 +7,7 @@ import importlib.util
 import logging
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Callable
@@ -20,7 +21,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.transcripts import parse_codex_transcript
-from scripts.hook_logging import configure_hook_logger
+from scripts.hook_logging import (
+    classify_transcript_path,
+    configure_hook_logger,
+    log_hook_event,
+)
 
 
 MAX_TURNS = 30
@@ -58,17 +63,42 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         value = json.loads(sys.stdin.read())
         if not isinstance(value, dict):
             raise ValueError("hook input must be a JSON object")
-    except (json.JSONDecodeError, ValueError, EOFError) as error:
-        logger.error("failed to parse hook input: %s", error)
+    except (json.JSONDecodeError, ValueError, EOFError):
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "malformed_input",
+            "failed to parse hook input",
+            source_agent="codex",
+        )
         return
 
     transcript_value = value.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
-        logger.info("skip: no transcript path")
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "transcript_missing",
+            "hook input did not include a transcript",
+            source_agent="codex",
+            session_id=value.get("session_id"),
+        )
         return
     transcript_path = Path(transcript_value).expanduser()
-    if not transcript_path.is_file():
-        logger.info("skip: transcript missing")
+    transcript_event = classify_transcript_path(transcript_path)
+    if transcript_event is not None:
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            transcript_event,
+            (
+                "transcript is missing"
+                if transcript_event == "transcript_missing"
+                else "transcript is unreadable"
+            ),
+            source_agent="codex",
+            session_id=value.get("session_id"),
+        )
         return
 
     try:
@@ -113,9 +143,32 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
                 deadline=deadline,
                 clock=clock,
             )
-        logger.info("capture %s for session %s", outcome.get("status"), outcome.get("job_id"))
+        log_hook_event(
+            logger,
+            logging.INFO,
+            "capture_succeeded",
+            f"capture {outcome.get('status')}",
+            source_agent="codex",
+            session_id=value.get("session_id"),
+        )
     except Exception as error:
-        logger.error("capture failed: %s", error)
+        event = (
+            "queue_unavailable"
+            if isinstance(error, sqlite3.Error)
+            else "capture_failed"
+        )
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            event,
+            (
+                "queue unavailable during capture"
+                if event == "queue_unavailable"
+                else "capture failed"
+            ),
+            source_agent="codex",
+            session_id=value.get("session_id"),
+        )
 
 
 if __name__ == "__main__":

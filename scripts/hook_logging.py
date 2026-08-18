@@ -7,11 +7,50 @@ import json
 import logging
 import os
 from pathlib import Path
+import stat
 
 try:
+    from .privacy import normalize_persistence_reason
     from .utils import open_secure_log_stream, prepare_secure_log_directory
 except ImportError:  # Standalone execution with scripts/ on sys.path.
+    from privacy import normalize_persistence_reason
     from utils import open_secure_log_stream, prepare_secure_log_directory
+
+
+_HOOK_EVENTS = frozenset(
+    {
+        "hook_log",
+        "malformed_input",
+        "transcript_missing",
+        "transcript_unreadable",
+        "capture_failed",
+        "queue_unavailable",
+        "capture_succeeded",
+        "capture_skipped",
+    }
+)
+_SOURCE_AGENTS = frozenset({"claude", "codex"})
+MAX_HOOK_CONTEXT_CHARS = 256
+
+
+def _safe_context(value: object, env: dict[str, str]) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > MAX_HOOK_CONTEXT_CHARS:
+        return None
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        return None
+    if normalize_persistence_reason(value, env) != value:
+        return None
+    return value
+
+
+def _safe_event_message(value: object, env: dict[str, str]) -> str:
+    text = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in str(value)
+    )
+    return normalize_persistence_reason(text, env)
 
 
 class HookJsonFormatter(logging.Formatter):
@@ -23,16 +62,31 @@ class HookJsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.fromtimestamp(record.created, timezone.utc)
+        event = getattr(record, "hook_event", "hook_log")
+        if event not in _HOOK_EVENTS:
+            event = "hook_log"
+        message = record.getMessage()
+        if event != "hook_log":
+            message = _safe_event_message(message, dict(os.environ))
         value = {
             "timestamp": timestamp.isoformat(timespec="milliseconds").replace(
                 "+00:00", "Z"
             ),
             "level": record.levelname,
             "component": self.component,
-            "event": "hook_log",
+            "event": event,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": message,
         }
+        source_agent = getattr(record, "source_agent", None)
+        if source_agent in _SOURCE_AGENTS:
+            value["source_agent"] = source_agent
+        session_id = _safe_context(
+            getattr(record, "session_id", None),
+            dict(os.environ),
+        )
+        if session_id is not None:
+            value["session_id"] = session_id
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -91,3 +145,40 @@ def configure_hook_logger(
     logger.setLevel(logging.INFO)
     logger.propagate = False
     return logger
+
+
+def log_hook_event(
+    logger: logging.Logger,
+    level: int,
+    event: str,
+    message: object,
+    *,
+    source_agent: str,
+    session_id: object = None,
+) -> None:
+    """Emit one structured, bounded hook event without exception metadata."""
+    logger.log(
+        level,
+        "%s",
+        message,
+        extra={
+            "hook_event": event,
+            "source_agent": source_agent,
+            "session_id": session_id,
+        },
+    )
+
+
+def classify_transcript_path(path: Path) -> str | None:
+    """Classify a transcript path without reading or exposing its contents."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "transcript_missing"
+    except OSError:
+        return "transcript_unreadable"
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return "transcript_unreadable"
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o444 == 0:
+        return "transcript_unreadable"
+    return None
