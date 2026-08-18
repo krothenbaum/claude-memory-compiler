@@ -6,9 +6,9 @@ from io import StringIO
 from types import SimpleNamespace
 from typing import Literal
 
-from scripts.status_app import StatusDashboard
 from scripts.providers import ProviderResult, ProviderRouter, TextRequest
 from scripts.queue import QueueRepository
+from scripts.status_app import StatusDashboard
 from scripts.status_store import (
     CompileStatus,
     HealthAlert,
@@ -19,7 +19,6 @@ from scripts.status_store import (
 )
 from scripts.transcripts import NormalizedSession, Turn
 from scripts.worker import MemoryWorker
-
 
 NOW = datetime(2026, 8, 18, 19, 0, tzinfo=UTC)
 
@@ -186,7 +185,7 @@ def test_dashboard_health_failure_is_bounded_and_refreshes_without_alerts(tmp_pa
 def test_public_dashboard_runner_composes_all_read_only_dependencies(
     tmp_path, monkeypatch
 ):
-    import scripts.status_app as status_app
+    from scripts import status_app
 
     queue_path = tmp_path / "scripts" / "jobs.sqlite3"
     config = SimpleNamespace(root_dir=tmp_path, queue_path=queue_path)
