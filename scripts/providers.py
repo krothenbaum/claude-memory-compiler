@@ -1092,6 +1092,9 @@ class RoutedResult:
 
 
 AttemptCallback = Callable[[ProviderResult], Awaitable[None] | None]
+AttemptStartCallback = Callable[
+    [Literal["codex", "claude"], str, TaskKind], Awaitable[None] | None
+]
 
 
 class ProviderRouter:
@@ -1102,6 +1105,7 @@ class ProviderRouter:
         codex: GenerationProvider,
         claude: GenerationProvider,
         *,
+        attempt_start_callback: AttemptStartCallback | None = None,
         attempt_callback: AttemptCallback | None = None,
         fallback_workspace_factory: (
             Callable[[WorkspaceRequest], WorkspaceRequest | Awaitable[WorkspaceRequest]]
@@ -1110,6 +1114,7 @@ class ProviderRouter:
     ) -> None:
         self._codex = codex
         self._claude = claude
+        self._attempt_start_callback = attempt_start_callback
         self._attempt_callback = attempt_callback
         self._fallback_workspace_factory = fallback_workspace_factory
 
@@ -1121,6 +1126,30 @@ class ProviderRouter:
         if inspect.isawaitable(callback_result):
             await callback_result
 
+    async def _record_start(
+        self,
+        provider: Literal["codex", "claude"],
+        model: str,
+        task: TaskKind,
+    ) -> None:
+        """Record provider invocation immediately before the provider call."""
+        if self._attempt_start_callback is None:
+            return
+        callback_result = self._attempt_start_callback(provider, model, task)
+        if inspect.isawaitable(callback_result):
+            await callback_result
+
+    @staticmethod
+    def _provider_model(
+        provider_name: Literal["codex", "claude"],
+        provider: GenerationProvider,
+        task: TaskKind,
+    ) -> str:
+        model = getattr(provider, "_model", None)
+        if provider_name == "codex":
+            model = getattr(provider, "_task_models", {}).get(task, model)
+        return model or "unknown"
+
     async def _attempt(
         self,
         provider_name: Literal["codex", "claude"],
@@ -1129,19 +1158,17 @@ class ProviderRouter:
         request: TextRequest,
     ) -> ProviderResult:
         started = time.monotonic()
+        model = self._provider_model(provider_name, provider, request.task)
+        await self._record_start(provider_name, model, request.task)
         try:
             method = getattr(provider, operation)
             return await method(request)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            model = getattr(provider, "_model", None)
-            if provider_name == "codex":
-                task_models = getattr(provider, "_task_models", {})
-                model = task_models.get(request.task, model)
             return ProviderResult(
                 provider=provider_name,
-                model=model or "unknown",
+                model=model,
                 task=request.task,
                 outcome="error",
                 elapsed_ms=max(0, round((time.monotonic() - started) * 1000)),
