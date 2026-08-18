@@ -158,3 +158,105 @@ async def test_selection_persists_by_run_id_across_regrouping(tmp_path):
         dashboard.selected_run_id = 2
         await dashboard.refresh_snapshot()
         assert dashboard.selected_run_id == 2
+
+
+@async_test
+async def test_keyboard_selection_filter_and_acknowledgment(tmp_path):
+    queries = []
+    acknowledged = []
+
+    def reader(*_args, **kwargs):
+        queries.append(kwargs["query"])
+        return snapshot()
+
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=reader,
+        details_reader=lambda _path, run_id: details_for(run_id),
+        observer_loader=lambda _path: ObserverState.empty(),
+        acknowledger=lambda _path, run_id: (
+            acknowledged.append(run_id)
+            or ObserverState(1, frozenset({run_id}))
+        ),
+        clock=lambda: NOW,
+    )
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.selected_run_id == 1
+        await pilot.press("j")
+        await pilot.pause()
+        assert dashboard.selected_run_id == 2
+        await pilot.press("a")
+        await pilot.pause()
+        assert acknowledged == [2]
+        await pilot.press("/")
+        await pilot.press("m", "e", "m", "o", "r", "y", "enter")
+        assert queries[-1] == "memory"
+        await pilot.press("escape")
+        assert dashboard.filter_query == ""
+        await pilot.press("k")
+        await pilot.pause()
+        assert dashboard.selected_run_id == 1
+
+
+@async_test
+async def test_compact_enter_opens_and_escape_closes_details_overlay(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test(size=(60, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert dashboard.screen.query_one("#details-overlay")
+        await pilot.press("escape")
+        assert dashboard.screen.id == "_default"
+
+
+@async_test
+async def test_no_color_preserves_icons_and_labels(tmp_path):
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: snapshot(),
+        details_reader=lambda _path, run_id: details_for(run_id),
+        observer_loader=lambda _path: ObserverState.empty(),
+        acknowledger=lambda _path, _run_id: ObserverState.empty(),
+        clock=lambda: NOW,
+        no_color=True,
+    )
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.has_class("nocolor")
+        rendered = " ".join(
+            str(row.render()) for row in dashboard.query(".run-row")
+        )
+        assert "●" in rendered and "✓" in rendered and "✗" in rendered
+        assert "provider_started" in rendered
+
+
+@async_test
+async def test_live_resize_changes_visible_column_contract(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        wide = str(dashboard.query_one("#run-1").render())
+        assert "session-1" in wide and "provider" in wide and "elapsed" in wide
+        await pilot.resize_terminal(80, 40)
+        await pilot.pause()
+        stacked = str(dashboard.query_one("#run-1").render())
+        assert "session-1" not in stacked and "provider" in stacked
+        await pilot.resize_terminal(60, 30)
+        await pilot.pause()
+        compact = str(dashboard.query_one("#run-1").render())
+        assert "provider=" not in compact and "elapsed=" not in compact
+        assert "memory" in compact and "running" in compact
+
+
+@async_test
+async def test_quit_binding_exits_cleanly(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+    assert not dashboard.is_running

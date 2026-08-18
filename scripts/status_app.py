@@ -11,7 +11,9 @@ from typing import ClassVar
 
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, Static
 
 from scripts.status_store import (
@@ -30,6 +32,24 @@ from scripts.status_store import (
 
 SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
+
+
+class DetailsOverlay(ModalScreen[None]):
+    CSS = "#details-overlay { width: 90%; height: 80%; border: round cyan; padding: 1; }"
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "close", "Close"),
+        ("enter", "close", "Close"),
+    ]
+
+    def __init__(self, content: Text) -> None:
+        super().__init__()
+        self.content = content
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.content, id="details-overlay")
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class StatusDashboard(App[None]):
@@ -64,12 +84,25 @@ class StatusDashboard(App[None]):
     StatusDashboard.compact #main-grid { layout: vertical; }
     StatusDashboard.compact #details-pane { display: none; }
     StatusDashboard.compact #runs-pane { width: 1fr; height: 1fr; }
+    StatusDashboard.nocolor #app-header,
+    StatusDashboard.nocolor .run-row,
+    StatusDashboard.nocolor #health-banner,
+    StatusDashboard.nocolor #delayed-banner,
+    StatusDashboard.nocolor #diagnostic { color: $text; }
     """
 
-    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
-        ("q", "quit", "Quit"),
-        ("r", "refresh", "Refresh"),
-        ("?", "help", "Help"),
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("r", "refresh", "Refresh", priority=True),
+        Binding("?", "help", "Help", priority=True),
+        Binding("j", "next_run", "Next", priority=True),
+        Binding("down", "next_run", "Next", priority=True),
+        Binding("k", "previous_run", "Previous", priority=True),
+        Binding("up", "previous_run", "Previous", priority=True),
+        Binding("enter", "details", "Details"),
+        Binding("/", "filter", "Filter", priority=True),
+        Binding("escape", "escape", "Clear", priority=True),
+        Binding("a", "acknowledge", "Acknowledge", priority=True),
     ]
 
     def __init__(
@@ -102,14 +135,16 @@ class StatusDashboard(App[None]):
             self.observer_state = ObserverState.empty()
         self.snapshot: StatusSnapshot | None = None
         self.selected_run_id: int | None = None
-        self.query = ""
+        self.filter_query = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="app-header")
         yield Static(id="health-banner")
         yield Static("Status refresh delayed", id="delayed-banner")
         yield Static(id="diagnostic")
-        yield Input(placeholder="Filter status history", id="filter-input")
+        yield Input(
+            placeholder="Filter status history", id="filter-input", disabled=True
+        )
         with Horizontal(id="main-grid"):
             with Vertical(id="runs-pane"):
                 yield VerticalScroll(id="run-list")
@@ -119,12 +154,16 @@ class StatusDashboard(App[None]):
         yield Footer(id="status-footer")
 
     async def on_mount(self) -> None:
+        if self.no_color:
+            self.add_class("nocolor")
         self._set_layout(self.size.width)
         await self.refresh_snapshot()
         self.set_interval(1.0, self.refresh_snapshot)
 
-    def on_resize(self) -> None:
-        self._set_layout(self.size.width)
+    def on_resize(self, event) -> None:
+        self._set_layout(event.size.width)
+        if self.snapshot is not None:
+            self.call_later(self._render_snapshot)
 
     def _set_layout(self, width: int) -> None:
         self.remove_class("wide", "stacked", "compact")
@@ -147,7 +186,7 @@ class StatusDashboard(App[None]):
                 self.queue_path,
                 now=self._clock(),
                 observer_state=self.observer_state,
-                query=self.query,
+                query=self.filter_query,
                 health_alerts=self._health_loader(),
                 memory_home=self.memory_home,
             )
@@ -197,7 +236,7 @@ class StatusDashboard(App[None]):
                     "dead": "✗",
                 }[run.state]
                 row = Static(
-                    Text(f"{icon} {run.project:<18} {run.phase:<24} {run.summary or run.error or ''}"),
+                    Text(self._row_text(run, icon)),
                     id=f"run-{abs(run.id)}",
                     classes=f"run-row state-{run.state}",
                 )
@@ -208,7 +247,24 @@ class StatusDashboard(App[None]):
         self.query_one("#compile-panel", Static).update(
             Text(f"End-of-day compile  {compile_status.state}: {compile_status.summary}")
         )
+        self.query_one("#compile-panel", Static).set_class(
+            compile_status.run is not None, "selectable"
+        )
         self._render_details()
+
+    def _row_text(self, run: StatusRun, icon: str) -> str:
+        result = run.summary or run.error or "—"
+        if self.has_class("wide"):
+            return (
+                f"{icon} {run.project} {run.state} {run.phase} result={result} "
+                f"session={run.session_id} provider=— elapsed=—"
+            )
+        if self.has_class("stacked"):
+            return (
+                f"{icon} {run.project} {run.state} {run.phase} result={result} "
+                "provider=— elapsed=—"
+            )
+        return f"{icon} {run.project} {run.state} {run.phase} result={result}"
 
     def _render_details(self) -> None:
         target = self.query_one("#details", Static)
@@ -236,6 +292,65 @@ class StatusDashboard(App[None]):
         target.update(Text("\n".join(lines)))
 
     async def action_refresh(self) -> None:
+        await self.refresh_snapshot()
+
+    def _move_selection(self, delta: int) -> None:
+        runs = self._all_runs()
+        if not runs:
+            return
+        ids = [run.id for run in runs]
+        index = ids.index(self.selected_run_id) if self.selected_run_id in ids else 0
+        self.selected_run_id = ids[(index + delta) % len(ids)]
+        self.call_later(self._render_snapshot)
+
+    def action_next_run(self) -> None:
+        self._move_selection(1)
+
+    def action_previous_run(self) -> None:
+        self._move_selection(-1)
+
+    def action_details(self) -> None:
+        if not self.has_class("compact") or self.selected_run_id is None:
+            self._render_details()
+            return
+        self._render_details()
+        details = self.query_one("#details", Static).render()
+        self.push_screen(DetailsOverlay(Text(str(details))))
+
+    def action_filter(self) -> None:
+        field = self.query_one("#filter-input", Input)
+        field.display = True
+        field.disabled = False
+        field.value = self.filter_query
+        field.focus()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "filter-input":
+            return
+        self.filter_query = event.value.strip()
+        event.input.display = False
+        event.input.disabled = True
+        await self.refresh_snapshot()
+
+    async def action_escape(self) -> None:
+        if isinstance(self.screen, DetailsOverlay):
+            self.pop_screen()
+            return
+        field = self.query_one("#filter-input", Input)
+        field.display = False
+        field.disabled = True
+        if self.filter_query:
+            self.filter_query = ""
+            await self.refresh_snapshot()
+
+    async def action_acknowledge(self) -> None:
+        if self.snapshot is None or self.selected_run_id is None:
+            return
+        if self.selected_run_id not in {run.id for run in self.snapshot.attention}:
+            return
+        self.observer_state = self._acknowledger(
+            self.observer_path, self.selected_run_id
+        )
         await self.refresh_snapshot()
 
     def action_help(self) -> None:
