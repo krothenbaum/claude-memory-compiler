@@ -232,6 +232,104 @@ def test_exhausted_compile_failure_marks_run_dead_atomically(tmp_path):
         assert reservation(repository)["status"] == "failed"
 
 
+def test_exit_75_marker_completion_terminalizes_run_before_deleting_reservation(
+    tmp_path,
+):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        run_id = reservation(repository)["status_run_id"]
+        repository.transition_operation_run(run_id, "running", "staging_started")
+
+        assert repository.defer_auto_compile_generation(
+            OWNER,
+            FIRST,
+            lambda: ("covered", None, ("prior", "compiled")),
+            compiler_lock_held=False,
+            now=NOW + timedelta(seconds=5),
+            expires_at=NOW + timedelta(seconds=35),
+        ) is None
+
+        run = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{FIRST}"
+        )
+        assert run is not None
+        assert run.state == "succeeded"
+        assert run.phase == "succeeded"
+        assert run.completed_at == NOW + timedelta(seconds=5)
+        assert reservation(repository) is None
+
+
+def test_watchdog_marker_completion_terminalizes_run_before_deleting_reservation(
+    tmp_path,
+):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        run_id = reservation(repository)["status_run_id"]
+        repository.transition_operation_run(run_id, "running", "staging_started")
+
+        status, fingerprint = repository.poll_auto_compile_watcher(
+            WATCHDOG,
+            SUCCESSOR,
+            lambda _reservation: ("covered", None),
+            lambda _token: None,
+            predecessor_token=None,
+            now=NOW + timedelta(seconds=31),
+            watcher_expires_at=NOW + timedelta(seconds=60),
+            owner_expires_at=NOW + timedelta(seconds=60),
+        )
+
+        assert (status, fingerprint) == ("done", None)
+        run = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{FIRST}"
+        )
+        assert run is not None
+        assert run.state == "succeeded"
+        assert run.phase == "succeeded"
+        assert run.completed_at == NOW + timedelta(seconds=31)
+        assert reservation(repository) is None
+
+
+def test_changed_content_failure_creates_fresh_reserved_generation(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        first_run_id = reservation(repository)["status_run_id"]
+        repository.transition_operation_run(
+            first_run_id, "running", "staging_started"
+        )
+
+        outcome = repository.record_auto_compile_failure(
+            OWNER,
+            FIRST,
+            "provider_failed",
+            lambda: ("uncompiled", SECOND, ("prior",)),
+            now=NOW + timedelta(seconds=5),
+            expires_at=NOW + timedelta(seconds=35),
+            max_attempts=3,
+            retry_base_seconds=5,
+        )
+
+        assert outcome == "retry_wait"
+        current = reservation(repository)
+        assert current["fingerprint"] == SECOND
+        assert "attempt_count" not in current
+        first = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{FIRST}"
+        )
+        second = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{SECOND}"
+        )
+        assert first is not None and second is not None
+        assert first.state == "failed"
+        assert first.phase == "failed"
+        assert second.state == "queued"
+        assert second.phase == "reserved"
+        assert second.summary is None
+        assert second.error is None
+        assert [event.phase for event in repository.status_events(second.id)] == [
+            "reserved"
+        ]
+
+
 def test_manual_compile_has_no_automatic_status_run(monkeypatch):
     monkeypatch.delenv("AI_MEMORY_AUTO_COMPILE", raising=False)
     monkeypatch.delenv("AI_MEMORY_STATUS_RUN_ID", raising=False)

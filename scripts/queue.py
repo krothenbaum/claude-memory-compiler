@@ -2302,6 +2302,25 @@ class QueueRepository:
                 self._connection.execute("COMMIT")
                 return "wait", None
             if observed_status == "covered":
+                completed_run = self._auto_compile_run_unlocked(reservation)
+                if completed_run is not None and completed_run.state in {
+                    "queued",
+                    "retrying",
+                }:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "running",
+                        "generation_recovered",
+                        now=now_dt,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "succeeded",
+                    "succeeded",
+                    now=now_dt,
+                    summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                )
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
@@ -2539,7 +2558,11 @@ class QueueRepository:
                     str(reservation["log_name"]), str(observed), now_dt
                 )
             run = self._auto_compile_run_unlocked(reservation)
-            if run is not None and run.state not in {"succeeded", "failed", "dead"}:
+            if (
+                not changed
+                and run is not None
+                and run.state not in {"succeeded", "failed", "dead"}
+            ):
                 if outcome == "retry_wait":
                     if run.state == "queued":
                         self._transition_auto_compile_run_unlocked(
@@ -2704,6 +2727,25 @@ class QueueRepository:
                 promoted_marker_prefix = tuple(pending_prefix)
                 active_observed = False
             if read_status == "covered" and observed is None:
+                completed_run = self._auto_compile_run_unlocked(reservation)
+                if completed_run is not None and completed_run.state in {
+                    "queued",
+                    "retrying",
+                }:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "running",
+                        "generation_recovered",
+                        now=now_dt,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "succeeded",
+                    "succeeded",
+                    now=now_dt,
+                    summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                )
                 self._connection.execute(
                     "DELETE FROM queue_metadata WHERE key = ?",
                     (AUTO_COMPILE_RESERVATION_KEY,),
