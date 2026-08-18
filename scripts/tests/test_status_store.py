@@ -114,6 +114,53 @@ def _create_version_2_queue(path, *, incompatible_status_view: bool = False) -> 
     connection.close()
 
 
+def _create_version_1_queue(path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            source_agent TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            available_at TEXT NOT NULL,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE (kind, source_agent, session_id, source_hash)
+        );
+        CREATE TABLE provider_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            task TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            elapsed_ms INTEGER NOT NULL
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         row[0]
@@ -218,10 +265,18 @@ def test_deduplicated_enqueue_lazily_adds_status_to_a_migrated_active_job(tmp_pa
             "SELECT count(*) FROM status_runs WHERE job_id = 41"
         ).fetchone()[0] == 1
 
-        repository.append_job_event(41, "codex_started", provider="codex")
+        repository.claim_next("worker", NOW, 30)
+        repository.append_job_event(
+            41,
+            "worker",
+            "codex_started",
+            expected_attempt_count=1,
+            provider="codex",
+        )
         assert repository.status_run_for_job(41).phase == "codex_started"
         assert [event.phase for event in repository.status_events(run.id)] == [
             "queued",
+            "worker_claimed",
             "codex_started",
         ]
 
@@ -303,7 +358,7 @@ def test_concurrent_version_2_openers_apply_status_migration_once(tmp_path, monk
 
     def synchronize_version_read(self, version):
         if version == 2:
-            both_observed_v2.wait(timeout=2)
+            both_observed_v2.wait(timeout=5)
 
     monkeypatch.setattr(
         queue_module.QueueRepository,
@@ -321,6 +376,42 @@ def test_concurrent_version_2_openers_apply_status_migration_once(tmp_path, monk
     assert versions == [3, 3]
     with QueueRepository(path, sync_usage=False) as repository:
         assert {"status_runs", "status_events"} <= _table_names(repository._connection)
+
+
+def test_concurrent_version_1_openers_apply_each_migration_step_once(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    _create_version_1_queue(path)
+    both_observed_v1 = threading.Barrier(2)
+
+    def synchronize_version_read(self, version):
+        if version == 1:
+            both_observed_v1.wait(timeout=5)
+
+    monkeypatch.setattr(
+        queue_module.QueueRepository,
+        "_migration_version_observed",
+        synchronize_version_read,
+    )
+
+    def open_repository(_):
+        with QueueRepository(path, sync_usage=False) as repository:
+            columns = {
+                row[1]
+                for row in repository._connection.execute(
+                    "PRAGMA table_info(provider_attempts)"
+                )
+            }
+            return (
+                repository._connection.execute("PRAGMA user_version").fetchone()[0],
+                "legacy_cost_usd" in columns,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(open_repository, range(2)))
+
+    assert results == [(3, True), (3, True)]
 
 
 def test_fresh_queue_contains_version_3_status_schema(tmp_path):
@@ -825,6 +916,11 @@ def test_operation_runs_are_idempotent_and_have_a_queryable_timeline(tmp_path):
             "reserved"
         ]
 
+        repository.transition_operation_run(
+            first.id,
+            "running",
+            "staging_started",
+        )
         repository.append_operation_event(
             first.id,
             "provider_started",
@@ -836,9 +932,10 @@ def test_operation_runs_are_idempotent_and_have_a_queryable_timeline(tmp_path):
         running = repository.status_run_for_operation(first.operation_key)
         assert running is not None
         assert running.phase == "provider_started"
-        assert running.state == "queued"
+        assert running.state == "running"
         assert [event.phase for event in repository.status_events(first.id)] == [
             "reserved",
+            "staging_started",
             "provider_started",
         ]
         assert repository.status_events(first.id)[-1].message == "Calling [REDACTED] now"
@@ -922,6 +1019,11 @@ def test_operation_transition_updates_summary_error_and_completion_atomically(tm
         assert run.operation_key is not None
         repository.transition_operation_run(
             run.id,
+            "running",
+            "staging_started",
+        )
+        repository.transition_operation_run(
+            run.id,
             "succeeded",
             "succeeded",
             summary=" Updated 6 articles ",
@@ -940,6 +1042,210 @@ def test_operation_transition_updates_summary_error_and_completion_atomically(tm
         assert terminal.phase == "succeeded"
         assert terminal.message == "Compile complete"
         assert terminal.details == {"changed_files": 6}
+
+
+def test_operation_events_and_transitions_reject_queued_success_contradictions(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:queued-contradiction",
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project="memory",
+        )
+
+        with pytest.raises(ValueError, match="phase"):
+            repository.append_operation_event(run.id, "succeeded")
+        with pytest.raises(ValueError, match="transition"):
+            repository.transition_operation_run(run.id, "succeeded", "succeeded")
+
+        unchanged = repository.status_run_for_operation(run.operation_key)
+        assert unchanged == run
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "reserved"
+        ]
+
+
+def test_terminal_operation_rejects_backwards_transitions_and_new_events(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:terminal",
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project="memory",
+        )
+        repository.transition_operation_run(run.id, "running", "staging_started")
+        repository.transition_operation_run(run.id, "succeeded", "succeeded")
+
+        with pytest.raises(ValueError, match="terminal"):
+            repository.transition_operation_run(run.id, "running", "staging_started")
+        with pytest.raises(ValueError, match="terminal"):
+            repository.append_operation_event(run.id, "provider_started")
+
+        completed = repository.status_run_for_operation(run.operation_key)
+        assert completed is not None
+        assert completed.state == "succeeded"
+        assert completed.phase == "succeeded"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "reserved",
+            "staging_started",
+            "succeeded",
+        ]
+
+
+def test_compile_operation_can_run_retry_recover_and_succeed(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:valid-lifecycle",
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project="memory",
+        )
+        repository.transition_operation_run(run.id, "running", "staging_started")
+        for phase in (
+            "provider_started",
+            "validation_started",
+            "apply_started",
+        ):
+            repository.append_operation_event(run.id, phase)
+        repository.transition_operation_run(
+            run.id,
+            "retrying",
+            "retry_wait",
+            error="retry compile",
+            level="warning",
+        )
+        repository.transition_operation_run(
+            run.id,
+            "running",
+            "generation_recovered",
+        )
+        repository.transition_operation_run(
+            run.id,
+            "succeeded",
+            "succeeded",
+            summary="Updated 4 articles",
+        )
+
+        completed = repository.status_run_for_operation(run.operation_key)
+        assert completed is not None
+        assert completed.state == "succeeded"
+        assert completed.phase == "succeeded"
+        assert completed.summary == "Updated 4 articles"
+        assert completed.error is None
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "reserved",
+            "staging_started",
+            "provider_started",
+            "validation_started",
+            "apply_started",
+            "retry_wait",
+            "generation_recovered",
+            "succeeded",
+        ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operation_key", " leading"),
+        ("operation_key", "contains\ncontrol"),
+        ("operation_key", "x" * 513),
+        ("kind", "unsupported"),
+        ("source_agent", "worker"),
+        ("session_id", ""),
+        ("session_id", "session\ncontrol"),
+        ("session_id", "x" * 257),
+        ("project", " trailing "),
+        ("project", "project\tcontrol"),
+        ("project", "x" * 257),
+    ],
+)
+def test_operation_identity_rejects_noncanonical_or_unsupported_values(
+    tmp_path, field, value
+):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        identity = {
+            "operation_key": "auto-compile:2026-08-18:identity",
+            "kind": "compile",
+            "source_agent": "claude",
+            "session_id": "session-1",
+            "project": "memory",
+        }
+        identity[field] = value
+        operation_key = identity.pop("operation_key")
+
+        with pytest.raises(ValueError, match=field):
+            repository.create_operation_run(operation_key, **identity)
+
+        assert repository._connection.execute(
+            "SELECT count(*) FROM status_runs"
+        ).fetchone()[0] == 0
+
+
+def test_operation_identity_rejects_configured_secrets(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    secret = "operation-secret-value"
+    with QueueRepository(
+        path,
+        clock=lambda: NOW,
+        redaction_env={"SERVICE_TOKEN": secret},
+        sync_usage=False,
+    ) as repository, pytest.raises(ValueError, match="operation_key"):
+        repository.create_operation_run(
+            f"auto-compile:{secret}",
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project="memory",
+        )
+
+
+def test_system_operation_allows_an_empty_session_id(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_operation_run(
+            "auto-compile:2026-08-18:system-no-session",
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project="memory",
+        )
+
+        assert run.session_id == ""
+
+
+def test_concurrent_operation_creation_reuses_one_run_and_reserved_event(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False):
+        pass
+    ready = threading.Barrier(2)
+
+    def create(_):
+        with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+            ready.wait(timeout=2)
+            return repository.create_operation_run(
+                "auto-compile:2026-08-18:concurrent",
+                kind="compile",
+                source_agent="system",
+                session_id="",
+                project="memory",
+            ).id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        run_ids = list(executor.map(create, range(2)))
+
+    assert run_ids[0] == run_ids[1]
+    with QueueRepository(path, sync_usage=False) as repository:
+        assert [
+            event.phase for event in repository.status_events(run_ids[0])
+        ] == ["reserved"]
 
 
 def test_idempotent_operation_creation_still_validates_requested_phase(tmp_path):

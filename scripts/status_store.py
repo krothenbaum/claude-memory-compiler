@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 try:
     from .privacy import normalize_persistence_reason
@@ -21,11 +21,44 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
 RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead"]
 EventLevel = Literal["info", "warning", "error"]
 ProviderName = Literal["codex", "claude"]
+RunKind = Literal["capture", "compile", "query_file", "connections", "semantic_lint"]
+SourceAgent = Literal["claude", "codex", "system"]
 type JsonScalar = str | int | float | bool | None
 
 _RUN_STATES = frozenset(get_args(RunState))
 _EVENT_LEVELS = frozenset(get_args(EventLevel))
 _PROVIDER_NAMES = frozenset(get_args(ProviderName))
+_RUN_KINDS = frozenset(get_args(RunKind))
+_SOURCE_AGENTS = frozenset(get_args(SourceAgent))
+
+_TERMINAL_STATES = frozenset({"succeeded", "failed", "dead"})
+_OPERATION_TRANSITIONS: Mapping[RunState, frozenset[RunState]] = {
+    "queued": frozenset({"running", "failed", "dead"}),
+    "running": frozenset({"retrying", "succeeded", "failed", "dead"}),
+    "retrying": frozenset({"running", "failed", "dead"}),
+    "succeeded": frozenset(),
+    "failed": frozenset(),
+    "dead": frozenset(),
+}
+_OPERATION_PHASES: Mapping[RunState, frozenset[str]] = {
+    "queued": frozenset({"queued", "reserved"}),
+    "running": frozenset(
+        {
+            "staging_started",
+            "provider_started",
+            "validation_started",
+            "apply_started",
+            "generation_recovered",
+        }
+    ),
+    "retrying": frozenset({"retry_wait", "recovery_pending"}),
+    "succeeded": frozenset({"succeeded"}),
+    "failed": frozenset({"failed"}),
+    "dead": frozenset({"dead"}),
+}
+
+MAX_OPERATION_KEY_CHARS = 512
+MAX_OPERATION_IDENTITY_CHARS = 256
 
 ALLOWED_PHASES = frozenset(
     {
@@ -141,6 +174,102 @@ def normalize_details(
             )
         normalized[key] = canonical_retry_at
     return MappingProxyType(normalized)
+
+
+def _validate_identity_text(
+    field: str,
+    value: str,
+    *,
+    max_chars: int,
+    allow_empty: bool,
+    redaction_env: Mapping[str, str],
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be text")
+    if not value:
+        if allow_empty:
+            return value
+        raise ValueError(f"{field} must not be empty")
+    if value != value.strip() or len(value) > max_chars:
+        raise ValueError(f"{field} must be canonical and at most {max_chars} characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{field} must not contain control characters")
+    if normalize_persistence_reason(value, redaction_env) != value:
+        raise ValueError(f"{field} must not contain secrets or noncanonical whitespace")
+    return value
+
+
+def validate_operation_identity(
+    operation_key: str,
+    kind: str,
+    source_agent: str,
+    session_id: str,
+    project: str,
+    *,
+    redaction_env: Mapping[str, str] | None = None,
+) -> tuple[str, RunKind, SourceAgent, str, str]:
+    """Validate bounded, canonical identity fields before operation persistence."""
+    env = redaction_env or {}
+    key = _validate_identity_text(
+        "operation_key",
+        operation_key,
+        max_chars=MAX_OPERATION_KEY_CHARS,
+        allow_empty=False,
+        redaction_env=env,
+    )
+    if not isinstance(kind, str) or kind not in _RUN_KINDS:
+        raise ValueError(f"invalid operation kind: {kind!r}")
+    if not isinstance(source_agent, str) or source_agent not in _SOURCE_AGENTS:
+        raise ValueError(f"invalid operation source_agent: {source_agent!r}")
+    session = _validate_identity_text(
+        "session_id",
+        session_id,
+        max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        allow_empty=source_agent == "system",
+        redaction_env=env,
+    )
+    project_name = _validate_identity_text(
+        "project",
+        project,
+        max_chars=MAX_OPERATION_IDENTITY_CHARS,
+        allow_empty=False,
+        redaction_env=env,
+    )
+    return (
+        key,
+        cast(RunKind, kind),
+        cast(SourceAgent, source_agent),
+        session,
+        project_name,
+    )
+
+
+def validate_operation_event(state: RunState, phase: str) -> None:
+    """Reject informative events incompatible with an operation's current state."""
+    if state in _TERMINAL_STATES:
+        raise ValueError(f"terminal operation state {state!r} cannot accept events")
+    if phase not in _OPERATION_PHASES[state]:
+        raise ValueError(f"status phase {phase!r} is incompatible with state {state!r}")
+
+
+def validate_operation_transition(
+    current_state: RunState,
+    target_state: RunState,
+    phase: str,
+) -> None:
+    """Validate an explicit operation state change and its target phase."""
+    if current_state in _TERMINAL_STATES:
+        raise ValueError(
+            f"terminal operation state {current_state!r} cannot transition"
+        )
+    if target_state not in _OPERATION_TRANSITIONS[current_state]:
+        raise ValueError(
+            f"invalid operation transition {current_state!r} -> {target_state!r}"
+        )
+    if phase not in _OPERATION_PHASES[target_state]:
+        raise ValueError(
+            f"status phase {phase!r} is incompatible with state {target_state!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -345,8 +474,8 @@ def create_operation_run_unlocked(
     connection: sqlite3.Connection,
     *,
     operation_key: str,
-    kind: str,
-    source_agent: str,
+    kind: RunKind,
+    source_agent: SourceAgent,
     session_id: str,
     project: str,
     phase: str,
@@ -354,8 +483,15 @@ def create_operation_run_unlocked(
     redaction_env: Mapping[str, str] | None = None,
 ) -> int:
     """Create a queued non-job run using the caller's transaction."""
-    if not operation_key.strip():
-        raise ValueError("operation_key must not be empty")
+    operation_key, kind, source_agent, session_id, project = validate_operation_identity(
+        operation_key,
+        kind,
+        source_agent,
+        session_id,
+        project,
+        redaction_env=redaction_env,
+    )
+    validate_operation_event("queued", phase)
     candidate = StatusRun(
         id=0,
         job_id=None,

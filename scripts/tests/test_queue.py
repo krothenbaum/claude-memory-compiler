@@ -131,6 +131,32 @@ def test_claim_is_atomic_and_cannot_be_claimed_twice(tmp_path):
         assert second.claim_next("worker-b", NOW, 120) is None
 
 
+def test_claim_rolls_back_when_status_event_insert_fails(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository._connection.execute(
+        """
+        CREATE TRIGGER reject_worker_claimed_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'worker_claimed'
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled claim status failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="controlled claim status failure"):
+        repository.claim_next("worker", NOW, 30)
+
+    job = repository.get_job(job_id)
+    run = repository.status_run_for_job(job_id)
+    assert job.status == "pending"
+    assert job.attempt_count == 0
+    assert job.lease_owner is None
+    assert run.state == "queued"
+    assert run.phase == "queued"
+    assert [event.phase for event in repository.status_events(run.id)] == ["queued"]
+
+
 def test_concurrent_claimers_observe_exactly_one_lease(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     with QueueRepository(path, clock=lambda: NOW) as repository:
@@ -198,6 +224,51 @@ def test_recover_stale_dead_letters_jobs_at_the_attempt_limit(tmp_path):
         assert repository.status_events(run.id)[-1].phase == "dead"
 
 
+def test_multi_row_stale_recovery_rolls_back_every_job_on_status_failure(
+    repository, tmp_path
+):
+    first_id = repository.enqueue_capture(
+        session(tmp_path, session_id="first", source_hash="first-hash")
+    ).job_id
+    second_id = repository.enqueue_capture(
+        session(tmp_path, session_id="second", source_hash="second-hash")
+    ).job_id
+    repository.claim_next("first-owner", NOW, 30)
+    repository.claim_next("second-owner", NOW, 30)
+    second_run = repository.status_run_for_job(second_id)
+    repository._connection.execute(
+        f"""
+        CREATE TRIGGER reject_second_recovery_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'recovery_pending' AND NEW.run_id = {second_run.id}
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled stale recovery status failure');
+        END
+        """
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="controlled stale recovery status failure",
+    ):
+        repository.recover_stale(NOW + timedelta(seconds=31))
+
+    for job_id, owner in (
+        (first_id, "first-owner"),
+        (second_id, "second-owner"),
+    ):
+        job = repository.get_job(job_id)
+        run = repository.status_run_for_job(job_id)
+        assert job.status == "leased"
+        assert job.lease_owner == owner
+        assert run.state == "running"
+        assert run.phase == "worker_claimed"
+        assert [event.phase for event in repository.status_events(run.id)] == [
+            "queued",
+            "worker_claimed",
+        ]
+
+
 def test_retry_respects_backoff_and_owner(repository, tmp_path):
     job_id = repository.enqueue_capture(session(tmp_path)).job_id
     repository.claim_next("worker", NOW, 30)
@@ -219,6 +290,139 @@ def test_retry_respects_backoff_and_owner(repository, tmp_path):
 
     assert repository.claim_next("worker", NOW + timedelta(minutes=4), 30) is None
     assert repository.claim_next("worker", available, 30).id == job_id
+
+
+def test_retry_rolls_back_when_status_event_insert_fails(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository.claim_next("worker", NOW, 30)
+    repository._connection.execute(
+        """
+        CREATE TRIGGER reject_retry_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'retry_wait'
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled retry status failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="controlled retry status failure"):
+        repository.retry(job_id, "worker", "provider failed", NOW)
+
+    job = repository.get_job(job_id)
+    run = repository.status_run_for_job(job_id)
+    assert job.status == "leased"
+    assert job.lease_owner == "worker"
+    assert job.last_error is None
+    assert run.state == "running"
+    assert run.phase == "worker_claimed"
+    assert [event.phase for event in repository.status_events(run.id)] == [
+        "queued",
+        "worker_claimed",
+    ]
+
+
+def test_job_events_use_authoritative_owner_and_attempt(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository.claim_next("worker", NOW, 30)
+
+    repository.append_job_event(
+        job_id,
+        "worker",
+        "codex_started",
+        expected_attempt_count=1,
+        provider="codex",
+    )
+
+    run = repository.status_run_for_job(job_id)
+    event = repository.status_events(run.id)[-1]
+    assert run.state == "running"
+    assert run.phase == "codex_started"
+    assert event.phase == "codex_started"
+    assert event.attempt == 1
+
+
+def test_stale_attempt_cannot_append_after_recovery_and_reclaim(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository.claim_next("worker", NOW, 30)
+    repository.recover_stale(NOW + timedelta(seconds=31))
+    repository.claim_next("worker", NOW + timedelta(seconds=31), 30)
+
+    with pytest.raises(LeaseOwnershipError):
+        repository.append_job_event(
+            job_id,
+            "worker",
+            "codex_succeeded",
+            expected_attempt_count=1,
+            provider="codex",
+        )
+
+    run = repository.status_run_for_job(job_id)
+    assert run.state == "running"
+    assert run.phase == "worker_claimed"
+    repository.append_job_event(
+        job_id,
+        "worker",
+        "codex_started",
+        expected_attempt_count=2,
+        provider="codex",
+    )
+    assert repository.status_events(run.id)[-1].attempt == 2
+
+
+def test_terminal_job_rejects_late_provider_success(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, max_attempts=1) as repository:
+        job_id = repository.enqueue_capture(session(tmp_path)).job_id
+        repository.claim_next("worker", NOW, 30)
+        repository.retry(job_id, "worker", "terminal failure", NOW)
+
+        with pytest.raises(LeaseOwnershipError):
+            repository.append_job_event(
+                job_id,
+                "worker",
+                "codex_succeeded",
+                expected_attempt_count=1,
+                provider="codex",
+            )
+
+        run = repository.status_run_for_job(job_id)
+        assert run.state == "dead"
+        assert run.phase == "dead"
+        assert repository.status_events(run.id)[-1].phase == "dead"
+
+
+def test_job_event_failure_rolls_back_phase_and_event(repository, tmp_path):
+    job_id = repository.enqueue_capture(session(tmp_path)).job_id
+    repository.claim_next("worker", NOW, 30)
+    repository._connection.execute(
+        """
+        CREATE TRIGGER reject_codex_started_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'codex_started'
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled job event failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="controlled job event failure"):
+        repository.append_job_event(
+            job_id,
+            "worker",
+            "codex_started",
+            expected_attempt_count=1,
+            provider="codex",
+        )
+
+    run = repository.status_run_for_job(job_id)
+    assert repository.get_job(job_id).status == "leased"
+    assert run.state == "running"
+    assert run.phase == "worker_claimed"
+    assert [event.phase for event in repository.status_events(run.id)] == [
+        "queued",
+        "worker_claimed",
+    ]
 
 
 def test_complete_and_dead_letter_transitions(tmp_path):
@@ -281,6 +485,41 @@ def test_status_event_failure_rolls_back_queue_completion(repository, tmp_path):
         "queued",
         "worker_claimed",
     ]
+
+
+def test_nested_enqueue_status_failure_preserves_the_caller_transaction(
+    repository, tmp_path
+):
+    repository._connection.execute("BEGIN IMMEDIATE")
+    repository._connection.execute(
+        "INSERT INTO queue_metadata(key, value) VALUES ('caller_sentinel', 'preserved')"
+    )
+    repository._connection.execute(
+        """
+        CREATE TEMP TRIGGER reject_nested_queued_event
+        BEFORE INSERT ON status_events
+        WHEN NEW.phase = 'queued'
+        BEGIN
+            SELECT RAISE(ABORT, 'controlled nested enqueue status failure');
+        END
+        """
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="controlled nested enqueue status failure",
+    ):
+        repository.enqueue_capture(session(tmp_path))
+
+    assert repository._connection.in_transaction is True
+    assert repository._connection.execute(
+        "SELECT value FROM queue_metadata WHERE key = 'caller_sentinel'"
+    ).fetchone()[0] == "preserved"
+    assert repository.count_jobs() == 0
+    assert repository._connection.execute(
+        "SELECT count(*) FROM status_runs"
+    ).fetchone()[0] == 0
+    repository._connection.execute("COMMIT")
 
 
 def test_queue_database_and_sidecars_are_owner_only_with_typical_umask(tmp_path):

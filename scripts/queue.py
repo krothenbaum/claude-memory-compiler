@@ -22,7 +22,9 @@ try:
         EventLevel,
         JsonScalar,
         ProviderName,
+        RunKind,
         RunState,
+        SourceAgent,
         StatusEvent,
         StatusRun,
         append_event_unlocked,
@@ -31,6 +33,9 @@ try:
         status_event_from_row,
         status_run_from_row,
         transition_run_unlocked,
+        validate_operation_event,
+        validate_operation_identity,
+        validate_operation_transition,
     )
     from .transcripts import NormalizedSession, render_turns
     from .usage import (
@@ -48,7 +53,9 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
         EventLevel,
         JsonScalar,
         ProviderName,
+        RunKind,
         RunState,
+        SourceAgent,
         StatusEvent,
         StatusRun,
         append_event_unlocked,
@@ -57,6 +64,9 @@ except ImportError:  # Direct execution with scripts/ on sys.path.
         status_event_from_row,
         status_run_from_row,
         transition_run_unlocked,
+        validate_operation_event,
+        validate_operation_identity,
+        validate_operation_transition,
     )
     from transcripts import NormalizedSession, render_turns
     from usage import (
@@ -108,6 +118,18 @@ _SYNTHESIZED_JOB_STATUS: dict[
     "dead": ("dead", "dead", "error", True),
 }
 
+_JOB_EVENT_PHASES = frozenset(
+    {
+        "codex_started",
+        "codex_succeeded",
+        "codex_failed",
+        "claude_started",
+        "claude_succeeded",
+        "claude_failed",
+        "daily_log_write_started",
+    }
+)
+
 _STATUS_SCHEMA_STATEMENTS = (
     """
 CREATE TABLE status_runs (
@@ -144,7 +166,72 @@ CREATE TABLE status_events (
     "CREATE INDEX status_runs_state_updated_idx ON status_runs(state, updated_at DESC)",
     "CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id)",
 )
-_STATUS_SCHEMA_SQL = ";\n".join(_STATUS_SCHEMA_STATEMENTS) + ";"
+
+_QUEUE_V2_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (
+            kind IN ('capture', 'compile', 'query_file', 'connections', 'semantic_lint')
+        ),
+        source_agent TEXT NOT NULL CHECK (
+            source_agent IN ('claude', 'codex', 'system')
+        ),
+        session_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (
+            status IN ('pending', 'leased', 'succeeded', 'failed', 'dead')
+        ),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        available_at TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE (kind, source_agent, session_id, source_hash)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS provider_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        task TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        elapsed_ms INTEGER NOT NULL,
+        legacy_cost_usd REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS jobs_status_available_idx ON jobs(status, available_at)",
+    "CREATE INDEX IF NOT EXISTS jobs_lease_expiry_idx ON jobs(lease_expires_at)",
+    "CREATE TABLE IF NOT EXISTS queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """
+    INSERT OR IGNORE INTO queue_metadata(key, value)
+    VALUES ('queue_id', lower(hex(randomblob(16))))
+    """,
+)
+
+_VERSION_1_TO_2_STATEMENTS = (
+    "ALTER TABLE provider_attempts ADD COLUMN legacy_cost_usd REAL",
+    "CREATE TABLE queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """
+    INSERT INTO queue_metadata(key, value)
+    VALUES ('queue_id', lower(hex(randomblob(16))))
+    """,
+)
 
 
 class LeaseOwnershipError(RuntimeError):
@@ -330,131 +417,46 @@ class QueueRepository:
         """Test seam for synchronizing concurrent migration openers."""
 
     def _migrate(self) -> None:
-        version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        self._migration_version_observed(version)
-        if version > SCHEMA_VERSION:
+        observed_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+        self._migration_version_observed(observed_version)
+        if observed_version > SCHEMA_VERSION:
             raise RuntimeError(
-                f"queue schema {version} is newer than supported version {SCHEMA_VERSION}"
+                f"queue schema {observed_version} is newer than supported version "
+                f"{SCHEMA_VERSION}"
             )
-        if version == SCHEMA_VERSION:
+        if observed_version == SCHEMA_VERSION:
             return
-        if version == 1:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                self._connection.execute(
-                    "ALTER TABLE provider_attempts ADD COLUMN legacy_cost_usd REAL"
-                )
-                self._connection.execute(
-                    "CREATE TABLE queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-                )
-                self._connection.execute(
-                    "INSERT INTO queue_metadata(key, value) VALUES ('queue_id', lower(hex(randomblob(16))))"
-                )
-                self._connection.execute("PRAGMA user_version = 2")
-                self._connection.execute("COMMIT")
-                version = 2
-            except BaseException:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                raise
-        if version == 2:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                locked_version = self._connection.execute(
-                    "PRAGMA user_version"
-                ).fetchone()[0]
-                if locked_version == SCHEMA_VERSION:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            while True:
+                version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+                if version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"queue schema {version} is newer than supported version "
+                        f"{SCHEMA_VERSION}"
+                    )
+                if version == SCHEMA_VERSION:
                     self._connection.execute("COMMIT")
                     return
-                if locked_version > SCHEMA_VERSION:
-                    raise RuntimeError(
-                        f"queue schema {locked_version} is newer than supported "
-                        f"version {SCHEMA_VERSION}"
-                    )
-                if locked_version != 2:
-                    raise RuntimeError(
-                        f"queue schema changed from 2 to {locked_version} during migration"
-                    )
-                for statement in _STATUS_SCHEMA_STATEMENTS:
-                    self._connection.execute(statement)
-                self._connection.execute("PRAGMA user_version = 3")
-                self._connection.execute("COMMIT")
-                return
-            except BaseException:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                raise
-        try:
-            self._connection.executescript(
-                f"""
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL CHECK (
-                        kind IN ('capture', 'compile', 'query_file', 'connections', 'semantic_lint')
-                    ),
-                    source_agent TEXT NOT NULL CHECK (
-                        source_agent IN ('claude', 'codex', 'system')
-                    ),
-                    session_id TEXT NOT NULL,
-                    project TEXT NOT NULL,
-                    cwd TEXT NOT NULL,
-                    trigger TEXT NOT NULL,
-                    source_path TEXT NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        status IN ('pending', 'leased', 'succeeded', 'failed', 'dead')
-                    ),
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    available_at TEXT NOT NULL,
-                    lease_owner TEXT,
-                    lease_expires_at TEXT,
-                    last_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    UNIQUE (kind, source_agent, session_id, source_hash)
-                );
-                CREATE TABLE IF NOT EXISTS provider_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    task TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    reason TEXT,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    elapsed_ms INTEGER NOT NULL,
-                    legacy_cost_usd REAL
-                );
-                CREATE INDEX IF NOT EXISTS jobs_status_available_idx
-                    ON jobs(status, available_at);
-                CREATE INDEX IF NOT EXISTS jobs_lease_expiry_idx
-                    ON jobs(lease_expires_at);
-                CREATE TABLE IF NOT EXISTS queue_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                INSERT OR IGNORE INTO queue_metadata(key, value)
-                    VALUES ('queue_id', lower(hex(randomblob(16))));
-                {_STATUS_SCHEMA_SQL}
-                PRAGMA user_version = 3;
-                COMMIT;
-                """
-            )
-        except BaseException as error:
+                if version == 0:
+                    for statement in _QUEUE_V2_SCHEMA_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 2")
+                    continue
+                if version == 1:
+                    for statement in _VERSION_1_TO_2_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 2")
+                    continue
+                if version == 2:
+                    for statement in _STATUS_SCHEMA_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 3")
+                    continue
+                raise RuntimeError(f"unsupported queue schema version {version}")
+        except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
-            if (
-                isinstance(error, sqlite3.OperationalError)
-                and self._connection.execute("PRAGMA user_version").fetchone()[0]
-                == SCHEMA_VERSION
-            ):
-                return
             raise
 
     def _now(self) -> datetime:
@@ -580,23 +582,48 @@ class QueueRepository:
     def append_job_event(
         self,
         job_id: int,
+        owner: str,
         phase: str,
         *,
+        expected_attempt_count: int,
         level: EventLevel = "info",
         provider: ProviderName | None = None,
-        attempt: int | None = None,
         message: str | None = None,
         details: Mapping[str, JsonScalar] | None = None,
     ) -> None:
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if (
+            isinstance(expected_attempt_count, bool)
+            or not isinstance(expected_attempt_count, int)
+            or expected_attempt_count < 1
+        ):
+            raise ValueError("expected_attempt_count must be a positive integer")
+        if phase not in _JOB_EVENT_PHASES:
+            raise ValueError(f"invalid job event phase: {phase!r}")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            job = self._connection.execute(
+                """
+                SELECT attempt_count FROM jobs
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                    AND attempt_count = ?
+                """,
+                (job_id, owner, expected_attempt_count),
+            ).fetchone()
+            if job is None:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
             run = self.status_run_for_job(job_id)
+            if run.state != "running":
+                raise ValueError(
+                    f"leased job {job_id} has incompatible run state {run.state!r}"
+                )
             self._append_run_event(
                 run,
                 phase,
                 level=level,
                 provider=provider,
-                attempt=attempt,
+                attempt=job["attempt_count"],
                 message=message,
                 details=details,
             )
@@ -610,16 +637,25 @@ class QueueRepository:
         self,
         operation_key: str,
         *,
-        kind: str,
-        source_agent: str,
+        kind: RunKind,
+        source_agent: SourceAgent,
         session_id: str,
         project: str,
         phase: str = "reserved",
     ) -> StatusRun:
+        operation_key, kind, source_agent, session_id, project = (
+            validate_operation_identity(
+                operation_key,
+                kind,
+                source_agent,
+                session_id,
+                project,
+                redaction_env=self._redaction_env,
+            )
+        )
         if phase not in ALLOWED_PHASES:
             raise ValueError(f"invalid status phase: {phase!r}")
-        if not operation_key.strip():
-            raise ValueError("operation_key must not be empty")
+        validate_operation_event("queued", phase)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.status_run_for_operation(operation_key)
@@ -684,6 +720,7 @@ class QueueRepository:
             if row is None:
                 raise KeyError(run_id)
             run = status_run_from_row(row, redaction_env=self._redaction_env)
+            validate_operation_event(run.state, phase)
             self._append_run_event(
                 run,
                 phase,
@@ -717,11 +754,13 @@ class QueueRepository:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             row = self._connection.execute(
-                "SELECT id FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+                "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
                 (run_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(run_id)
+            run = status_run_from_row(row, redaction_env=self._redaction_env)
+            validate_operation_transition(run.state, state, phase)
             transition_run_unlocked(
                 self._connection,
                 run_id,
