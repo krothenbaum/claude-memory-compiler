@@ -2077,7 +2077,7 @@ class _ObserverAclApi:
 def test_windows_observer_directory_acl_validator_rejects_broad_access(
     tmp_path, monkeypatch
 ):
-    import scripts.windows_acl as windows_acl
+    from scripts import windows_acl
 
     api = _ObserverAclApi(owner_only=False)
     monkeypatch.setattr(windows_acl, "_active_api", lambda _api: api)
@@ -2091,7 +2091,7 @@ def test_windows_observer_directory_acl_validator_rejects_broad_access(
 def test_windows_observer_file_acl_validator_rejects_broad_access(
     tmp_path, monkeypatch
 ):
-    import scripts.windows_acl as windows_acl
+    from scripts import windows_acl
 
     api = _ObserverAclApi(owner_only=False)
     monkeypatch.setattr(windows_acl, "_active_api", lambda _api: api)
