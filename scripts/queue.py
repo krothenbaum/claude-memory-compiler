@@ -1356,6 +1356,19 @@ class QueueRepository:
     def _auto_compile_operation_key(log_name: str, fingerprint: str) -> str:
         return f"auto-compile:{log_name}:{fingerprint}"
 
+    @classmethod
+    def _run_matches_auto_compile_generation(
+        cls, run: StatusRun, log_name: str, fingerprint: str
+    ) -> bool:
+        base = cls._auto_compile_operation_key(log_name, fingerprint)
+        key = run.operation_key
+        return key == base or (
+            isinstance(key, str)
+            and key.startswith(f"{base}:")
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", key[len(base) + 1 :])
+            is not None
+        )
+
     def _create_auto_compile_run_unlocked(
         self,
         log_name: str,
@@ -1411,7 +1424,13 @@ class QueueRepository:
         log_name = reservation.get("log_name")
         if isinstance(fingerprint, str) and isinstance(log_name, str):
             run = self._auto_compile_run_unlocked(reservation)
-            if run is None or run.state in {"succeeded", "failed", "dead"}:
+            if (
+                run is None
+                or run.state in {"succeeded", "failed", "dead"}
+                or not self._run_matches_auto_compile_generation(
+                    run, log_name, fingerprint
+                )
+            ):
                 reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
                     log_name,
                     fingerprint,
@@ -1423,7 +1442,13 @@ class QueueRepository:
         pending_log = reservation.get("pending_log_name")
         if isinstance(pending, str) and isinstance(pending_log, str):
             run = self._auto_compile_run_unlocked(reservation, pending=True)
-            if run is None or run.state in {"succeeded", "failed", "dead"}:
+            if (
+                run is None
+                or run.state in {"succeeded", "failed", "dead"}
+                or not self._run_matches_auto_compile_generation(
+                    run, pending_log, pending
+                )
+            ):
                 reservation["pending_status_run_id"] = (
                     self._create_auto_compile_run_unlocked(
                         pending_log,
@@ -1447,7 +1472,12 @@ class QueueRepository:
     ) -> None:
         active = self._auto_compile_run_unlocked(reservation)
         pending = self._auto_compile_run_unlocked(reservation, pending=True)
-        for run, succeeded in ((active, active_succeeded), (pending, False)):
+        linked: dict[int, tuple[StatusRun, bool]] = {}
+        if active is not None:
+            linked[active.id] = (active, active_succeeded)
+        if pending is not None and pending.id not in linked:
+            linked[pending.id] = (pending, False)
+        for run, succeeded in linked.values():
             if run is None or run.state in {"succeeded", "failed", "dead"}:
                 continue
             if succeeded:
@@ -1827,11 +1857,19 @@ class QueueRepository:
                     reservation = json.loads(row["value"])
                 except (TypeError, json.JSONDecodeError):
                     reservation = {}
-            if reservation:
-                self._ensure_auto_compile_links_unlocked(reservation, now_dt)
             status = reservation.get("status")
+            if status == "failed":
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Restarting exhausted automatic compile reservation",
+                )
+                reservation = {}
+            elif reservation:
+                self._ensure_auto_compile_links_unlocked(reservation, now_dt)
             predecessor_token: str | None = None
-            if not reservation or status == "failed":
+            if not reservation:
                 status_run_id = self._create_auto_compile_run_unlocked(
                     log_name,
                     fingerprint,
@@ -2462,12 +2500,11 @@ class QueueRepository:
                 pending_run = self._auto_compile_run_unlocked(
                     reservation, pending=True
                 )
-                observed_key = self._auto_compile_operation_key(
-                    observed_log_name, observed_fingerprint
-                )
                 reused_pending = (
                     pending_run is not None
-                    and pending_run.operation_key == observed_key
+                    and self._run_matches_auto_compile_generation(
+                        pending_run, observed_log_name, observed_fingerprint
+                    )
                     and pending_run.state not in {"succeeded", "failed", "dead"}
                 )
                 for discarded in (
@@ -2923,12 +2960,11 @@ class QueueRepository:
                 pending_run = self._auto_compile_run_unlocked(
                     reservation, pending=True
                 )
-                expected_key = self._auto_compile_operation_key(
-                    str(promoted_log_name), str(observed)
-                )
                 reused_pending = (
                     pending_run is not None
-                    and pending_run.operation_key == expected_key
+                    and self._run_matches_auto_compile_generation(
+                        pending_run, str(promoted_log_name), str(observed)
+                    )
                     and pending_run.state not in {"succeeded", "failed", "dead"}
                 )
                 for discarded in (
@@ -3070,17 +3106,11 @@ class QueueRepository:
         else:
             required_markers = None
         run = self._auto_compile_run_unlocked(reservation)
-        expected_key = (
-            self._auto_compile_operation_key(log_name, fingerprint)
-            if isinstance(log_name, str)
-            else None
-        )
-        if run is None or not (
-            run.operation_key == expected_key
-            or (
-                expected_key is not None
-                and run.operation_key is not None
-                and run.operation_key.startswith(f"{expected_key}:")
+        if (
+            run is None
+            or not isinstance(log_name, str)
+            or not self._run_matches_auto_compile_generation(
+                run, log_name, fingerprint
             )
         ):
             return None
@@ -3388,13 +3418,14 @@ class QueueRepository:
                 pending_run = self._auto_compile_run_unlocked(
                     reservation, pending=True
                 )
-                expected_key = self._auto_compile_operation_key(
-                    str(promoted_log_name), str(observed_fingerprint)
-                )
                 reservation["status_run_id"] = (
                     pending_run.id
                     if pending_run is not None
-                    and pending_run.operation_key == expected_key
+                    and self._run_matches_auto_compile_generation(
+                        pending_run,
+                        str(promoted_log_name),
+                        str(observed_fingerprint),
+                    )
                     else self._create_auto_compile_run_unlocked(
                         str(promoted_log_name), str(observed_fingerprint), now_dt
                     )

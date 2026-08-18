@@ -449,6 +449,106 @@ def test_reservation_removal_terminalizes_all_linked_runs(tmp_path, removal):
             ).fetchone()[0] == "failed"
 
 
+def test_exhausted_reservation_reschedule_creates_only_one_fresh_run(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        first_id = reservation(repository)["status_run_id"]
+        repository.transition_operation_run(first_id, "running", "staging_started")
+        assert repository.record_auto_compile_failure(
+            OWNER,
+            FIRST,
+            "provider_failed",
+            lambda: ("uncompiled", FIRST, ("prior",)),
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=30),
+            max_attempts=1,
+            retry_base_seconds=5,
+        ) == "failed"
+
+        assert repository.schedule_auto_compile(
+            "4" * 64,
+            "5" * 64,
+            FIRST,
+            log_name=LOG_NAME,
+            required_marker_prefix=("prior",),
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=31),
+        ) == ("owner", "watchdog")
+
+        current = reservation(repository)
+        assert current["status_run_id"] != first_id
+        assert repository._connection.execute(
+            "SELECT count(*) FROM status_runs"
+        ).fetchone()[0] == 2
+        assert repository._connection.execute(
+            "SELECT state FROM status_runs WHERE id = ?",
+            (current["status_run_id"],),
+        ).fetchone()[0] == "queued"
+
+
+def test_takeover_reuses_suffixed_pending_generation(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository, SECOND)
+        terminal_id = reservation(repository)["status_run_id"]
+        repository.transition_operation_run(terminal_id, "failed", "failed")
+        repository.release_auto_compile(OWNER, SECOND)
+        schedule(repository, FIRST)
+        schedule(repository, SECOND)
+        pending_id = reservation(repository)["pending_status_run_id"]
+
+        status, claimed = repository.poll_auto_compile_watcher(
+            WATCHDOG,
+            SUCCESSOR,
+            lambda _reservation: (
+                "uncompiled",
+                {
+                    "fingerprint": SECOND,
+                    "log_name": LOG_NAME,
+                    "required_marker_prefix": ["prior"],
+                },
+            ),
+            lambda _token: None,
+            predecessor_token=None,
+            now=NOW + timedelta(seconds=31),
+            watcher_expires_at=NOW + timedelta(seconds=60),
+            owner_expires_at=NOW + timedelta(seconds=60),
+        )
+
+        assert (status, claimed) == ("claimed", SECOND)
+        assert reservation(repository)["status_run_id"] == pending_id
+        assert repository._connection.execute(
+            "SELECT state FROM status_runs WHERE id = ?", (pending_id,)
+        ).fetchone()[0] == "running"
+        assert repository._connection.execute(
+            "SELECT count(*) FROM status_runs"
+        ).fetchone()[0] == 3
+
+
+def test_aliased_active_pending_link_gets_one_terminal_event(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        current = reservation(repository)
+        run_id = current["status_run_id"]
+        current.update(
+            {
+                "pending_fingerprint": FIRST,
+                "pending_log_name": LOG_NAME,
+                "pending_required_marker_prefix": ["prior"],
+                "pending_status_run_id": run_id,
+            }
+        )
+        repository._connection.execute(
+            "UPDATE queue_metadata SET value = ? WHERE key = 'auto_compile_reservation'",
+            (json.dumps(current),),
+        )
+
+        assert repository.release_auto_compile(OWNER, FIRST)
+        assert [event.phase for event in repository.status_events(run_id)] == [
+            "reserved",
+            "failed",
+        ]
+
+
 def test_manual_compile_has_no_automatic_status_run(monkeypatch):
     monkeypatch.delenv("AI_MEMORY_AUTO_COMPILE", raising=False)
     monkeypatch.delenv("AI_MEMORY_STATUS_RUN_ID", raising=False)
