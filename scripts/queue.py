@@ -386,7 +386,11 @@ class QueueRepository:
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
-            self._migrate()
+            observed_version = self._connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
+            self._secure_database_files()
+            self._migrate(observed_version)
             self._secure_database_files()
             if sync_usage:
                 self._sync_usage_records()
@@ -437,8 +441,11 @@ class QueueRepository:
     def _migration_version_observed(self, version: int) -> None:
         """Test seam for synchronizing concurrent migration openers."""
 
-    def _migrate(self) -> None:
-        observed_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+    def _migrate(self, observed_version: int | None = None) -> None:
+        if observed_version is None:
+            observed_version = self._connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
         self._migration_version_observed(observed_version)
         if observed_version > SCHEMA_VERSION:
             raise RuntimeError(

@@ -615,6 +615,37 @@ def test_windows_queue_acl_failure_rejects_insecure_sidecar(tmp_path, monkeypatc
         QueueRepository(path, clock=lambda: NOW, sync_usage=False)
 
 
+def test_windows_queue_secures_sidecars_before_migration_writes(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    secured: set[Path] = set()
+    monkeypatch.setattr(queue_module, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(
+        queue_module,
+        "_secure_windows_queue_file",
+        lambda candidate: secured.add(Path(candidate)),
+    )
+
+    class MigrationObservingRepository(QueueRepository):
+        def _migration_version_observed(self, version):
+            assert version == 0
+            present = {
+                candidate
+                for candidate in (
+                    path,
+                    Path(f"{path}-wal"),
+                    Path(f"{path}-shm"),
+                )
+                if candidate.exists()
+            }
+            assert len(present) == 3
+            assert present <= secured
+
+    with MigrationObservingRepository(path, clock=lambda: NOW, sync_usage=False):
+        pass
+
+
 def test_queue_rejects_symlink_database_target(tmp_path):
     real = tmp_path / "attacker.sqlite3"
     real.write_bytes(b"attacker bytes")
