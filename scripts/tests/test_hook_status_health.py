@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -344,7 +345,20 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
 )
 @pytest.mark.parametrize(
     "queue_attack",
-    ["directory", "symlink", "hardlink", "unsafe_mode", "permission"],
+    [
+        "directory",
+        "symlink",
+        "hardlink",
+        "newer_schema",
+        pytest.param(
+            "unsafe_mode",
+            marks=pytest.mark.skipif(os.name == "nt", reason="POSIX mode required"),
+        ),
+        pytest.param(
+            "permission",
+            marks=pytest.mark.skipif(os.name == "nt", reason="POSIX mode required"),
+        ),
+    ],
 )
 def test_real_capture_child_classifies_unsafe_queue_boundary(
     tmp_path, hook_name, fixture_name, source_agent, queue_attack
@@ -370,6 +384,12 @@ def test_real_capture_child_classifies_unsafe_queue_boundary(
         invalid_queue = tmp_path / "queue-public.sqlite3"
         invalid_queue.write_bytes(b"")
         invalid_queue.chmod(0o644)
+    elif queue_attack == "newer_schema":
+        invalid_queue = tmp_path / "queue-newer.sqlite3"
+        connection = sqlite3.connect(invalid_queue)
+        connection.execute("PRAGMA user_version = 999")
+        connection.close()
+        invalid_queue.chmod(0o600)
     else:
         queue_parent_to_restore = tmp_path / "read-only-queue-parent"
         queue_parent_to_restore.mkdir()

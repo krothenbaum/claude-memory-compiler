@@ -89,14 +89,28 @@ def _guarded_outcome(env: Mapping[str, str]) -> CaptureOutcome | None:
 
 def _validate_live_queue_override(env: Mapping[str, str]) -> None:
     """Reject an unsafe configured queue identity before config resolution."""
-    configured = env.get("AI_MEMORY_QUEUE_PATH")
-    if not configured:
+    if "AI_MEMORY_QUEUE_PATH" not in env:
         return
+    configured = env.get("AI_MEMORY_QUEUE_PATH")
+    if not isinstance(configured, str) or not configured:
+        error = ValueError("AI_MEMORY_QUEUE_PATH must not be empty")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
     target = Path(configured).expanduser()
+    if not target.is_absolute():
+        error = ValueError("AI_MEMORY_QUEUE_PATH must be absolute")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
     try:
         info = target.lstat()
     except FileNotFoundError:
         return
+    except OSError as error:
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         error = ValueError("configured queue must be a regular non-symlink file")
         raise CaptureQueueUnavailableError(
@@ -478,6 +492,8 @@ def capture_transcript(
     if not source.is_file():
         raise ValueError("transcript_path must name a regular file")
 
+    if queue is None:
+        _validate_live_queue_override(source_env)
     if memory_home is None:
         root = load_config(source_env).root_dir
     else:
@@ -520,7 +536,6 @@ def capture_transcript(
         owns_queue = queue is None
         if queue is None:
             _check_deadline(deadline, monotonic)
-            _validate_live_queue_override(source_env)
             try:
                 queue_config = load_config(
                     {
@@ -529,7 +544,7 @@ def capture_transcript(
                         "CLAUDE_MEMORY_HOME": str(root),
                     }
                 )
-            except (OSError, ValueError) as error:
+            except OSError as error:
                 raise CaptureQueueUnavailableError(
                     "queue configuration is unavailable"
                 ) from error
@@ -569,6 +584,10 @@ def capture_transcript(
                 except (OSError, sqlite3.Error, ValueError) as error:
                     raise CaptureQueueUnavailableError(
                         "queue repository is unavailable"
+                    ) from error
+                except RuntimeError as error:
+                    raise CaptureQueueUnavailableError(
+                        "queue repository schema is unavailable"
                     ) from error
             else:  # pragma: no cover - the bounded loop always breaks or raises.
                 raise RuntimeError("queue open retry loop exhausted")
