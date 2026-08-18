@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import wraps
 
@@ -248,15 +249,15 @@ async def test_live_resize_changes_visible_column_contract(tmp_path):
     dashboard = app(tmp_path)
     async with dashboard.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        wide = str(dashboard.query_one("#run-1").render())
+        wide = str(dashboard.query_one("#run-positive-1").render())
         assert "session-1" in wide and "provider" in wide and "elapsed" in wide
         await pilot.resize_terminal(80, 40)
         await pilot.pause()
-        stacked = str(dashboard.query_one("#run-1").render())
+        stacked = str(dashboard.query_one("#run-positive-1").render())
         assert "session-1" not in stacked and "provider" in stacked
         await pilot.resize_terminal(60, 30)
         await pilot.pause()
-        compact = str(dashboard.query_one("#run-1").render())
+        compact = str(dashboard.query_one("#run-positive-1").render())
         assert "provider=" not in compact and "elapsed=" not in compact
         assert "memory" in compact and "running" in compact
 
@@ -347,7 +348,7 @@ async def test_compile_panel_is_not_duplicated_and_participates_in_navigation(tm
     dashboard = app(tmp_path)
     async with dashboard.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        assert len(dashboard.query("#run-4")) == 0
+        assert len(dashboard.query("#run-positive-4")) == 0
         for _ in range(3):
             await pilot.press("j")
             await pilot.pause()
@@ -372,11 +373,11 @@ async def test_only_active_rows_animate_between_refresh_ticks(tmp_path):
     dashboard = app(tmp_path)
     async with dashboard.run_test() as pilot:
         await pilot.pause()
-        active_before = str(dashboard.query_one("#run-1").render())
-        terminal_before = str(dashboard.query_one("#run-3").render())
+        active_before = str(dashboard.query_one("#run-positive-1").render())
+        terminal_before = str(dashboard.query_one("#run-positive-3").render())
         await dashboard.refresh_snapshot()
-        active_after = str(dashboard.query_one("#run-1").render())
-        terminal_after = str(dashboard.query_one("#run-3").render())
+        active_after = str(dashboard.query_one("#run-positive-1").render())
+        terminal_after = str(dashboard.query_one("#run-positive-3").render())
         assert active_before != active_after
         assert terminal_before == terminal_after
 
@@ -392,7 +393,7 @@ async def test_no_color_environment_presence_and_constructor_are_additive(
         assert dashboard.no_color is True
         assert dashboard.has_class("nocolor")
         assert dashboard.screen.has_class("nocolor")
-        assert dashboard.query_one("#run-1").has_class("state-running")
+        assert dashboard.query_one("#run-positive-1").has_class("state-running")
 
     explicit = StatusDashboard(
         tmp_path / "jobs.sqlite3",
@@ -405,3 +406,54 @@ async def test_no_color_environment_presence_and_constructor_are_additive(
         no_color=True,
     )
     assert explicit.no_color is True
+
+
+@async_test
+async def test_signed_ids_and_concurrent_refreshes_do_not_duplicate_rows(tmp_path):
+    value = snapshot()
+    mixed = StatusSnapshot(
+        active=(value.active[0], replace(value.active[0], id=-1, job_id=1)),
+        attention=value.attention,
+        recent=value.recent,
+        compile=value.compile,
+        health_alerts=(),
+    )
+    dashboard = app(tmp_path, lambda *_args, **_kwargs: mixed)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        await asyncio.gather(
+            dashboard.refresh_snapshot(),
+            dashboard.refresh_snapshot(),
+            dashboard._render_snapshot(),
+        )
+        assert dashboard.query_one("#run-positive-1")
+        assert dashboard.query_one("#run-legacy-1")
+        assert len(dashboard.query(".run-row")) == 4
+
+
+@async_test
+async def test_non_busy_operational_error_and_ack_failure_are_diagnostic(tmp_path):
+    def broken(*_args, **_kwargs):
+        raise sqlite3.OperationalError("no such table")
+
+    diagnostic = app(tmp_path, broken)
+    async with diagnostic.run_test() as pilot:
+        await pilot.pause()
+        assert diagnostic.query_one("#diagnostic").display is True
+        assert diagnostic.query_one("#delayed-banner").display is False
+
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: snapshot(),
+        details_reader=lambda _path, run_id: details_for(run_id),
+        observer_loader=lambda _path: ObserverState.empty(),
+        acknowledger=lambda *_args: (_ for _ in ()).throw(PermissionError("denied")),
+        clock=lambda: NOW,
+    )
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("j", "a")
+        await pilot.pause()
+        assert dashboard.snapshot is not None
+        assert "denied" in str(dashboard.query_one("#diagnostic").render())
