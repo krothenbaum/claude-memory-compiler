@@ -2963,3 +2963,12 @@ def test_run_details_queries_share_one_read_transaction(tmp_path, monkeypatch):
 
     assert [event.phase for event in details.events] == ["queued"]
     assert details.provider_attempts == ()
+def test_bounded_snapshot_rejects_invalid_max_runs(tmp_path):
+    for maximum in (0, -1, True, 10_001):
+        with pytest.raises(ValueError, match="max_runs"):
+            status_store_module.read_snapshot(
+                tmp_path / "missing.sqlite3",
+                now=READ_NOW,
+                observer_state=status_store_module.ObserverState.empty(),
+                max_runs=maximum,
+            )
