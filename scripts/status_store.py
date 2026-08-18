@@ -1439,6 +1439,7 @@ def read_snapshot(
     health_alerts: tuple[HealthAlert, ...] = (),
     memory_home: Path | None = None,
     max_runs: int | None = None,
+    compile_probes: CompileReadinessProbes | None = None,
 ) -> StatusSnapshot:
     """Read and group status without creating, migrating, or mutating the queue."""
     if now.tzinfo is None or now.utcoffset() is None:
@@ -1525,15 +1526,19 @@ def read_snapshot(
     compile_status = project_compile_status(
         compile_run=compile_run,
         queue_active_count=queue_active_count,
-        probes=CompileReadinessProbes(
-            local_now=lambda: now.astimezone(),
-            session_count=_default_session_count,
-            daily_state=(
-                (lambda: _default_daily_state(resolved, now, memory_home))
-                if memory_home is not None
-                else (lambda: _default_daily_state(resolved, now))
-            ),
-            reservation_state=lambda: reservation_state,
+        probes=(
+            compile_probes
+            if compile_probes is not None
+            else CompileReadinessProbes(
+                local_now=lambda: now.astimezone(),
+                session_count=_default_session_count,
+                daily_state=(
+                    (lambda: _default_daily_state(resolved, now, memory_home))
+                    if memory_home is not None
+                    else (lambda: _default_daily_state(resolved, now))
+                ),
+                reservation_state=lambda: reservation_state,
+            )
         ),
     )
     has_more = False

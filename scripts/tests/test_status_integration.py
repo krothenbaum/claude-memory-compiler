@@ -10,6 +10,7 @@ from scripts.providers import ProviderResult, ProviderRouter, TextRequest
 from scripts.queue import QueueRepository
 from scripts.status_app import StatusDashboard
 from scripts.status_store import (
+    CompileReadinessProbes,
     CompileStatus,
     HealthAlert,
     ObserverState,
@@ -225,6 +226,15 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
     writes = []
     live_started = asyncio.Event()
     live_release = asyncio.Event()
+    compile_probes = CompileReadinessProbes(
+        local_now=lambda: NOW,
+        session_count=lambda: 0,
+        daily_state=lambda: "covered",
+        reservation_state=lambda: None,
+    )
+
+    def project_snapshot(path, **kwargs):
+        return read_snapshot(path, compile_probes=compile_probes, **kwargs)
 
     class Provider:
         def __init__(self, name: Literal["codex", "claude"]):
@@ -313,7 +323,7 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
             assert retry is not None and retry.session_id == "session-fail"
             await worker.process(retry)
 
-            closed_snapshot = read_snapshot(
+            closed_snapshot = project_snapshot(
                 queue_path,
                 now=current[0],
                 observer_state=ObserverState.empty(),
@@ -354,6 +364,8 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
             dashboard = StatusDashboard(
                 queue_path,
                 memory_home=root,
+                snapshot_reader=project_snapshot,
+                details_reader=read_run_details,
                 observer_loader=lambda _path: ObserverState.empty(),
                 health_loader=lambda *_args, **_kwargs: (),
                 clock=lambda: current[0],
@@ -371,22 +383,40 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
                 )
                 assert live_run.phase == "codex_started"
 
+            assert not dashboard.is_running
+            assert not live_release.is_set()
             assert worker_task is not None and not worker_task.done()
             live_release.set()
             assert await worker_task is True
 
-            reopened = read_snapshot(
+            reopened_dashboard = StatusDashboard(
                 queue_path,
-                now=current[0],
-                observer_state=ObserverState.empty(),
                 memory_home=root,
-                max_runs=200,
+                snapshot_reader=project_snapshot,
+                details_reader=read_run_details,
+                observer_loader=lambda _path: ObserverState.empty(),
+                health_loader=lambda *_args, **_kwargs: (),
+                clock=lambda: current[0],
             )
-            final_live = next(
-                run for run in reopened.recent if run.session_id == "session-live"
-            )
-            assert final_live.state == "succeeded"
-            assert final_live.summary == "Saved 16 characters"
+            assert reopened_dashboard is not dashboard
+            async with reopened_dashboard.run_test() as pilot:
+                await pilot.pause()
+                await reopened_dashboard.refresh_snapshot()
+                assert reopened_dashboard.snapshot is not None
+                final_live = next(
+                    run
+                    for run in reopened_dashboard.snapshot.recent
+                    if run.session_id == "session-live"
+                )
+                assert final_live.state == "succeeded"
+                assert final_live.summary == "Saved 16 characters"
+                rendered = str(
+                    reopened_dashboard.query_one(
+                        f"#run-positive-{final_live.id}"
+                    ).render()
+                )
+                assert "succeeded" in rendered
+                assert "Saved 16 characters" in rendered
 
     asyncio.run(exercise())
     assert writes == [
