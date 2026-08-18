@@ -6,7 +6,6 @@ import io
 import json
 import logging
 import os
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -17,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts import capture as capture_module
 from scripts import hook_logging
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,7 +113,7 @@ def test_precompact_structured_input_errors_are_visible_to_health_reader(
     [
         (ValueError("capture problem"), "capture_failed", True),
         (
-            hook_logging.QueueUnavailableError("queue denied"),
+            capture_module.CaptureQueueUnavailableError("queue denied"),
             "queue_unavailable",
             True,
         ),
@@ -326,7 +326,7 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
         hook,
         "enqueue_capture_with_deadline",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("database is unavailable")
+            capture_module.CaptureQueueUnavailableError("database is unavailable")
         ),
     )
 
@@ -342,14 +342,39 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
         ("codex-session-end.py", "codex-basic.jsonl", "codex"),
     ],
 )
-def test_real_capture_child_classifies_invalid_queue_directory(
-    tmp_path, hook_name, fixture_name, source_agent
+@pytest.mark.parametrize(
+    "queue_attack",
+    ["directory", "symlink", "hardlink", "unsafe_mode", "permission"],
+)
+def test_real_capture_child_classifies_unsafe_queue_boundary(
+    tmp_path, hook_name, fixture_name, source_agent, queue_attack
 ):
     memory_home = tmp_path / "memory"
-    queue_parent = tmp_path / "read-only-queue-parent"
-    queue_parent.mkdir()
-    queue_parent.chmod(0o500)
-    invalid_queue = queue_parent / "jobs.sqlite3"
+    queue_parent_to_restore: Path | None = None
+    if queue_attack == "directory":
+        invalid_queue = tmp_path / "queue-is-a-directory"
+        invalid_queue.mkdir()
+    elif queue_attack == "symlink":
+        target = tmp_path / "queue-target.sqlite3"
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        invalid_queue = tmp_path / "queue-symlink.sqlite3"
+        invalid_queue.symlink_to(target)
+    elif queue_attack == "hardlink":
+        target = tmp_path / "queue-target.sqlite3"
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        invalid_queue = tmp_path / "queue-hardlink.sqlite3"
+        os.link(target, invalid_queue)
+    elif queue_attack == "unsafe_mode":
+        invalid_queue = tmp_path / "queue-public.sqlite3"
+        invalid_queue.write_bytes(b"")
+        invalid_queue.chmod(0o644)
+    else:
+        queue_parent_to_restore = tmp_path / "read-only-queue-parent"
+        queue_parent_to_restore.mkdir()
+        queue_parent_to_restore.chmod(0o500)
+        invalid_queue = queue_parent_to_restore / "jobs.sqlite3"
     transcript = (
         Path(__file__).resolve().parent / "fixtures" / "transcripts" / fixture_name
     )
@@ -378,7 +403,8 @@ def test_real_capture_child_classifies_invalid_queue_directory(
             check=False,
         )
     finally:
-        queue_parent.chmod(0o700)
+        if queue_parent_to_restore is not None:
+            queue_parent_to_restore.chmod(0o700)
 
     assert result.returncode == 0
     assert result.stdout == ""
@@ -476,7 +502,9 @@ def test_hook_log_handler_failure_never_writes_record_to_stdio(
         (ValueError("database appears in unrelated content"), "capture_failed"),
         (PermissionError("unrelated permission denied"), "capture_failed"),
         (
-            hook_logging.QueueUnavailableError("custom queue permission denied"),
+            capture_module.CaptureQueueUnavailableError(
+                "custom queue permission denied"
+            ),
             "queue_unavailable",
         ),
     ],

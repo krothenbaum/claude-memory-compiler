@@ -750,7 +750,7 @@ def test_capture_fails_closed_under_database_contention_before_hook_deadline(tmp
     launched = []
     started = time.monotonic()
     try:
-        with pytest.raises(sqlite3.OperationalError):
+        with pytest.raises(capture_module.CaptureQueueUnavailableError) as caught:
             capture_transcript(
                 source,
                 source_agent="claude",
@@ -759,6 +759,7 @@ def test_capture_fails_closed_under_database_contention_before_hook_deadline(tmp
                 launcher=lambda root: launched.append(root),
                 env={},
             )
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
     finally:
         elapsed = time.monotonic() - started
         locker.execute("ROLLBACK")
@@ -767,6 +768,93 @@ def test_capture_fails_closed_under_database_contention_before_hook_deadline(tmp
     assert elapsed < 1.0
     assert launched == []
     assert list((home / "scripts" / "spool").glob("*.jsonl"))
+
+
+@pytest.mark.parametrize(
+    "queue_error",
+    [
+        sqlite3.OperationalError("unable to open database"),
+        PermissionError("queue permission denied"),
+        ValueError("queue path must not be a symlink"),
+    ],
+)
+def test_capture_wraps_repository_open_failures_with_typed_queue_error(
+    tmp_path, monkeypatch, queue_error
+):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+
+    class FailingRepository:
+        def __init__(self, *_args, **_kwargs):
+            raise queue_error
+
+    monkeypatch.setattr(capture_module, "QueueRepository", FailingRepository)
+
+    with pytest.raises(capture_module.CaptureQueueUnavailableError) as caught:
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=tmp_path / "memory",
+            launcher=lambda _root: None,
+            env={},
+        )
+
+    assert caught.value.__cause__ is queue_error
+
+
+def test_capture_wraps_repository_enqueue_storage_failure(tmp_path):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    queue_error = sqlite3.OperationalError("enqueue failed")
+
+    class FailingQueue:
+        def enqueue_capture(self, _normalized):
+            raise queue_error
+
+    with pytest.raises(capture_module.CaptureQueueUnavailableError) as caught:
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=tmp_path / "memory",
+            queue=FailingQueue(),
+            launcher=lambda _root: None,
+            env={},
+        )
+
+    assert caught.value.__cause__ is queue_error
+
+
+def test_windows_queue_permission_boundary_uses_typed_capture_error(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.jsonl"
+    write_claude_transcript(source)
+    queue_error = PermissionError("Windows queue ACL denied")
+
+    class WindowsDeniedRepository:
+        def __init__(self, *_args, **_kwargs):
+            raise queue_error
+
+    monkeypatch.setattr(capture_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        capture_module,
+        "QueueRepository",
+        WindowsDeniedRepository,
+    )
+
+    with pytest.raises(capture_module.CaptureQueueUnavailableError) as caught:
+        capture_transcript(
+            source,
+            source_agent="claude",
+            metadata={"trigger": "session_end"},
+            memory_home=tmp_path / "memory",
+            launcher=lambda _root: None,
+            env={},
+        )
+
+    assert caught.value.__cause__ is queue_error
 
 
 def test_capture_rejects_symlinked_spool_component(tmp_path):

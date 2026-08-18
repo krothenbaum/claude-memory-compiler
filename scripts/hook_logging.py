@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,10 +33,6 @@ _HOOK_EVENTS = frozenset(
 _SOURCE_AGENTS = frozenset({"claude", "codex"})
 MAX_HOOK_CONTEXT_CHARS = 256
 _ABSOLUTE_PATH_START = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|/)")
-
-
-class QueueUnavailableError(PermissionError):
-    """Typed custom queue permission failure for hook classification."""
 
 
 def _safe_context(value: object, env: dict[str, str]) -> str | None:
@@ -262,16 +257,10 @@ def classify_capture_error(error: BaseException) -> str:
         "capture_failed",
     }:
         return child_event
-    traceback = error.__traceback__
-    queue_boundary = False
-    while traceback is not None:
-        module_name = traceback.tb_frame.f_globals.get("__name__")
-        if module_name in {"queue", "scripts.queue"}:
-            queue_boundary = True
-            break
-        traceback = traceback.tb_next
-    if isinstance(error, (sqlite3.Error, QueueUnavailableError)) or (
-        isinstance(error, PermissionError) and queue_boundary
-    ):
+    try:
+        from .capture import CaptureQueueUnavailableError
+    except ImportError:  # Direct execution with scripts/ on sys.path.
+        from capture import CaptureQueueUnavailableError
+    if isinstance(error, CaptureQueueUnavailableError):
         return "queue_unavailable"
     return "capture_failed"
