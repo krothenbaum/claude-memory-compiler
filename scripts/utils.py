@@ -270,8 +270,11 @@ def _prepare_private_state_parent(parent: Path) -> os.stat_result:
     try:
         info = parent.lstat()
     except FileNotFoundError:
-        parent.mkdir(parents=True, mode=0o700)
-        created = True
+        try:
+            parent.mkdir(parents=True, mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
         _validate_no_linked_ancestors(parent)
         info = parent.lstat()
     _validate_private_state_directory(info, parent)
@@ -296,6 +299,111 @@ def _relative_stat(directory_descriptor: int, name: str) -> os.stat_result | Non
         return os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return None
+
+
+@dataclass(frozen=True)
+class SecureReadIdentity:
+    """Pinned identity for a private regular file opened without following links."""
+
+    path: Path
+    device: int
+    inode: int
+    size: int
+
+
+def _validate_secure_read_directory(info: os.stat_result, path: Path) -> None:
+    if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"secure read parent is unsafe: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"secure read parent is unsafe: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"secure read parent is unsafe: {path}")
+
+
+def _validate_windows_inherited_directory(path: Path) -> None:
+    _secure_windows_runtime_directory(path, owner_only=False)
+
+
+def inspect_secure_read_file(path: Path | str) -> SecureReadIdentity:
+    """Validate and identity-pin a private file for a later read-only consumer."""
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    parent = target.parent
+    _validate_no_linked_ancestors(parent)
+    parent_before = parent.lstat()
+    _validate_secure_read_directory(parent_before, parent)
+    if _windows_acl_required():
+        _validate_windows_inherited_directory(parent)
+
+    if _PRIVATE_STATE_DIR_FD_SUPPORTED:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        descriptor = -1
+        try:
+            parent_opened = os.fstat(parent_descriptor)
+            parent_after = parent.lstat()
+            _validate_secure_read_directory(parent_opened, parent)
+            _validate_secure_read_directory(parent_after, parent)
+            if not _same_file_identity(parent_before, parent_opened) or not (
+                _same_file_identity(parent_opened, parent_after)
+            ):
+                raise ValueError(f"secure read parent identity changed: {parent}")
+            before = _relative_stat(parent_descriptor, target.name)
+            if before is None:
+                raise FileNotFoundError(target)
+            _validate_private_regular_file(before, target)
+            descriptor = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            _validate_private_regular_file(opened, target)
+            visible = _relative_stat(parent_descriptor, target.name)
+            if (
+                visible is None
+                or not _same_file_identity(before, opened)
+                or not _same_file_identity(opened, visible)
+            ):
+                raise ValueError(f"secure read file identity changed: {target}")
+            return SecureReadIdentity(
+                path=target,
+                device=opened.st_dev,
+                inode=opened.st_ino,
+                size=opened.st_size,
+            )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+    before = target.lstat()
+    _validate_private_regular_file(before, target)
+    descriptor = os.open(
+        target,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
+        visible = target.lstat()
+        if not _same_file_identity(before, opened) or not _same_file_identity(
+            opened, visible
+        ):
+            raise ValueError(f"secure read file identity changed: {target}")
+        return SecureReadIdentity(
+            path=target,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            size=opened.st_size,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _write_private_temp_posix(
@@ -1324,6 +1432,24 @@ class ExclusiveFileLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+@contextmanager
+def secure_private_state_lock(state_path: Path | str) -> Iterator[None]:
+    """Serialize one private-state mutation inside its secured directory."""
+    target = Path(os.path.abspath(Path(state_path).expanduser()))
+    _prepare_private_state_parent(target.parent)
+    lock_path = target.parent / ".status-view.lock"
+    lock = ExclusiveFileLock(lock_path)
+    with lock:
+        descriptor = lock._descriptor
+        if descriptor is None:  # pragma: no cover - guarded by context manager.
+            raise RuntimeError("private state lock has no retained descriptor")
+        _validate_private_regular_file(os.fstat(descriptor), lock_path)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, lock_path)
+            _validate_windows_owner_only_file_descriptor(descriptor, lock_path)
+        yield
 
 
 def append_daily_entry(

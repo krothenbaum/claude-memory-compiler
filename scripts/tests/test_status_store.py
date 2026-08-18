@@ -118,6 +118,7 @@ def _create_version_2_queue(path, *, incompatible_status_view: bool = False) -> 
         connection.execute("CREATE VIEW status_events AS SELECT 1 AS id")
     connection.commit()
     connection.close()
+    path.chmod(0o600)
 
 
 def _create_version_1_queue(path) -> None:
@@ -1519,6 +1520,39 @@ def test_snapshot_query_searches_older_approved_history(tmp_path):
     assert [run.id for run in snapshot.recent] == [6]
 
 
+def test_default_snapshot_filters_old_successes_in_sql(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    original_from_row = status_store_module.status_run_from_row
+    observed_ids: list[int] = []
+
+    def record_rows(row, **kwargs):
+        observed_ids.append(row["id"])
+        return original_from_row(row, **kwargs)
+
+    monkeypatch.setattr(status_store_module, "status_run_from_row", record_rows)
+
+    default = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert 6 not in observed_ids
+    assert all(run.id != 6 for run in default.recent)
+    observed_ids.clear()
+
+    searched = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        query="old-project",
+    )
+
+    assert 6 in observed_ids
+    assert [run.id for run in searched.recent] == [6]
+
+
 def test_snapshot_injects_health_alerts_without_mutating_them(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     _create_projection_queue(path)
@@ -1554,6 +1588,32 @@ def test_read_run_details_returns_immutable_safe_timeline(tmp_path):
         details.events[0].details["elapsed_ms"] = 500
 
 
+def test_run_details_maps_unknown_provider_attempt_outcome_to_unknown(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: READ_NOW, sync_usage=False) as repository:
+        result = repository.enqueue_capture(_version_2_session())
+        run = repository.status_run_for_job(result.job_id)
+        repository._connection.execute(
+            """
+            INSERT INTO provider_attempts (
+                job_id, provider, model, task, started_at, ended_at,
+                outcome, elapsed_ms
+            ) VALUES (?, 'codex', 'gpt-5.6-luna', 'extract', ?, ?, ?, 1)
+            """,
+            (
+                result.job_id,
+                READ_NOW.isoformat(),
+                READ_NOW.isoformat(),
+                "credential-like-unknown-outcome",
+            ),
+        )
+        repository._connection.commit()
+
+    details = status_store_module.read_run_details(path, run.id)
+
+    assert details.provider_attempts[0].outcome == "unknown"
+
+
 def test_missing_database_is_a_typed_diagnostic_and_is_not_created(tmp_path):
     path = tmp_path / "missing.sqlite3"
 
@@ -1566,6 +1626,107 @@ def test_missing_database_is_a_typed_diagnostic_and_is_not_created(tmp_path):
 
     assert caught.value.path == path.resolve()
     assert not path.exists()
+
+
+def test_status_read_rejects_symlinked_queue_path(tmp_path):
+    actual = tmp_path / "actual.sqlite3"
+    _create_projection_queue(actual)
+    link = tmp_path / "linked.sqlite3"
+    try:
+        link.symlink_to(actual)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(status_store_module.StatusReadError, match="unsafe"):
+        status_store_module.read_snapshot(
+            link,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")
+def test_status_read_rejects_hardlinked_queue_path(tmp_path):
+    actual = tmp_path / "actual.sqlite3"
+    _create_projection_queue(actual)
+    link = tmp_path / "hardlinked.sqlite3"
+    os.link(actual, link)
+
+    with pytest.raises(status_store_module.StatusReadError, match="unsafe"):
+        status_store_module.read_snapshot(
+            link,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits required")
+@pytest.mark.parametrize("mode", [0o644, 0o666])
+def test_status_read_rejects_insecure_queue_mode(tmp_path, mode):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    path.chmod(mode)
+
+    with pytest.raises(status_store_module.StatusReadError, match="unsafe"):
+        status_store_module.read_snapshot(
+            path,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
+
+
+def test_status_read_rejects_unsafe_windows_queue_acl(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    monkeypatch.setattr(utils_module, "_PRIVATE_STATE_DIR_FD_SUPPORTED", False)
+    monkeypatch.setattr(utils_module, "_windows_acl_required", lambda: True)
+    monkeypatch.setattr(
+        utils_module,
+        "_validate_windows_inherited_directory",
+        lambda _path: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        utils_module,
+        "_validate_windows_owner_only_file_descriptor",
+        lambda *_: (_ for _ in ()).throw(
+            PermissionError("queue ACL is unsafe")
+        ),
+    )
+
+    with pytest.raises(status_store_module.StatusReadError, match="unsafe"):
+        status_store_module.read_snapshot(
+            path,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
+
+
+def test_status_read_rejects_queue_swapped_before_secure_open(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    backup = tmp_path / "original.sqlite3"
+    _create_projection_queue(path)
+    _create_projection_queue(replacement)
+    real_open = utils_module.os.open
+    swapped = False
+
+    def swap_before_open(candidate, *args, **kwargs):
+        nonlocal swapped
+        if candidate == path.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            path.rename(backup)
+            replacement.rename(path)
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "open", swap_before_open)
+
+    with pytest.raises(status_store_module.StatusReadError, match="unsafe"):
+        status_store_module.read_snapshot(
+            path,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
 
 
 def test_version_2_queue_is_synthesized_without_migration_or_writes(tmp_path):
@@ -2290,7 +2451,75 @@ def test_acknowledge_run_rejects_invalid_identifiers(tmp_path, run_id):
 def test_status_view_file_is_gitignored():
     ignore = (Path(__file__).resolve().parents[2] / ".gitignore").read_text()
 
-    assert "scripts/status-view.json" in ignore.splitlines()
+    assert "scripts/status-state/" in ignore.splitlines()
+
+
+def test_observer_state_path_uses_a_dedicated_private_runtime_directory(tmp_path):
+    assert status_store_module.observer_state_path(tmp_path) == (
+        tmp_path.resolve() / "scripts" / "status-state" / "status-view.json"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits required")
+def test_observer_state_private_child_allows_normal_repository_scripts_acl(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.chmod(0o777)
+    path = status_store_module.observer_state_path(tmp_path)
+
+    state = status_store_module.acknowledge_run(path, 1)
+
+    assert state.acknowledged_run_ids == {1}
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_concurrent_acknowledgments_do_not_lose_run_ids(tmp_path, monkeypatch):
+    path = status_store_module.observer_state_path(tmp_path)
+    original_load = status_store_module.load_observer_state
+    both_loaded = threading.Barrier(2)
+
+    def synchronized_load(candidate):
+        state = original_load(candidate)
+        both_loaded.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(status_store_module, "load_observer_state", synchronized_load)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda run_id: status_store_module.acknowledge_run(path, run_id),
+                (11, 19),
+            )
+        )
+    monkeypatch.setattr(status_store_module, "load_observer_state", original_load)
+
+    assert sorted(len(result.acknowledged_run_ids) for result in results) == [1, 2]
+    assert set().union(*(result.acknowledged_run_ids for result in results)) == {
+        11,
+        19,
+    }
+    assert original_load(path).acknowledged_run_ids == {11, 19}
+
+
+def test_acknowledgments_are_deterministically_pruned_and_keep_current_id(tmp_path):
+    path = status_store_module.observer_state_path(tmp_path)
+    existing = list(range(1, status_store_module.MAX_ACKNOWLEDGED_RUN_IDS + 1))
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.write_text(
+        json.dumps({"version": 1, "acknowledged_run_ids": existing}),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    state = status_store_module.acknowledge_run(path, -50_000)
+
+    assert len(state.acknowledged_run_ids) == (
+        status_store_module.MAX_ACKNOWLEDGED_RUN_IDS
+    )
+    assert -50_000 in state.acknowledged_run_ids
+    assert 1 not in state.acknowledged_run_ids
+    assert path.stat().st_size <= status_store_module.MAX_OBSERVER_STATE_BYTES
 
 
 @pytest.mark.parametrize(
@@ -2482,3 +2711,128 @@ def test_snapshot_ignores_an_expired_compile_reservation(tmp_path, monkeypatch):
     )
 
     assert snapshot.compile.state == "ready"
+
+
+def test_custom_queue_uses_explicit_memory_home_for_daily_readiness(
+    tmp_path, monkeypatch
+):
+    memory_home = tmp_path / "memory"
+    custom_queue = tmp_path / "runtime" / "custom.sqlite3"
+    with QueueRepository(custom_queue, memory_home=memory_home, sync_usage=False):
+        pass
+    daily = memory_home / "daily"
+    daily.mkdir(parents=True)
+    daily.joinpath("2026-08-18.md").write_text("# Daily Log\n\nUncompiled session\n")
+    monkeypatch.setattr(status_store_module, "_default_session_count", lambda: 0)
+    now = datetime.fromisoformat("2026-08-18T17:00:00-07:00")
+
+    without_root = status_store_module.read_snapshot(
+        custom_queue,
+        now=now,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+    with_root = status_store_module.read_snapshot(
+        custom_queue,
+        now=now,
+        observer_state=status_store_module.ObserverState.empty(),
+        memory_home=memory_home,
+    )
+
+    assert without_root.compile.state == "unavailable"
+    assert with_root.compile.state == "ready"
+
+
+def test_snapshot_projection_queries_share_one_read_transaction(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False):
+        pass
+    original_read_runs = status_store_module._read_runs
+
+    def insert_reservation():
+        writer = sqlite3.connect(path)
+        try:
+            writer.execute(
+                """
+                INSERT OR REPLACE INTO queue_metadata(key, value)
+                VALUES (
+                    'auto_compile_reservation',
+                    '{"status":"retry_wait","expires_at":"2026-08-20T00:00:00+00:00"}'
+                )
+                """
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+    def synchronized_read_runs(*args, **kwargs):
+        runs = original_read_runs(*args, **kwargs)
+        writer = threading.Thread(target=insert_reservation)
+        writer.start()
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+        return runs
+
+    monkeypatch.setattr(status_store_module, "_read_runs", synchronized_read_runs)
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=datetime.fromisoformat("2026-08-18T15:00:00-07:00"),
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert snapshot.compile.state == "before_window"
+
+
+def test_run_details_queries_share_one_read_transaction(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: READ_NOW, sync_usage=False) as repository:
+        result = repository.enqueue_capture(_version_2_session())
+        run = repository.status_run_for_job(result.job_id)
+    original_from_row = status_store_module.status_run_from_row
+    inserted = False
+
+    def add_event_and_attempt():
+        writer = sqlite3.connect(path)
+        try:
+            writer.execute(
+                """
+                INSERT INTO status_events (
+                    run_id, phase, level, details_json, created_at
+                ) VALUES (?, 'codex_started', 'info', '{}', ?)
+                """,
+                (run.id, READ_NOW.isoformat()),
+            )
+            writer.execute(
+                """
+                INSERT INTO provider_attempts (
+                    job_id, provider, model, task, started_at, ended_at,
+                    outcome, elapsed_ms
+                ) VALUES (?, 'codex', 'gpt-5.6-luna', 'extract', ?, ?, 'success', 1)
+                """,
+                (result.job_id, READ_NOW.isoformat(), READ_NOW.isoformat()),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+    def synchronized_from_row(*args, **kwargs):
+        nonlocal inserted
+        projected = original_from_row(*args, **kwargs)
+        if not inserted:
+            inserted = True
+            writer = threading.Thread(target=add_event_and_attempt)
+            writer.start()
+            writer.join(timeout=5)
+            assert not writer.is_alive()
+        return projected
+
+    monkeypatch.setattr(
+        status_store_module,
+        "status_run_from_row",
+        synchronized_from_row,
+    )
+
+    details = status_store_module.read_run_details(path, run.id)
+
+    assert [event.phase for event in details.events] == ["queued"]
+    assert details.provider_attempts == ()

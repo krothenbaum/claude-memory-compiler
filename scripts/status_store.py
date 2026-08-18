@@ -16,10 +16,20 @@ from typing import Literal, cast, get_args
 
 try:
     from .privacy import normalize_persistence_reason
-    from .utils import atomic_write_private_file, read_private_bounded_file
+    from .utils import (
+        atomic_write_private_file,
+        inspect_secure_read_file,
+        read_private_bounded_file,
+        secure_private_state_lock,
+    )
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from privacy import normalize_persistence_reason
-    from utils import atomic_write_private_file, read_private_bounded_file
+    from utils import (
+        atomic_write_private_file,
+        inspect_secure_read_file,
+        read_private_bounded_file,
+        secure_private_state_lock,
+    )
 
 
 RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead"]
@@ -451,7 +461,7 @@ class StatusReadError(RuntimeError):
     """Base class for typed read-only dashboard diagnostics."""
 
     def __init__(self, path: Path, message: str) -> None:
-        self.path = path.resolve()
+        self.path = Path(os.path.abspath(path.expanduser()))
         super().__init__(message)
 
 
@@ -459,11 +469,22 @@ class StatusDatabaseUnavailable(StatusReadError):
     """Raised when the configured queue cannot be opened read-only."""
 
 
+class StatusDatabaseUnsafe(StatusReadError):
+    """Raised when the queue path cannot be identity-pinned as private."""
+
+
 class StatusDataInvalid(StatusReadError):
     """Raised when persisted queue/status data cannot be safely projected."""
 
 
 MAX_OBSERVER_STATE_BYTES = 64 * 1024
+MAX_ACKNOWLEDGED_RUN_IDS = 2_048
+_OBSERVER_STATE_RELATIVE_PATH = Path("scripts/status-state/status-view.json")
+
+
+def observer_state_path(memory_home: Path) -> Path:
+    """Return the private display-state path for one configured memory root."""
+    return Path(os.path.abspath(memory_home.expanduser())) / _OBSERVER_STATE_RELATIVE_PATH
 
 
 def _stored_time(value: datetime) -> str:
@@ -798,7 +819,19 @@ _RECENT_WINDOW = timedelta(days=7)
 
 
 def _open_read_only_database(queue_path: Path) -> sqlite3.Connection:
-    resolved = queue_path.expanduser().resolve()
+    resolved = Path(os.path.abspath(queue_path.expanduser()))
+    try:
+        expected_identity = inspect_secure_read_file(resolved)
+    except FileNotFoundError as error:
+        raise StatusDatabaseUnavailable(
+            resolved,
+            f"status database is unavailable: {resolved}",
+        ) from error
+    except (OSError, ValueError) as error:
+        raise StatusDatabaseUnsafe(
+            resolved,
+            f"status database path is unsafe: {resolved}",
+        ) from error
     try:
         connection = sqlite3.connect(
             f"{resolved.as_uri()}?mode=ro",
@@ -814,6 +847,21 @@ def _open_read_only_database(queue_path: Path) -> sqlite3.Connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 100")
+        try:
+            observed_identity = inspect_secure_read_file(resolved)
+        except (OSError, ValueError) as error:
+            raise StatusDatabaseUnsafe(
+                resolved,
+                f"status database path became unsafe during open: {resolved}",
+            ) from error
+        if (
+            observed_identity.device,
+            observed_identity.inode,
+        ) != (expected_identity.device, expected_identity.inode):
+            raise StatusDatabaseUnsafe(
+                resolved,
+                f"status database identity changed during open: {resolved}",
+            )
         return connection
     except BaseException:
         connection.close()
@@ -957,15 +1005,26 @@ def _safe_projection_operation_key(value: object) -> str | None:
 def _read_runs(
     connection: sqlite3.Connection,
     tables: frozenset[str],
+    *,
+    now: datetime,
+    all_history: bool,
 ) -> tuple[StatusRun, ...]:
     runs: list[StatusRun] = []
+    cutoff = _stored_time(now.astimezone(UTC) - _RECENT_WINDOW)
     if "status_runs" in tables:
+        status_sql = "SELECT * FROM status_runs"
+        status_parameters: tuple[object, ...] = ()
+        if not all_history:
+            status_sql += (
+                " WHERE state IN ('queued', 'running', 'retrying', 'failed', 'dead')"
+                " OR (state = 'succeeded' AND updated_at >= ?)"
+            )
+            status_parameters = (cutoff,)
         runs.extend(
             _safe_projection_run(status_run_from_row(row, redaction_env=os.environ))
-            for row in connection.execute("SELECT * FROM status_runs")
+            for row in connection.execute(status_sql, status_parameters)
         )
-        legacy_rows = connection.execute(
-            """
+        legacy_sql = """
             SELECT
                 jobs.id, jobs.kind, jobs.source_agent, jobs.session_id,
                 jobs.project, jobs.status, jobs.last_error, jobs.created_at,
@@ -974,15 +1033,28 @@ def _read_runs(
             LEFT JOIN status_runs ON status_runs.job_id = jobs.id
             WHERE status_runs.id IS NULL
             """
-        )
+        legacy_parameters: tuple[object, ...] = ()
+        if not all_history:
+            legacy_sql += (
+                " AND (jobs.status IN ('pending', 'leased', 'failed', 'dead')"
+                " OR (jobs.status = 'succeeded' AND jobs.updated_at >= ?))"
+            )
+            legacy_parameters = (cutoff,)
+        legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     else:
-        legacy_rows = connection.execute(
-            """
+        legacy_sql = """
             SELECT id, kind, source_agent, session_id, project, status,
                 last_error, created_at, updated_at, completed_at
             FROM jobs
             """
-        )
+        legacy_parameters = ()
+        if not all_history:
+            legacy_sql += (
+                " WHERE status IN ('pending', 'leased', 'failed', 'dead')"
+                " OR (status = 'succeeded' AND updated_at >= ?)"
+            )
+            legacy_parameters = (cutoff,)
+        legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
     return tuple(runs)
 
@@ -1162,18 +1234,31 @@ def _default_session_count() -> int:
         return -1
 
 
-def _default_daily_state(queue_path: Path, now: datetime) -> str:
+def _default_daily_state(
+    queue_path: Path,
+    now: datetime,
+    memory_home: Path | None = None,
+) -> str:
     try:
         if __package__:
             from .flush import _read_daily_compile_state
         else:
             from flush import _read_daily_compile_state
 
+        root = (
+            Path(os.path.abspath(memory_home.expanduser()))
+            if memory_home is not None
+            else (
+                queue_path.parent.parent
+                if queue_path.parent.name == "scripts"
+                else None
+            )
+        )
+        if root is None:
+            return "unreadable"
         local_now = now.astimezone()
         daily_path = (
-            queue_path.parent.parent
-            / "daily"
-            / f"{local_now.strftime('%Y-%m-%d')}.md"
+            root / "daily" / f"{local_now.strftime('%Y-%m-%d')}.md"
         )
         return _read_daily_compile_state(daily_path).status
     except (ImportError, OSError, RuntimeError, ValueError):
@@ -1187,17 +1272,24 @@ def read_snapshot(
     observer_state: ObserverState,
     query: str = "",
     health_alerts: tuple[HealthAlert, ...] = (),
+    memory_home: Path | None = None,
 ) -> StatusSnapshot:
     """Read and group status without creating, migrating, or mutating the queue."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("snapshot time must be timezone-aware")
-    resolved = queue_path.expanduser().resolve()
+    resolved = Path(os.path.abspath(queue_path.expanduser()))
     connection = _open_read_only_database(resolved)
     try:
         tables = _database_tables(connection)
         if "jobs" not in tables:
             raise StatusDataInvalid(resolved, "status database has no jobs table")
-        runs = _read_runs(connection, tables)
+        connection.execute("BEGIN")
+        runs = _read_runs(
+            connection,
+            tables,
+            now=now,
+            all_history=bool(query.strip()),
+        )
         queue_active_count, reservation_state = _read_compile_database_state(
             connection, tables, now
         )
@@ -1259,7 +1351,11 @@ def read_snapshot(
         probes=CompileReadinessProbes(
             local_now=lambda: now.astimezone(),
             session_count=_default_session_count,
-            daily_state=lambda: _default_daily_state(resolved, now),
+            daily_state=(
+                (lambda: _default_daily_state(resolved, now, memory_home))
+                if memory_home is not None
+                else (lambda: _default_daily_state(resolved, now))
+            ),
             reservation_state=lambda: reservation_state,
         ),
     )
@@ -1280,7 +1376,13 @@ def _provider_attempt_from_row(row: sqlite3.Row) -> ProviderAttempt:
     provider = str(row["provider"])
     if provider not in _PROVIDER_NAMES:
         provider = "unknown"
-    outcome = normalize_summary(row["outcome"], os.environ) or "unknown"
+    raw_outcome = row["outcome"]
+    outcome = (
+        raw_outcome
+        if raw_outcome
+        in {"success", "auth_failed", "capacity", "timeout", "invalid_output", "error"}
+        else "unknown"
+    )
     elapsed_ms = row["elapsed_ms"]
     if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
         raise ValueError("provider attempt elapsed_ms must be a nonnegative integer")
@@ -1297,12 +1399,13 @@ def _provider_attempt_from_row(row: sqlite3.Row) -> ProviderAttempt:
 
 def read_run_details(queue_path: Path, run_id: int) -> RunDetails:
     """Read one run timeline without exposing queue payload or provider output."""
-    resolved = queue_path.expanduser().resolve()
+    resolved = Path(os.path.abspath(queue_path.expanduser()))
     connection = _open_read_only_database(resolved)
     try:
         tables = _database_tables(connection)
         if "jobs" not in tables:
             raise StatusDataInvalid(resolved, "status database has no jobs table")
+        connection.execute("BEGIN")
         if run_id > 0 and "status_runs" in tables:
             row = connection.execute(
                 "SELECT * FROM status_runs WHERE id = ?", (run_id,)
@@ -1365,8 +1468,26 @@ def read_run_details(queue_path: Path, run_id: int) -> RunDetails:
         connection.close()
 
 
-def load_observer_state(path: Path) -> ObserverState:
-    """Load exact version-1 display state; unsafe or malformed files reset safely."""
+def _prune_acknowledged_run_ids(
+    identifiers: frozenset[int],
+    *,
+    current_run_id: int | None = None,
+) -> frozenset[int]:
+    if len(identifiers) <= MAX_ACKNOWLEDGED_RUN_IDS:
+        return identifiers
+    retained = sorted(
+        identifiers,
+        key=lambda run_id: (
+            run_id == current_run_id,
+            abs(run_id),
+            run_id,
+        ),
+        reverse=True,
+    )[:MAX_ACKNOWLEDGED_RUN_IDS]
+    return frozenset(retained)
+
+
+def _load_observer_state_unlocked(path: Path) -> ObserverState:
     try:
         data = read_private_bounded_file(path, max_bytes=MAX_OBSERVER_STATE_BYTES)
         if data is None:
@@ -1392,28 +1513,37 @@ def load_observer_state(path: Path) -> ObserverState:
             return ObserverState.empty()
         return ObserverState(
             version=1,
-            acknowledged_run_ids=frozenset(identifiers),
+            acknowledged_run_ids=_prune_acknowledged_run_ids(
+                frozenset(identifiers)
+            ),
         )
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return ObserverState.empty()
+
+
+def load_observer_state(path: Path) -> ObserverState:
+    """Load exact version-1 display state; unsafe or malformed files reset safely."""
+    return _load_observer_state_unlocked(path)
 
 
 def acknowledge_run(path: Path, run_id: int) -> ObserverState:
     """Persist one display-only acknowledgment with a private atomic replace."""
     if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id == 0:
         raise ValueError("acknowledged run identifier must be a nonzero integer")
-    current = load_observer_state(path)
-    updated = ObserverState(
-        version=1,
-        acknowledged_run_ids=current.acknowledged_run_ids | {run_id},
-    )
-    payload = json.dumps(
-        {
-            "version": 1,
-            "acknowledged_run_ids": sorted(updated.acknowledged_run_ids),
-        },
-        sort_keys=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    atomic_write_private_file(path, payload, max_bytes=MAX_OBSERVER_STATE_BYTES)
-    return updated
+    with secure_private_state_lock(path):
+        current = _load_observer_state_unlocked(path)
+        identifiers = _prune_acknowledged_run_ids(
+            current.acknowledged_run_ids | {run_id},
+            current_run_id=run_id,
+        )
+        updated = ObserverState(version=1, acknowledged_run_ids=identifiers)
+        payload = json.dumps(
+            {
+                "version": 1,
+                "acknowledged_run_ids": sorted(updated.acknowledged_run_ids),
+            },
+            sort_keys=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        atomic_write_private_file(path, payload, max_bytes=MAX_OBSERVER_STATE_BYTES)
+        return updated
