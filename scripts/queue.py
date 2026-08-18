@@ -97,6 +97,17 @@ SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 5
 AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
 
+_SYNTHESIZED_JOB_STATUS: dict[
+    JobStatus,
+    tuple[RunState, str, EventLevel, bool],
+] = {
+    "pending": ("queued", "queued", "info", False),
+    "leased": ("running", "worker_claimed", "info", False),
+    "failed": ("retrying", "retry_wait", "warning", True),
+    "succeeded": ("succeeded", "succeeded", "info", False),
+    "dead": ("dead", "dead", "error", True),
+}
+
 _STATUS_SCHEMA_STATEMENTS = (
     """
 CREATE TABLE status_runs (
@@ -458,7 +469,7 @@ class QueueRepository:
         return status_run_from_row(row, redaction_env=self._redaction_env)
 
     def _ensure_job_run_unlocked(self, job_id: int) -> StatusRun:
-        """Create status history lazily for an active pre-v3 queue job."""
+        """Synthesize one authoritative coarse event for a pre-v3 queue job."""
         try:
             return self.status_run_for_job(job_id)
         except KeyError:
@@ -468,8 +479,23 @@ class QueueRepository:
             if job is None:
                 raise
             started_at = _loaded_time(job["created_at"])
-            if started_at is None:
-                raise ValueError("queue job is missing its creation timestamp")
+            updated_at = _loaded_time(job["updated_at"])
+            if started_at is None or updated_at is None:
+                raise ValueError("queue job is missing a required timestamp")
+            mapping = _SYNTHESIZED_JOB_STATUS.get(job["status"])
+            if mapping is None:
+                raise ValueError(f"invalid queue job status: {job['status']!r}")
+            state, phase, level, retains_error = mapping
+            completed_at = (
+                _loaded_time(job["completed_at"])
+                if state in {"succeeded", "dead"}
+                else None
+            )
+            error = (
+                normalize_persistence_reason(job["last_error"], self._redaction_env)
+                if retains_error and job["last_error"] is not None
+                else None
+            )
             run_id = create_job_run_unlocked(
                 self._connection,
                 job_id=job["id"],
@@ -478,13 +504,28 @@ class QueueRepository:
                 session_id=job["session_id"],
                 project=job["project"],
                 now=started_at,
+                state=state,
+                phase=phase,
+                summary=error,
+                error=error,
+                updated_at=updated_at,
+                completed_at=completed_at,
                 redaction_env=self._redaction_env,
+            )
+            details = (
+                {"retry_at": _stored_time(job["available_at"])}
+                if state == "retrying"
+                else None
             )
             append_event_unlocked(
                 self._connection,
                 run_id,
-                "queued",
-                now=started_at,
+                phase,
+                now=completed_at or updated_at,
+                level=level,
+                attempt=(job["attempt_count"] or None),
+                message=error,
+                details=details,
                 redaction_env=self._redaction_env,
             )
             return self.status_run_for_job(job_id)
@@ -846,6 +887,7 @@ class QueueRepository:
             if row is None:
                 self._connection.execute("COMMIT")
                 return None
+            run = self._ensure_job_run_unlocked(row["id"])
             self._connection.execute(
                 """
                 UPDATE jobs
@@ -858,7 +900,6 @@ class QueueRepository:
             claimed = self._connection.execute(
                 "SELECT * FROM jobs WHERE id = ?", (row["id"],)
             ).fetchone()
-            run = self._ensure_job_run_unlocked(row["id"])
             transition_run_unlocked(
                 self._connection,
                 run.id,
@@ -1016,6 +1057,16 @@ class QueueRepository:
         now = _stored_time(now_dt)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            ownership = self._connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                """,
+                (job_id, owner),
+            ).fetchone()
+            if ownership is None:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self._ensure_job_run_unlocked(job_id)
             cursor = self._connection.execute(
                 """
                 UPDATE jobs
@@ -1027,7 +1078,6 @@ class QueueRepository:
             )
             if cursor.rowcount != 1:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
-            run = self._ensure_job_run_unlocked(job_id)
             transition_run_unlocked(
                 self._connection,
                 run.id,
@@ -1062,6 +1112,7 @@ class QueueRepository:
             ).fetchone()
             if row is None:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self._ensure_job_run_unlocked(job_id)
             now_dt = self._now()
             now = _stored_time(now_dt)
             dead = row["attempt_count"] >= self.max_attempts
@@ -1086,7 +1137,6 @@ class QueueRepository:
             )
             if cursor.rowcount != 1:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
-            run = self._ensure_job_run_unlocked(job_id)
             transition_run_unlocked(
                 self._connection,
                 run.id,
@@ -1120,6 +1170,10 @@ class QueueRepository:
                 """,
                 (now_value,),
             ).fetchall()
+            runs = {
+                job["id"]: self._ensure_job_run_unlocked(job["id"])
+                for job in stale
+            }
             cursor = self._connection.execute(
                 """
                 UPDATE jobs
@@ -1140,7 +1194,7 @@ class QueueRepository:
             )
             for job in stale:
                 dead = job["attempt_count"] >= self.max_attempts
-                run = self._ensure_job_run_unlocked(job["id"])
+                run = runs[job["id"]]
                 transition_run_unlocked(
                     self._connection,
                     run.id,

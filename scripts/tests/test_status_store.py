@@ -226,6 +226,76 @@ def test_deduplicated_enqueue_lazily_adds_status_to_a_migrated_active_job(tmp_pa
         ]
 
 
+@pytest.mark.parametrize(
+    (
+        "job_status",
+        "expected_state",
+        "expected_phase",
+        "last_error",
+        "completed_at",
+    ),
+    [
+        ("pending", "queued", "queued", None, None),
+        ("leased", "running", "worker_claimed", "prior failure", None),
+        ("failed", "retrying", "retry_wait", "retry failure", None),
+        ("succeeded", "succeeded", "succeeded", None, NOW),
+        ("dead", "dead", "dead", "terminal failure", NOW),
+    ],
+)
+def test_deduplicated_migrated_jobs_synthesize_their_authoritative_status(
+    tmp_path,
+    job_status,
+    expected_state,
+    expected_phase,
+    last_error,
+    completed_at,
+):
+    path = tmp_path / "jobs.sqlite3"
+    _create_version_2_queue(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        UPDATE jobs
+        SET status = ?, attempt_count = 1, available_at = ?, lease_owner = ?,
+            lease_expires_at = ?, last_error = ?, completed_at = ?
+        """,
+        (
+            job_status,
+            NOW.isoformat(),
+            "worker" if job_status == "leased" else None,
+            (
+                (NOW.replace(minute=1)).isoformat()
+                if job_status == "leased"
+                else None
+            ),
+            last_error,
+            completed_at.isoformat() if completed_at is not None else None,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        result = repository.enqueue_capture(_version_2_session())
+
+        assert result.created is False
+        run = repository.status_run_for_job(result.job_id)
+        assert run.state == expected_state
+        assert run.phase == expected_phase
+        assert run.error == (
+            last_error if job_status in {"failed", "dead"} else None
+        )
+        assert run.summary == (
+            last_error if job_status in {"failed", "dead"} else None
+        )
+        assert run.completed_at == completed_at
+        events = repository.status_events(run.id)
+        assert [event.phase for event in events] == [expected_phase]
+        assert events[0].message == (
+            last_error if job_status in {"failed", "dead"} else None
+        )
+
+
 def test_concurrent_version_2_openers_apply_status_migration_once(tmp_path, monkeypatch):
     path = tmp_path / "jobs.sqlite3"
     _create_version_2_queue(path)

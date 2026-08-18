@@ -284,9 +284,15 @@ def create_job_run_unlocked(
     session_id: str,
     project: str,
     now: datetime,
+    state: RunState = "queued",
+    phase: str = "queued",
+    summary: str | None = None,
+    error: str | None = None,
+    updated_at: datetime | None = None,
+    completed_at: datetime | None = None,
     redaction_env: Mapping[str, str] | None = None,
 ) -> int:
-    """Create a queued job run using the caller's existing transaction."""
+    """Create a validated job run using the caller's existing transaction."""
     candidate = StatusRun(
         id=0,
         job_id=job_id,
@@ -295,13 +301,13 @@ def create_job_run_unlocked(
         source_agent=source_agent,
         session_id=session_id,
         project=project,
-        state="queued",
-        phase="queued",
-        summary=None,
-        error=None,
+        state=state,
+        phase=phase,
+        summary=summary,
+        error=error,
         started_at=now,
-        updated_at=now,
-        completed_at=None,
+        updated_at=updated_at or now,
+        completed_at=completed_at,
         redaction_env=redaction_env,
     )
     cursor = connection.execute(
@@ -323,7 +329,11 @@ def create_job_run_unlocked(
             candidate.error,
             _stored_time(candidate.started_at),
             _stored_time(candidate.updated_at),
-            None,
+            (
+                _stored_time(candidate.completed_at)
+                if candidate.completed_at is not None
+                else None
+            ),
         ),
     )
     if cursor.lastrowid is None:
