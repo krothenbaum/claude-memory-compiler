@@ -112,6 +112,94 @@ def _fsync_directory(path: Path | str) -> None:
         os.close(descriptor)
 
 
+def _validate_private_regular_file(info: os.stat_result, path: Path) -> None:
+    """Validate an owner-only state file without following links."""
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if info.st_nlink != 1:
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError(f"state path must be a private regular file: {path}")
+
+
+def read_private_bounded_file(path: Path | str, *, max_bytes: int) -> bytes | None:
+    """Read a small owner-only regular file, retaining its verified descriptor."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    if not target.exists() and not target.is_symlink():
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise ValueError(f"state path must be a private regular file: {target}") from error
+    try:
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if opened.st_size > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        visible = target.lstat()
+        _validate_private_regular_file(visible, target)
+        if not _same_file_identity(opened, visible):
+            raise ValueError(f"state path identity changed while reading: {target}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_private_file(
+    path: Path | str,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
+    """Fsync and atomically replace one bounded owner-only state file."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    if len(data) > max_bytes:
+        raise ValueError(f"state payload exceeds {max_bytes} bytes")
+    target = Path(os.path.abspath(Path(path).expanduser()))
+    parent = target.parent
+    if parent.exists() or parent.is_symlink():
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError(f"state directory must be a real directory: {parent}")
+    else:
+        parent.mkdir(parents=True, mode=0o700)
+    if target.exists() or target.is_symlink():
+        _validate_private_regular_file(target.lstat(), target)
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, temporary)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _validate_private_regular_file(temporary.lstat(), temporary)
+        os.replace(temporary, target)
+        if hasattr(os, "chmod"):
+            target.chmod(0o600)
+        _fsync_directory(parent)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def _validate_log_directory(info: os.stat_result, path: Path) -> None:
     if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
         raise ValueError(

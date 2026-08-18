@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, cast, get_args
+from typing import Callable, Literal, cast, get_args
 
 try:
     from .privacy import normalize_persistence_reason
+    from .utils import atomic_write_private_file, read_private_bounded_file
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from privacy import normalize_persistence_reason
+    from utils import atomic_write_private_file, read_private_bounded_file
 
 
 RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead"]
@@ -288,6 +292,7 @@ class StatusRun:
     started_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    timeline_available: bool = True
     redaction_env: InitVar[Mapping[str, str] | None] = None
 
     def __post_init__(self, redaction_env: Mapping[str, str] | None) -> None:
@@ -332,6 +337,121 @@ class StatusEvent:
             normalize_event_message(self.message, redaction_env),
         )
         object.__setattr__(self, "details", normalize_details(self.details))
+
+
+@dataclass(frozen=True)
+class HealthAlert:
+    """One already-filtered operational health warning injected by a caller."""
+
+    created_at: datetime
+    level: EventLevel
+    message: str
+    component: str = "hook"
+    redaction_env: InitVar[Mapping[str, str] | None] = None
+
+    def __post_init__(self, redaction_env: Mapping[str, str] | None) -> None:
+        if self.level not in _EVENT_LEVELS:
+            raise ValueError(f"invalid health alert level: {self.level!r}")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("health alert timestamps must be timezone-aware")
+        message = normalize_event_message(self.message, redaction_env)
+        if message is None:
+            raise ValueError("health alert message must not be empty")
+        object.__setattr__(self, "message", message)
+
+
+@dataclass(frozen=True)
+class ObserverState:
+    """Display-only state that never changes queue execution."""
+
+    version: int
+    acknowledged_run_ids: frozenset[int]
+
+    @classmethod
+    def empty(cls) -> "ObserverState":
+        return cls(version=1, acknowledged_run_ids=frozenset())
+
+    def __post_init__(self) -> None:
+        if self.version != 1:
+            raise ValueError("observer state version must be 1")
+        if any(
+            isinstance(run_id, bool) or not isinstance(run_id, int) or run_id == 0
+            for run_id in self.acknowledged_run_ids
+        ):
+            raise ValueError("acknowledged run identifiers must be nonzero integers")
+
+
+@dataclass(frozen=True)
+class CompileStatus:
+    """Current end-of-day compile state for snapshot renderers."""
+
+    state: str
+    summary: str
+    run: StatusRun | None = None
+    ready: bool = False
+
+
+@dataclass(frozen=True)
+class CompileReadinessProbes:
+    """Injected, side-effect-free inputs for compile readiness projection."""
+
+    local_now: Callable[[], datetime]
+    session_count: Callable[[], int]
+    daily_state: Callable[[], str]
+    reservation_state: Callable[[], str | None]
+
+
+@dataclass(frozen=True)
+class ProviderAttempt:
+    """Privacy-safe provider attempt metadata for one run."""
+
+    id: int
+    provider: str
+    outcome: str
+    reason: str | None
+    started_at: datetime
+    ended_at: datetime
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
+class RunDetails:
+    """One run and its immutable, content-free operational timeline."""
+
+    run: StatusRun
+    events: tuple[StatusEvent, ...]
+    provider_attempts: tuple[ProviderAttempt, ...]
+    timeline_available: bool
+
+
+@dataclass(frozen=True)
+class StatusSnapshot:
+    """Immutable dashboard projection grouped for operational triage."""
+
+    active: tuple[StatusRun, ...]
+    attention: tuple[StatusRun, ...]
+    recent: tuple[StatusRun, ...]
+    compile: CompileStatus
+    health_alerts: tuple[HealthAlert, ...]
+
+
+class StatusReadError(RuntimeError):
+    """Base class for typed read-only dashboard diagnostics."""
+
+    def __init__(self, path: Path, message: str) -> None:
+        self.path = path.resolve()
+        super().__init__(message)
+
+
+class StatusDatabaseUnavailable(StatusReadError):
+    """Raised when the configured queue cannot be opened read-only."""
+
+
+class StatusDataInvalid(StatusReadError):
+    """Raised when persisted queue/status data cannot be safely projected."""
+
+
+MAX_OBSERVER_STATE_BYTES = 64 * 1024
 
 
 def _stored_time(value: datetime) -> str:
@@ -658,3 +778,528 @@ def transition_run_unlocked(
         details=details,
         redaction_env=redaction_env,
     )
+
+
+_ACTIVE_RUN_STATES = frozenset({"queued", "running", "retrying"})
+_ATTENTION_RUN_STATES = frozenset({"failed", "dead"})
+_RECENT_WINDOW = timedelta(days=7)
+
+
+def _open_read_only_database(queue_path: Path) -> sqlite3.Connection:
+    resolved = queue_path.expanduser().resolve()
+    try:
+        connection = sqlite3.connect(
+            f"{resolved.as_uri()}?mode=ro",
+            uri=True,
+            timeout=0.1,
+        )
+    except sqlite3.Error as error:
+        raise StatusDatabaseUnavailable(
+            resolved,
+            f"status database is unavailable: {resolved}",
+        ) from error
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 100")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _database_tables(connection: sqlite3.Connection) -> frozenset[str]:
+    return frozenset(
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    )
+
+
+def _synthetic_run_from_job(row: sqlite3.Row) -> StatusRun:
+    state_by_job_status: Mapping[str, tuple[RunState, str]] = {
+        "pending": ("queued", "queued"),
+        "leased": ("running", "worker_claimed"),
+        "failed": ("retrying", "retry_wait"),
+        "succeeded": ("succeeded", "succeeded"),
+        "dead": ("dead", "dead"),
+    }
+    job_status = str(row["status"])
+    try:
+        state, phase = state_by_job_status[job_status]
+    except KeyError as error:
+        raise ValueError(f"unsupported legacy job status: {job_status!r}") from error
+    started_at = _loaded_time(row["created_at"])
+    updated_at = _loaded_time(row["updated_at"])
+    if started_at is None or updated_at is None:
+        raise ValueError("legacy job is missing a required timestamp")
+    summary_by_state = {
+        "queued": "Queued",
+        "running": "Worker claimed",
+        "retrying": "Waiting to retry",
+        "succeeded": "Completed",
+        "dead": "Attempts exhausted",
+    }
+    job_id = int(row["id"])
+    return StatusRun(
+        id=-job_id,
+        job_id=job_id,
+        operation_key=None,
+        kind=row["kind"],
+        source_agent=row["source_agent"],
+        session_id=row["session_id"],
+        project=row["project"],
+        state=state,
+        phase=phase,
+        summary=summary_by_state[state],
+        error=row["last_error"],
+        started_at=started_at,
+        updated_at=updated_at,
+        completed_at=_loaded_time(row["completed_at"]),
+        timeline_available=False,
+        redaction_env=os.environ,
+    )
+
+
+def _read_runs(
+    connection: sqlite3.Connection,
+    tables: frozenset[str],
+) -> tuple[StatusRun, ...]:
+    runs: list[StatusRun] = []
+    if "status_runs" in tables:
+        runs.extend(
+            status_run_from_row(row, redaction_env=os.environ)
+            for row in connection.execute("SELECT * FROM status_runs")
+        )
+        legacy_rows = connection.execute(
+            """
+            SELECT
+                jobs.id, jobs.kind, jobs.source_agent, jobs.session_id,
+                jobs.project, jobs.status, jobs.last_error, jobs.created_at,
+                jobs.updated_at, jobs.completed_at
+            FROM jobs
+            LEFT JOIN status_runs ON status_runs.job_id = jobs.id
+            WHERE status_runs.id IS NULL
+            """
+        )
+    else:
+        legacy_rows = connection.execute(
+            """
+            SELECT id, kind, source_agent, session_id, project, status,
+                last_error, created_at, updated_at, completed_at
+            FROM jobs
+            """
+        )
+    runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
+    return tuple(runs)
+
+
+def _matches_query(run: StatusRun, query: str) -> bool:
+    needle = " ".join(query.split()).casefold()
+    if not needle:
+        return True
+    approved_fields = (
+        run.kind,
+        run.source_agent,
+        run.session_id,
+        run.project,
+        run.state,
+        run.phase,
+        run.summary or "",
+    )
+    return any(needle in field.casefold() for field in approved_fields)
+
+
+def _run_sort_key(run: StatusRun) -> tuple[datetime, int]:
+    return run.updated_at, run.id
+
+
+def project_compile_status(
+    *,
+    compile_run: StatusRun | None,
+    queue_active_count: int,
+    probes: CompileReadinessProbes,
+) -> CompileStatus:
+    """Purely project compile readiness from injected operational probes."""
+    if compile_run is not None:
+        summary = (
+            compile_run.summary
+            or compile_run.error
+            or compile_run.phase.replace("_", " ").capitalize()
+        )
+        return CompileStatus(
+            state=compile_run.state,
+            summary=summary,
+            run=compile_run,
+            ready=False,
+        )
+    reservation = probes.reservation_state()
+    if reservation is not None:
+        reservation_state = {
+            "failed": "failed",
+            "retry_wait": "retrying",
+            "queue_wait": "retrying",
+            "read_wait": "retrying",
+        }.get(reservation, "reserved")
+        return CompileStatus(
+            state=reservation_state,
+            summary=(
+                "Automatic compile is waiting to retry"
+                if reservation_state == "retrying"
+                else "Automatic compile is reserved"
+            ),
+        )
+    local_now = probes.local_now()
+    if local_now.tzinfo is None or local_now.utcoffset() is None:
+        raise ValueError("compile readiness time must be timezone-aware")
+    if local_now.hour < 16:
+        return CompileStatus(
+            state="before_window",
+            summary="Next automatic compile window begins at 16:00",
+        )
+    if queue_active_count < 0:
+        raise ValueError("queue active count must be nonnegative")
+    if queue_active_count:
+        return CompileStatus(
+            state="waiting_queue",
+            summary=f"Waiting for {queue_active_count} flush job(s)",
+        )
+    session_count = probes.session_count()
+    if session_count < 0:
+        return CompileStatus(
+            state="unavailable",
+            summary="Interactive session count is unavailable",
+        )
+    if session_count:
+        return CompileStatus(
+            state="waiting_sessions",
+            summary=f"Waiting for {session_count} interactive session(s) to close",
+        )
+    daily_state = probes.daily_state()
+    if daily_state == "covered":
+        return CompileStatus(
+            state="complete",
+            summary="Today's captured content is compiled",
+        )
+    if daily_state == "uncompiled":
+        return CompileStatus(
+            state="ready",
+            summary="Automatic compile is ready",
+            ready=True,
+        )
+    return CompileStatus(
+        state="unavailable",
+        summary="Today's compile state is unavailable",
+    )
+
+
+def _read_compile_database_state(
+    connection: sqlite3.Connection,
+    tables: frozenset[str],
+    now: datetime,
+) -> tuple[int, str | None]:
+    queue_active_count = connection.execute(
+        "SELECT count(*) FROM jobs WHERE status IN ('pending', 'leased', 'failed')"
+    ).fetchone()[0]
+    reservation_state: str | None = None
+    if "queue_metadata" in tables:
+        row = connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = 'auto_compile_reservation'"
+        ).fetchone()
+        if row is not None:
+            try:
+                reservation = json.loads(row["value"])
+            except (TypeError, json.JSONDecodeError):
+                reservation = None
+            if isinstance(reservation, dict):
+                expiry_values = []
+                for key in (
+                    "expires_at",
+                    "watcher_expires_at",
+                    "contender_expires_at",
+                    "next_retry_at",
+                ):
+                    value = reservation.get(key)
+                    if isinstance(value, str):
+                        try:
+                            expiry = _loaded_time(value)
+                        except ValueError:
+                            continue
+                        if expiry is not None:
+                            expiry_values.append(expiry)
+                raw_state = reservation.get("status", "reserved")
+                if raw_state == "failed" or any(
+                    expiry > now.astimezone(UTC) for expiry in expiry_values
+                ):
+                    reservation_state = (
+                        raw_state if isinstance(raw_state, str) else "reserved"
+                    )
+    return int(queue_active_count), reservation_state
+
+
+def _default_session_count() -> int:
+    try:
+        if __package__:
+            from .flush import count_interactive_agent_sessions
+        else:
+            from flush import count_interactive_agent_sessions
+
+        return count_interactive_agent_sessions()
+    except (ImportError, OSError, RuntimeError):
+        return -1
+
+
+def _default_daily_state(queue_path: Path, now: datetime) -> str:
+    try:
+        if __package__:
+            from .flush import _read_daily_compile_state
+        else:
+            from flush import _read_daily_compile_state
+
+        local_now = now.astimezone()
+        daily_path = (
+            queue_path.parent.parent
+            / "daily"
+            / f"{local_now.strftime('%Y-%m-%d')}.md"
+        )
+        return _read_daily_compile_state(daily_path).status
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return "unreadable"
+
+
+def read_snapshot(
+    queue_path: Path,
+    *,
+    now: datetime,
+    observer_state: ObserverState,
+    query: str = "",
+    health_alerts: tuple[HealthAlert, ...] = (),
+) -> StatusSnapshot:
+    """Read and group status without creating, migrating, or mutating the queue."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("snapshot time must be timezone-aware")
+    resolved = queue_path.expanduser().resolve()
+    connection = _open_read_only_database(resolved)
+    try:
+        tables = _database_tables(connection)
+        if "jobs" not in tables:
+            raise StatusDataInvalid(resolved, "status database has no jobs table")
+        runs = _read_runs(connection, tables)
+        queue_active_count, reservation_state = _read_compile_database_state(
+            connection, tables, now
+        )
+    except StatusReadError:
+        raise
+    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as error:
+        raise StatusDataInvalid(
+            resolved,
+            f"status database contains invalid operational data: {resolved}",
+        ) from error
+    finally:
+        connection.close()
+
+    matching = tuple(run for run in runs if _matches_query(run, query))
+    active = tuple(
+        sorted(
+            (run for run in matching if run.state in _ACTIVE_RUN_STATES),
+            key=_run_sort_key,
+            reverse=True,
+        )
+    )
+    attention = tuple(
+        sorted(
+            (
+                run
+                for run in matching
+                if run.state in _ATTENTION_RUN_STATES
+                and run.id not in observer_state.acknowledged_run_ids
+            ),
+            key=_run_sort_key,
+            reverse=True,
+        )
+    )
+    cutoff = now.astimezone(UTC) - _RECENT_WINDOW
+    search_all_history = bool(query.strip())
+    recent = tuple(
+        sorted(
+            (
+                run
+                for run in matching
+                if (
+                    run.state == "succeeded"
+                    or (
+                        run.state in _ATTENTION_RUN_STATES
+                        and run.id in observer_state.acknowledged_run_ids
+                    )
+                )
+                and (search_all_history or run.updated_at >= cutoff)
+            ),
+            key=_run_sort_key,
+            reverse=True,
+        )
+    )
+    compile_runs = tuple(run for run in runs if run.kind == "compile")
+    compile_run = max(compile_runs, key=_run_sort_key) if compile_runs else None
+    compile_status = project_compile_status(
+        compile_run=compile_run,
+        queue_active_count=queue_active_count,
+        probes=CompileReadinessProbes(
+            local_now=lambda: now.astimezone(),
+            session_count=_default_session_count,
+            daily_state=lambda: _default_daily_state(resolved, now),
+            reservation_state=lambda: reservation_state,
+        ),
+    )
+    return StatusSnapshot(
+        active=active,
+        attention=attention,
+        recent=recent,
+        compile=compile_status,
+        health_alerts=tuple(health_alerts),
+    )
+
+
+def _provider_attempt_from_row(row: sqlite3.Row) -> ProviderAttempt:
+    started_at = _loaded_time(row["started_at"])
+    ended_at = _loaded_time(row["ended_at"])
+    if started_at is None or ended_at is None:
+        raise ValueError("provider attempt is missing a required timestamp")
+    provider = str(row["provider"])
+    if provider not in _PROVIDER_NAMES:
+        provider = "unknown"
+    outcome = normalize_summary(row["outcome"], os.environ) or "unknown"
+    elapsed_ms = row["elapsed_ms"]
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
+        raise ValueError("provider attempt elapsed_ms must be a nonnegative integer")
+    return ProviderAttempt(
+        id=row["id"],
+        provider=provider,
+        outcome=outcome,
+        reason=normalize_status_reason(row["reason"], os.environ),
+        started_at=started_at,
+        ended_at=ended_at,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def read_run_details(queue_path: Path, run_id: int) -> RunDetails:
+    """Read one run timeline without exposing queue payload or provider output."""
+    resolved = queue_path.expanduser().resolve()
+    connection = _open_read_only_database(resolved)
+    try:
+        tables = _database_tables(connection)
+        if "jobs" not in tables:
+            raise StatusDataInvalid(resolved, "status database has no jobs table")
+        if run_id > 0 and "status_runs" in tables:
+            row = connection.execute(
+                "SELECT * FROM status_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            run = status_run_from_row(row, redaction_env=os.environ)
+            events = tuple(
+                status_event_from_row(event, redaction_env=os.environ)
+                for event in connection.execute(
+                    "SELECT * FROM status_events WHERE run_id = ? ORDER BY id",
+                    (run_id,),
+                )
+            )
+        else:
+            job_id = -run_id if run_id < 0 else run_id
+            row = connection.execute(
+                """
+                SELECT id, kind, source_agent, session_id, project, status,
+                    last_error, created_at, updated_at, completed_at
+                FROM jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            run = _synthetic_run_from_job(row)
+            events = ()
+        attempts = (
+            tuple(
+                _provider_attempt_from_row(attempt)
+                for attempt in connection.execute(
+                    """
+                    SELECT id, provider, outcome, reason, started_at, ended_at,
+                        elapsed_ms
+                    FROM provider_attempts WHERE job_id = ? ORDER BY id
+                    """,
+                    (run.job_id,),
+                )
+            )
+            if run.job_id is not None and "provider_attempts" in tables
+            else ()
+        )
+        return RunDetails(
+            run=run,
+            events=events,
+            provider_attempts=attempts,
+            timeline_available=run.timeline_available,
+        )
+    except (KeyError, StatusReadError):
+        raise
+    except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as error:
+        raise StatusDataInvalid(
+            resolved,
+            f"status database contains invalid operational data: {resolved}",
+        ) from error
+    finally:
+        connection.close()
+
+
+def load_observer_state(path: Path) -> ObserverState:
+    """Load exact version-1 display state; unsafe or malformed files reset safely."""
+    try:
+        data = read_private_bounded_file(path, max_bytes=MAX_OBSERVER_STATE_BYTES)
+        if data is None:
+            return ObserverState.empty()
+        decoded = json.loads(data.decode("utf-8"))
+        if not isinstance(decoded, dict) or set(decoded) != {
+            "version",
+            "acknowledged_run_ids",
+        }:
+            return ObserverState.empty()
+        identifiers = decoded["acknowledged_run_ids"]
+        if (
+            decoded["version"] != 1
+            or isinstance(decoded["version"], bool)
+            or not isinstance(identifiers, list)
+            or any(
+                isinstance(run_id, bool)
+                or not isinstance(run_id, int)
+                or run_id == 0
+                for run_id in identifiers
+            )
+        ):
+            return ObserverState.empty()
+        return ObserverState(
+            version=1,
+            acknowledged_run_ids=frozenset(identifiers),
+        )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return ObserverState.empty()
+
+
+def acknowledge_run(path: Path, run_id: int) -> ObserverState:
+    """Persist one display-only acknowledgment with a private atomic replace."""
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id == 0:
+        raise ValueError("acknowledged run identifier must be a nonzero integer")
+    current = load_observer_state(path)
+    updated = ObserverState(
+        version=1,
+        acknowledged_run_ids=current.acknowledged_run_ids | {run_id},
+    )
+    payload = json.dumps(
+        {
+            "version": 1,
+            "acknowledged_run_ids": sorted(updated.acknowledged_run_ids),
+        },
+        sort_keys=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    atomic_write_private_file(path, payload, max_bytes=MAX_OBSERVER_STATE_BYTES)
+    return updated

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import get_args
 
@@ -14,6 +16,7 @@ import pytest
 from transcripts import NormalizedSession, Turn
 
 import scripts.queue as queue_module
+import scripts.status_store as status_store_module
 from scripts.queue import QueueRepository
 from scripts.status_store import (
     ALLOWED_PHASES,
@@ -1352,3 +1355,500 @@ def test_details_reject_non_finite_numbers_and_oversized_metadata():
         normalize_details({f"field_{index}": index for index in range(33)})
     with pytest.raises(ValueError, match="at most 1000"):
         normalize_details({"retry_at": "x" * 1_001})
+
+
+READ_NOW = datetime(2026, 8, 18, 18, 0, tzinfo=UTC)
+
+
+def _insert_projection_run(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    state: str,
+    phase: str,
+    updated_at: datetime,
+    project: str,
+    summary: str | None = None,
+    error: str | None = None,
+    kind: str = "capture",
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO status_runs (
+            id, operation_key, kind, source_agent, session_id, project, state,
+            phase, summary, error, started_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, 'system', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            f"projection:{run_id}",
+            kind,
+            f"session-{run_id}",
+            project,
+            state,
+            phase,
+            summary,
+            error,
+            (updated_at - timedelta(minutes=1)).isoformat(),
+            updated_at.isoformat(),
+            updated_at.isoformat() if state in {"succeeded", "failed", "dead"} else None,
+        ),
+    )
+
+
+def _create_projection_queue(path: Path) -> None:
+    with QueueRepository(path, sync_usage=False) as repository:
+        connection = repository._connection
+        _insert_projection_run(
+            connection,
+            run_id=1,
+            state="running",
+            phase="codex_started",
+            updated_at=READ_NOW - timedelta(minutes=1),
+            project="active-project",
+            summary="Extracting",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=2,
+            state="retrying",
+            phase="retry_wait",
+            updated_at=READ_NOW - timedelta(minutes=2),
+            project="retry-project",
+            error="retry later",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=3,
+            state="failed",
+            phase="failed",
+            updated_at=READ_NOW - timedelta(days=30),
+            project="attention-project",
+            error="old but unacknowledged",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=4,
+            state="failed",
+            phase="failed",
+            updated_at=READ_NOW - timedelta(days=1),
+            project="acknowledged-project",
+            error="reviewed failure",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=5,
+            state="succeeded",
+            phase="succeeded",
+            updated_at=READ_NOW - timedelta(days=2),
+            project="recent-project",
+            summary="Saved 42 characters",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=6,
+            state="succeeded",
+            phase="succeeded",
+            updated_at=READ_NOW - timedelta(days=8),
+            project="old-project",
+            summary="Old successful result",
+        )
+        _insert_projection_run(
+            connection,
+            run_id=7,
+            state="running",
+            phase="validation_started",
+            updated_at=READ_NOW - timedelta(seconds=30),
+            project="memory",
+            summary="Validating staged changes",
+            kind="compile",
+        )
+        connection.execute(
+            """
+            INSERT INTO status_events (
+                run_id, phase, level, provider, attempt, message,
+                details_json, created_at
+            ) VALUES (
+                1, 'codex_started', 'info', 'codex', 1, 'Calling provider',
+                '{"elapsed_ms":125}', '2026-08-18T17:59:00+00:00'
+            )
+            """
+        )
+        connection.commit()
+
+
+def test_snapshot_groups_active_attention_and_seven_day_recent(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    observer = status_store_module.ObserverState(
+        version=1,
+        acknowledged_run_ids=frozenset({4}),
+    )
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=observer,
+    )
+
+    assert [run.id for run in snapshot.active] == [7, 1, 2]
+    assert [run.id for run in snapshot.attention] == [3]
+    assert [run.id for run in snapshot.recent] == [4, 5]
+    assert snapshot.compile.run is not None
+    assert snapshot.compile.run.id == 7
+    assert snapshot.health_alerts == ()
+
+
+def test_snapshot_query_searches_older_approved_history(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    observer = status_store_module.ObserverState.empty()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=observer,
+        query="old-project",
+    )
+
+    assert snapshot.active == ()
+    assert snapshot.attention == ()
+    assert [run.id for run in snapshot.recent] == [6]
+
+
+def test_snapshot_injects_health_alerts_without_mutating_them(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+    alert = status_store_module.HealthAlert(
+        created_at=READ_NOW,
+        level="error",
+        message="Hook could not reach SQLite",
+    )
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        health_alerts=(alert,),
+    )
+
+    assert snapshot.health_alerts == (alert,)
+    with pytest.raises(FrozenInstanceError):
+        snapshot.health_alerts = ()
+
+
+def test_read_run_details_returns_immutable_safe_timeline(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+
+    details = status_store_module.read_run_details(path, 1)
+
+    assert details.run.id == 1
+    assert details.timeline_available is True
+    assert [event.phase for event in details.events] == ["codex_started"]
+    assert details.events[0].details == {"elapsed_ms": 125}
+    with pytest.raises(TypeError):
+        details.events[0].details["elapsed_ms"] = 500
+
+
+def test_missing_database_is_a_typed_diagnostic_and_is_not_created(tmp_path):
+    path = tmp_path / "missing.sqlite3"
+
+    with pytest.raises(status_store_module.StatusDatabaseUnavailable) as caught:
+        status_store_module.read_snapshot(
+            path,
+            now=READ_NOW,
+            observer_state=status_store_module.ObserverState.empty(),
+        )
+
+    assert caught.value.path == path.resolve()
+    assert not path.exists()
+
+
+def test_version_2_queue_is_synthesized_without_migration_or_writes(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    _create_version_2_queue(path)
+    before = path.read_bytes()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert len(snapshot.recent) == 1
+    legacy = snapshot.recent[0]
+    assert legacy.job_id == 41
+    assert legacy.timeline_available is False
+    assert status_store_module.read_run_details(path, legacy.id).timeline_available is False
+    assert path.read_bytes() == before
+    connection = sqlite3.connect(path)
+    try:
+        assert "status_runs" not in _table_names(connection)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        connection.close()
+
+
+def test_snapshot_synthesizes_uninstrumented_v3_jobs_without_payload_search(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        repository._connection.execute(
+            """
+            INSERT INTO jobs (
+                id, kind, source_agent, session_id, project, cwd, trigger,
+                source_path, source_hash, payload_json, status, attempt_count,
+                available_at, created_at, updated_at, completed_at
+            ) VALUES (
+                88, 'capture', 'claude', 'legacy-session', 'legacy-project',
+                '/memory', 'session_end', '/memory/private.jsonl', 'hash-88',
+                '{"rendered_context":"private-search-needle"}', 'succeeded', 1,
+                '2026-08-18T12:00:00+00:00', '2026-08-18T12:00:00+00:00',
+                '2026-08-18T12:01:00+00:00', '2026-08-18T12:01:00+00:00'
+            )
+            """
+        )
+        repository._connection.commit()
+
+    default = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+    private_search = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        query="private-search-needle",
+    )
+
+    assert [run.job_id for run in default.recent] == [88]
+    assert default.recent[0].timeline_available is False
+    assert private_search.active == ()
+    assert private_search.attention == ()
+    assert private_search.recent == ()
+
+
+def test_load_observer_state_returns_empty_for_missing_or_malformed_files(tmp_path):
+    path = tmp_path / "scripts" / "status-view.json"
+
+    assert status_store_module.load_observer_state(path) == (
+        status_store_module.ObserverState.empty()
+    )
+    assert not path.exists()
+
+    path.parent.mkdir()
+    path.write_text('{"version":1,"acknowledged_run_ids":"not-a-list"}')
+    path.chmod(0o600)
+
+    assert status_store_module.load_observer_state(path) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 2, "acknowledged_run_ids": [1]},
+        {"version": 1, "acknowledged_run_ids": [0]},
+        {"version": 1, "acknowledged_run_ids": [True]},
+        {"version": 1, "acknowledged_run_ids": [1], "extra": "field"},
+    ],
+)
+def test_load_observer_state_requires_the_exact_version_1_schema(tmp_path, payload):
+    path = tmp_path / "status-view.json"
+    path.write_text(json.dumps(payload))
+    path.chmod(0o600)
+
+    assert status_store_module.load_observer_state(path) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+def test_load_observer_state_rejects_oversized_or_nonprivate_files(tmp_path):
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b" " * (status_store_module.MAX_OBSERVER_STATE_BYTES + 1))
+    oversized.chmod(0o600)
+    public = tmp_path / "public.json"
+    public.write_text('{"version":1,"acknowledged_run_ids":[1]}')
+    public.chmod(0o644)
+
+    assert status_store_module.load_observer_state(oversized) == (
+        status_store_module.ObserverState.empty()
+    )
+    assert status_store_module.load_observer_state(public) == (
+        status_store_module.ObserverState.empty()
+    )
+
+
+def test_acknowledge_run_atomically_writes_private_exact_state(tmp_path):
+    path = tmp_path / "scripts" / "status-view.json"
+
+    first = status_store_module.acknowledge_run(path, 19)
+    second = status_store_module.acknowledge_run(path, 12)
+    duplicate = status_store_module.acknowledge_run(path, 19)
+
+    assert first.acknowledged_run_ids == frozenset({19})
+    assert second.acknowledged_run_ids == frozenset({12, 19})
+    assert duplicate == second
+    assert json.loads(path.read_text()) == {
+        "version": 1,
+        "acknowledged_run_ids": [12, 19],
+    }
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+
+def test_acknowledge_run_refuses_unsafe_existing_target(tmp_path):
+    target = tmp_path / "actual.json"
+    target.write_text('{"version":1,"acknowledged_run_ids":[]}')
+    target.chmod(0o600)
+    link = tmp_path / "status-view.json"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(ValueError, match="private regular file"):
+        status_store_module.acknowledge_run(link, 1)
+
+    assert target.read_text() == '{"version":1,"acknowledged_run_ids":[]}'
+
+
+def test_acknowledge_run_supports_synthetic_legacy_run_identifiers(tmp_path):
+    path = tmp_path / "status-view.json"
+
+    state = status_store_module.acknowledge_run(path, -41)
+
+    assert state.acknowledged_run_ids == frozenset({-41})
+    assert status_store_module.load_observer_state(path) == state
+
+
+@pytest.mark.parametrize("run_id", [0, True, "1"])
+def test_acknowledge_run_rejects_invalid_identifiers(tmp_path, run_id):
+    with pytest.raises(ValueError, match="nonzero integer"):
+        status_store_module.acknowledge_run(tmp_path / "status-view.json", run_id)
+
+
+def test_status_view_file_is_gitignored():
+    ignore = (Path(__file__).resolve().parents[2] / ".gitignore").read_text()
+
+    assert "scripts/status-view.json" in ignore.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("hour", "queue_active", "sessions", "daily_state", "reservation", "expected"),
+    [
+        (15, 0, 0, "uncompiled", None, "before_window"),
+        (16, 2, 0, "uncompiled", None, "waiting_queue"),
+        (16, 0, 2, "uncompiled", None, "waiting_sessions"),
+        (16, 0, 0, "unreadable", None, "unavailable"),
+        (16, 0, 0, "covered", None, "complete"),
+        (16, 0, 0, "uncompiled", None, "ready"),
+        (16, 0, 0, "uncompiled", "retry_wait", "retrying"),
+    ],
+)
+def test_compile_readiness_uses_pure_injected_probes(
+    hour, queue_active, sessions, daily_state, reservation, expected
+):
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: datetime(2026, 8, 18, hour, 0, tzinfo=UTC),
+        session_count=lambda: sessions,
+        daily_state=lambda: daily_state,
+        reservation_state=lambda: reservation,
+    )
+
+    status = status_store_module.project_compile_status(
+        compile_run=None,
+        queue_active_count=queue_active,
+        probes=probes,
+    )
+
+    assert status.state == expected
+    assert status.ready is (expected == "ready")
+
+
+def test_compile_status_prefers_the_authoritative_compile_run():
+    failed = _status_run(
+        id=91,
+        job_id=None,
+        operation_key="compile:91",
+        kind="compile",
+        source_agent="system",
+        session_id="2026-08-18",
+        project="memory",
+        state="failed",
+        phase="failed",
+        summary=None,
+        error="Validation failed",
+        completed_at=READ_NOW,
+    )
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: pytest.fail("compile run should avoid readiness probes"),
+        session_count=lambda: pytest.fail("compile run should avoid readiness probes"),
+        daily_state=lambda: pytest.fail("compile run should avoid readiness probes"),
+        reservation_state=lambda: pytest.fail("compile run should avoid readiness probes"),
+    )
+
+    status = status_store_module.project_compile_status(
+        compile_run=failed,
+        queue_active_count=0,
+        probes=probes,
+    )
+
+    assert status.state == "failed"
+    assert status.summary == "Validation failed"
+    assert status.run == failed
+
+
+def test_snapshot_reads_active_compile_reservation_without_queue_mutation(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        repository._connection.execute(
+            """
+            INSERT OR REPLACE INTO queue_metadata(key, value)
+            VALUES (
+                'auto_compile_reservation',
+                '{"status":"retry_wait","expires_at":"2026-08-19T00:00:00+00:00"}'
+            )
+            """
+        )
+        repository._connection.commit()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=datetime(2026, 8, 18, 17, 0, tzinfo=UTC),
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert snapshot.compile.state == "retrying"
+    assert snapshot.compile.run is None
+
+
+def test_snapshot_ignores_an_expired_compile_reservation(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        repository._connection.execute(
+            """
+            INSERT OR REPLACE INTO queue_metadata(key, value)
+            VALUES (
+                'auto_compile_reservation',
+                '{"status":"retry_wait","expires_at":"2026-08-18T12:00:00+00:00"}'
+            )
+            """
+        )
+        repository._connection.commit()
+    monkeypatch.setattr(status_store_module, "_default_session_count", lambda: 0)
+    monkeypatch.setattr(
+        status_store_module,
+        "_default_daily_state",
+        lambda _path, _now: "uncompiled",
+    )
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    assert snapshot.compile.state == "ready"
