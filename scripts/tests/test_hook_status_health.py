@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -206,6 +207,66 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
     assert handler.records[-1].hook_event == "queue_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("hook_name", "fixture_name", "source_agent"),
+    [
+        ("session-end.py", "claude-basic.jsonl", "claude"),
+        ("codex-session-end.py", "codex-basic.jsonl", "codex"),
+    ],
+)
+def test_real_capture_child_classifies_invalid_queue_directory(
+    tmp_path, hook_name, fixture_name, source_agent
+):
+    memory_home = tmp_path / "memory"
+    invalid_queue = tmp_path / "queue-is-a-directory"
+    invalid_queue.mkdir()
+    transcript = (
+        Path(__file__).resolve().parent / "fixtures" / "transcripts" / fixture_name
+    )
+    environment = os.environ.copy()
+    environment.pop("CLAUDE_MEMORY_HOME", None)
+    environment.update(
+        {
+            "AI_MEMORY_HOME": str(memory_home),
+            "AI_MEMORY_QUEUE_PATH": str(invalid_queue),
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, str(HOOKS / hook_name)],
+        input=json.dumps(
+            {
+                "session_id": f"real-child-{source_agent}",
+                "transcript_path": str(transcript),
+                "cwd": str(tmp_path),
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=3,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    records = [
+        json.loads(line)
+        for line in (memory_home / "scripts" / "logs" / "hooks.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[-1] == {
+        **records[-1],
+        "level": "ERROR",
+        "event": "queue_unavailable",
+        "source_agent": source_agent,
+        "session_id": f"real-child-{source_agent}",
+        "message": "queue unavailable during capture",
+    }
+    assert str(transcript) not in json.dumps(records[-1])
+
+
 def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeypatch):
     secret = "credential-value-never-log"
     monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
@@ -236,6 +297,36 @@ def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeyp
     assert len(record["message"]) <= 1_000
     assert "session_id" not in record
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_legacy_hook_log_sanitizes_credentials_paths_and_controls(
+    tmp_path, monkeypatch
+):
+    secret = "credential-value-never-log"
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
+    logger = hook_logging.configure_hook_logger("legacy-health", "pre-compact", tmp_path)
+    try:
+        logger.error(
+            "RuntimeError at /private/tmp/transcript.jsonl and "
+            r"C:\Users\name\session.jsonl "
+            f"with {secret}\ncontrol\x00"
+        )
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    record = json.loads(
+        (tmp_path / "scripts" / "logs" / "hooks.log").read_text(encoding="utf-8")
+    )
+    serialized = json.dumps(record)
+    assert secret not in serialized
+    assert "/private/tmp/transcript.jsonl" not in serialized
+    assert r"C:\Users\name\session.jsonl" not in serialized
+    assert "\n" not in record["message"]
+    assert "\x00" not in record["message"]
+    assert "RuntimeError" in record["message"]
+    assert len(record["message"]) <= 1_000
 
 
 def _health_module():
@@ -316,6 +407,36 @@ def test_recent_hook_alerts_reads_bounded_tail_and_discards_partial_first_line(t
 
     assert [alert.message for alert in alerts] == ["tail failure"]
     assert path.stat().st_size > 220
+
+
+def test_recent_hook_alerts_discards_unterminated_final_record(tmp_path):
+    health = _health_module()
+    path = _write_hook_log(tmp_path, [])
+    encoded = json.dumps(_error_record(message="torn failure")).encode("utf-8")
+    path.write_bytes(encoded)
+    path.chmod(0o600)
+
+    assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
+
+    path.write_bytes(encoded + b"\n")
+    path.chmod(0o600)
+    assert [
+        alert.message for alert in health.read_recent_hook_alerts(tmp_path, now=NOW)
+    ] == ["torn failure"]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        '{"value":' + "9" * 5_000 + "}",
+        "[" * 2_000 + "0" + "]" * 2_000,
+    ],
+)
+def test_recent_hook_alerts_ignores_pathological_json(tmp_path, malformed):
+    health = _health_module()
+    _write_hook_log(tmp_path, [malformed])
+
+    assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
 
 
 @pytest.mark.parametrize("attack", ["missing", "symlink", "hardlink", "public"])

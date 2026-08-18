@@ -122,6 +122,9 @@ def _bounded_log_tail(path: Path, *, max_bytes: int) -> bytes | None:
             return None
         if (observed.device, observed.inode) != (identity.device, identity.inode):
             return None
+        if data and not data.endswith(b"\n"):
+            final_boundary = data.rfind(b"\n")
+            data = b"" if final_boundary < 0 else data[: final_boundary + 1]
         if start and preceding != b"\n":
             boundary = data.find(b"\n")
             data = b"" if boundary < 0 else data[boundary + 1 :]
@@ -165,7 +168,7 @@ def read_recent_hook_alerts(
             continue
         try:
             record = json.loads(line.decode("utf-8", errors="strict"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             continue
         if not isinstance(record, dict):
             continue

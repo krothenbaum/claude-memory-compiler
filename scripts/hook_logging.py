@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,10 @@ _HOOK_EVENTS = frozenset(
 )
 _SOURCE_AGENTS = frozenset({"claude", "codex"})
 MAX_HOOK_CONTEXT_CHARS = 256
+_POSIX_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/(?:[^\s/]+/)*[^\s]+")
+_WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?<![\w])(?:[a-z]:\\)(?:[^\\\s]+\\)*[^\\\s]+"
+)
 
 
 def _safe_context(value: object, env: dict[str, str]) -> str | None:
@@ -53,6 +58,30 @@ def _safe_event_message(value: object, env: dict[str, str]) -> str:
     return normalize_persistence_reason(text, env)
 
 
+def _safe_legacy_message(value: object, env: dict[str, str]) -> str:
+    raw = str(value)
+    canonical = " ".join(raw.split())
+    redacted = normalize_persistence_reason(canonical, env)
+    contains_path = bool(
+        _POSIX_ABSOLUTE_PATH.search(raw) or _WINDOWS_ABSOLUTE_PATH.search(raw)
+    )
+    contains_control = any(
+        (ord(character) < 32 and character not in "\n\r\t")
+        or ord(character) == 127
+        for character in raw
+    )
+    if (
+        len(raw) <= 1_000
+        and "[REDACTED]" not in redacted
+        and not contains_path
+        and not contains_control
+    ):
+        return raw
+    path_safe = _WINDOWS_ABSOLUTE_PATH.sub("[PATH]", raw)
+    path_safe = _POSIX_ABSOLUTE_PATH.sub("[PATH]", path_safe)
+    return _safe_event_message(path_safe, env)
+
+
 class HookJsonFormatter(logging.Formatter):
     """Format one stable, exception-safe operational JSONL record."""
 
@@ -66,7 +95,9 @@ class HookJsonFormatter(logging.Formatter):
         if event not in _HOOK_EVENTS:
             event = "hook_log"
         message = record.getMessage()
-        if event != "hook_log":
+        if event == "hook_log":
+            message = _safe_legacy_message(message, dict(os.environ))
+        else:
             message = _safe_event_message(message, dict(os.environ))
         value = {
             "timestamp": timestamp.isoformat(timespec="milliseconds").replace(

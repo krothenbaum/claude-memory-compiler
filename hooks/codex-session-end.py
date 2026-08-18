@@ -150,10 +150,16 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             session_id=value.get("session_id"),
         )
     except Exception as error:
+        child_event = getattr(error, "event", None)
         event = (
-            "queue_unavailable"
-            if isinstance(error, sqlite3.Error)
-            else "capture_failed"
+            child_event
+            if isinstance(child_event, str)
+            and child_event in {"queue_unavailable", "capture_failed"}
+            else (
+                "queue_unavailable"
+                if isinstance(error, sqlite3.Error)
+                else "capture_failed"
+            )
         )
         log_hook_event(
             logger,

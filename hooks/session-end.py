@@ -60,6 +60,14 @@ class HookDeadlineExceeded(TimeoutError):
     """The internal hook budget expired before durable enqueue began."""
 
 
+class CaptureChildError(RuntimeError):
+    """A bounded classified failure returned by the capture subprocess."""
+
+    def __init__(self, event: str, message: str) -> None:
+        self.event = event
+        super().__init__(message)
+
+
 def run_process_until_deadline(
     command: list[str],
     *,
@@ -175,31 +183,65 @@ def enqueue_capture_with_deadline(
     value = json.loads(output)
     if not isinstance(value, dict):
         raise ValueError("capture child returned invalid output")
+    if value.get("status") == "error":
+        raw_event = value.get("event")
+        event = (
+            raw_event
+            if isinstance(raw_event, str)
+            and raw_event in {"queue_unavailable", "capture_failed"}
+            else "capture_failed"
+        )
+        raw_message = value.get("message")
+        message = (
+            raw_message
+            if isinstance(raw_message, str)
+            and raw_message
+            and len(raw_message) <= 1_000
+            else "capture failed"
+        )
+        raise CaptureChildError(event, message)
     return value
 
 
 def _capture_child_main() -> None:
-    request = json.loads(sys.stdin.read())
-    if not isinstance(request, dict):
-        raise ValueError("capture child input must be an object")
-    budget = request.get("budget_seconds")
-    token = request.get("capture_token")
-    if not isinstance(budget, (int, float)) or budget <= 0:
-        raise ValueError("capture child budget must be positive")
-    if not isinstance(token, str) or not token:
-        raise ValueError("capture child token is required")
-    outcome = enqueue_hook_input(
-        request["hook_input"],
-        source_agent=request["source_agent"],
-        trigger=request["trigger"],
-        limits=request["limits"],
-        deadline=time.monotonic() + budget,
-        monotonic=time.monotonic,
-        capture_token=token,
-    )
-    sys.stdout.write(
-        json.dumps({"status": outcome.status, "job_id": outcome.job_id})
-    )
+    try:
+        request = json.loads(sys.stdin.read())
+        if not isinstance(request, dict):
+            raise ValueError("capture child input must be an object")
+        budget = request.get("budget_seconds")
+        token = request.get("capture_token")
+        if not isinstance(budget, (int, float)) or budget <= 0:
+            raise ValueError("capture child budget must be positive")
+        if not isinstance(token, str) or not token:
+            raise ValueError("capture child token is required")
+        outcome = enqueue_hook_input(
+            request["hook_input"],
+            source_agent=request["source_agent"],
+            trigger=request["trigger"],
+            limits=request["limits"],
+            deadline=time.monotonic() + budget,
+            monotonic=time.monotonic,
+            capture_token=token,
+        )
+        response: dict[str, object] = {
+            "status": outcome.status,
+            "job_id": outcome.job_id,
+        }
+    except Exception as error:
+        text = str(error).casefold()
+        queue_failure = isinstance(error, sqlite3.Error) or any(
+            marker in text for marker in ("queue", "database", "sqlite")
+        )
+        response = {
+            "status": "error",
+            "event": "queue_unavailable" if queue_failure else "capture_failed",
+            "message": (
+                "queue unavailable during capture"
+                if queue_failure
+                else "capture failed"
+            ),
+        }
+    sys.stdout.write(json.dumps(response, separators=(",", ":")))
 
 
 def require_time_remaining(
@@ -1175,10 +1217,16 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         )
     except Exception as error:
         # Hooks are advisory. A capture failure must never block the host agent.
+        child_event = getattr(error, "event", None)
         event = (
-            "queue_unavailable"
-            if isinstance(error, sqlite3.Error)
-            else "capture_failed"
+            child_event
+            if isinstance(child_event, str)
+            and child_event in {"queue_unavailable", "capture_failed"}
+            else (
+                "queue_unavailable"
+                if isinstance(error, sqlite3.Error)
+                else "capture_failed"
+            )
         )
         log_hook_event(
             logger,
