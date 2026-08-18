@@ -3028,3 +3028,47 @@ def test_bounded_attention_reserves_modern_and_legacy_sources(tmp_path):
     assert {run.id > 0 for run in snapshot.attention} == {True, False}
     assert len(snapshot.attention) == 2
     assert snapshot.has_more
+
+
+def test_bounded_candidate_queries_limit_projection_materialization(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        for index in range(120):
+            _insert_projection_run(
+                repository._connection,
+                run_id=20_000 + index,
+                state="running" if index % 2 else "failed",
+                phase="worker_claimed" if index % 2 else "failed",
+                updated_at=READ_NOW - timedelta(seconds=index),
+                project="bounded",
+            )
+        repository._connection.commit()
+    materialized = 0
+    statements: list[str] = []
+    original_from_row = status_store_module.status_run_from_row
+    original_open = status_store_module._open_read_only_database
+
+    def count_row(row, **kwargs):
+        nonlocal materialized
+        materialized += 1
+        return original_from_row(row, **kwargs)
+
+    def traced_open(candidate):
+        connection = original_open(candidate)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(status_store_module, "status_run_from_row", count_row)
+    monkeypatch.setattr(status_store_module, "_open_read_only_database", traced_open)
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        max_runs=2,
+    )
+    assert materialized <= 18
+    assert len(snapshot.active) + len(snapshot.attention) + len(snapshot.recent) == 2
+    assert snapshot.has_more
+    assert sum(" LIMIT 3" in statement for statement in statements) >= 6

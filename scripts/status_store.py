@@ -1031,6 +1031,86 @@ def _read_runs(
         }.get(str(status), ("unknown", "unknown", ""))
         return safe_match(kind, source, session, project, *mapping)
     connection.create_function("safe_legacy_match", 5, safe_legacy_match, deterministic=True)
+    if max_runs is not None:
+        acknowledged = tuple(sorted(acknowledged_run_ids))
+        placeholders = ",".join("?" for _ in acknowledged)
+        modern_in = f"id IN ({placeholders})" if acknowledged else "0=1"
+        modern_not_in = f"id NOT IN ({placeholders})" if acknowledged else "1=1"
+        legacy_in = f"(-jobs.id) IN ({placeholders})" if acknowledged else "0=1"
+        legacy_not_in = f"(-jobs.id) NOT IN ({placeholders})" if acknowledged else "1=1"
+        query_modern = (
+            " AND safe_status_match(kind,source_agent,session_id,project,state,phase,summary)=1"
+            if needle
+            else ""
+        )
+        query_legacy = (
+            " AND safe_legacy_match(jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,jobs.status)=1"
+            if needle
+            else ""
+        )
+        recent_modern = "" if all_history else " AND julianday(updated_at) >= julianday(?)"
+        recent_legacy = "" if all_history else " AND julianday(jobs.updated_at) >= julianday(?)"
+        modern_categories = (
+            f"state IN ('failed','dead') AND {modern_not_in}",
+            "state IN ('queued','running','retrying')",
+            f"(state='succeeded' OR (state IN ('failed','dead') AND {modern_in})){recent_modern}",
+        )
+        legacy_categories = (
+            f"jobs.status='dead' AND {legacy_not_in}",
+            "jobs.status IN ('pending','leased','failed')",
+            f"(jobs.status='succeeded' OR (jobs.status='dead' AND {legacy_in})){recent_legacy}",
+        )
+        seen: set[int] = set()
+        bounded: list[StatusRun] = []
+        if "status_runs" in tables:
+            for index, predicate in enumerate(modern_categories):
+                parameters: tuple[object, ...] = (
+                    (*acknowledged,) if index != 1 else ()
+                )
+                if index == 2 and not all_history:
+                    parameters = (*parameters, cutoff)
+                parameters = (*parameters, max_runs + 1)
+                rows = connection.execute(
+                    "SELECT * FROM status_runs WHERE kind != 'compile' AND "
+                    + predicate
+                    + query_modern
+                    + " ORDER BY julianday(updated_at) DESC, id DESC LIMIT ?",
+                    parameters,
+                )
+                for row in rows:
+                    run = _safe_projection_run(
+                        status_run_from_row(row, redaction_env=os.environ)
+                    )
+                    if run.id not in seen:
+                        seen.add(run.id)
+                        bounded.append(run)
+        legacy_join = (
+            " LEFT JOIN status_runs ON status_runs.job_id=jobs.id WHERE status_runs.id IS NULL AND "
+            if "status_runs" in tables
+            else " WHERE "
+        )
+        for index, predicate in enumerate(legacy_categories):
+            parameters = (*acknowledged,) if index != 1 else ()
+            if index == 2 and not all_history:
+                parameters = (*parameters, cutoff)
+            parameters = (*parameters, max_runs + 1)
+            rows = connection.execute(
+                "SELECT jobs.id,jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,"
+                "jobs.status,jobs.last_error,jobs.created_at,jobs.updated_at,jobs.completed_at "
+                "FROM jobs"
+                + legacy_join
+                + "jobs.kind != 'compile' AND "
+                + predicate
+                + query_legacy
+                + " ORDER BY julianday(jobs.updated_at) DESC,jobs.id DESC LIMIT ?",
+                parameters,
+            )
+            for row in rows:
+                run = _synthetic_run_from_job(row)
+                if run.id not in seen:
+                    seen.add(run.id)
+                    bounded.append(run)
+        return tuple(bounded)
     if "status_runs" in tables:
         status_sql = "SELECT * FROM status_runs WHERE kind != 'compile'"
         status_parameters: tuple[object, ...] = ()
