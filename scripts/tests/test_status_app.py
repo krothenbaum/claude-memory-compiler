@@ -7,12 +7,13 @@ from functools import wraps
 
 import pytest
 
-from scripts.status_app import StatusDashboard
+from scripts.status_app import StatusDashboard, run_dashboard
 from scripts.status_store import (
     CompileStatus,
     ObserverState,
     RunDetails,
     StatusDatabaseUnavailable,
+    StatusDataInvalid,
     StatusEvent,
     StatusRun,
     StatusSnapshot,
@@ -65,7 +66,13 @@ def snapshot():
 def details_for(run_id):
     selected = next(
         item
-        for item in (*snapshot().active, *snapshot().attention, *snapshot().recent)
+        for item in (
+            *snapshot().active,
+            *snapshot().attention,
+            *snapshot().recent,
+            snapshot().compile.run,
+        )
+        if item is not None
         if item.id == run_id
     )
     event = StatusEvent(
@@ -156,6 +163,7 @@ async def test_selection_persists_by_run_id_across_regrouping(tmp_path):
     async with dashboard.run_test() as pilot:
         await pilot.pause()
         dashboard.selected_run_id = 2
+        dashboard.preferred_run_id = 2
         await dashboard.refresh_snapshot()
         assert dashboard.selected_run_id == 2
 
@@ -230,7 +238,8 @@ async def test_no_color_preserves_icons_and_labels(tmp_path):
         rendered = " ".join(
             str(row.render()) for row in dashboard.query(".run-row")
         )
-        assert "●" in rendered and "✓" in rendered and "✗" in rendered
+        assert any(icon in rendered for icon in ("●", "◉"))
+        assert "✓" in rendered and "✗" in rendered
         assert "provider_started" in rendered
 
 
@@ -260,3 +269,139 @@ async def test_quit_binding_exits_cleanly(tmp_path):
         await pilot.press("q")
         await pilot.pause()
     assert not dashboard.is_running
+
+
+def test_public_dashboard_runner_returns_zero_after_clean_exit(monkeypatch):
+    exits = []
+    monkeypatch.setattr(StatusDashboard, "run", lambda self: exits.append(self))
+
+    assert run_dashboard(no_color=True) == 0
+    assert exits and exits[0].no_color is True
+
+
+@async_test
+async def test_wrapped_sqlite_busy_keeps_last_good_frame_and_initial_busy_diagnoses(
+    tmp_path,
+):
+    calls = 0
+
+    def reader(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return snapshot()
+        cause = sqlite3.OperationalError("database is locked")
+        raise StatusDataInvalid(tmp_path / "jobs.sqlite3", "invalid") from cause
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        await dashboard.refresh_snapshot()
+        assert dashboard.snapshot is not None
+        assert dashboard.query_one("#delayed-banner").display is True
+
+    def initially_busy(*_args, **_kwargs):
+        raise StatusDataInvalid(tmp_path / "missing.sqlite3", "busy") from (
+            sqlite3.OperationalError("database is locked")
+        )
+
+    initial = app(tmp_path, initially_busy)
+    async with initial.run_test() as pilot:
+        await pilot.pause()
+        assert initial.snapshot is None
+        assert initial.query_one("#delayed-banner").display is True
+        assert initial.query_one("#diagnostic").display is True
+    assert not (tmp_path / "missing.sqlite3").exists()
+
+
+@async_test
+async def test_filter_fallback_restores_preferred_selection_when_cleared(tmp_path):
+    def reader(*_args, **kwargs):
+        value = snapshot()
+        if kwargs["query"] == "success":
+            return StatusSnapshot(
+                active=(),
+                attention=(),
+                recent=value.recent,
+                compile=value.compile,
+                health_alerts=(),
+            )
+        return value
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.pause()
+        assert dashboard.preferred_run_id == 2
+        dashboard.filter_query = "success"
+        await dashboard.refresh_snapshot()
+        assert dashboard.selected_run_id == 3
+        dashboard.filter_query = ""
+        await dashboard.refresh_snapshot()
+        assert dashboard.selected_run_id == 2
+
+
+@async_test
+async def test_compile_panel_is_not_duplicated_and_participates_in_navigation(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert len(dashboard.query("#run-4")) == 0
+        for _ in range(3):
+            await pilot.press("j")
+            await pilot.pause()
+        assert dashboard.selected_run_id == 4
+        assert dashboard.query_one("#compile-panel").has_class("selected")
+        await pilot.press("enter")
+        assert "Run 4" in str(dashboard.query_one("#details").render())
+
+    compact = app(tmp_path)
+    async with compact.run_test(size=(60, 30)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.press("j")
+            await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert compact.screen.query_one("#details-overlay")
+
+
+@async_test
+async def test_only_active_rows_animate_between_refresh_ticks(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        active_before = str(dashboard.query_one("#run-1").render())
+        terminal_before = str(dashboard.query_one("#run-3").render())
+        await dashboard.refresh_snapshot()
+        active_after = str(dashboard.query_one("#run-1").render())
+        terminal_after = str(dashboard.query_one("#run-3").render())
+        assert active_before != active_after
+        assert terminal_before == terminal_after
+
+
+@async_test
+async def test_no_color_environment_presence_and_constructor_are_additive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("NO_COLOR", "")
+    dashboard = app(tmp_path)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.no_color is True
+        assert dashboard.has_class("nocolor")
+        assert dashboard.screen.has_class("nocolor")
+        assert dashboard.query_one("#run-1").has_class("state-running")
+
+    explicit = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: snapshot(),
+        details_reader=lambda _path, run_id: details_for(run_id),
+        observer_loader=lambda _path: ObserverState.empty(),
+        acknowledger=lambda _path, _run_id: ObserverState.empty(),
+        clock=lambda: NOW,
+        no_color=True,
+    )
+    assert explicit.no_color is True

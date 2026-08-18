@@ -16,19 +16,36 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, Static
 
-from scripts.status_store import (
-    HealthAlert,
-    ObserverState,
-    RunDetails,
-    StatusReadError,
-    StatusRun,
-    StatusSnapshot,
-    acknowledge_run,
-    load_observer_state,
-    observer_state_path,
-    read_run_details,
-    read_snapshot,
-)
+try:
+    from scripts.config import load_config
+    from scripts.status_store import (
+        HealthAlert,
+        ObserverState,
+        RunDetails,
+        StatusReadError,
+        StatusRun,
+        StatusSnapshot,
+        acknowledge_run,
+        load_observer_state,
+        observer_state_path,
+        read_run_details,
+        read_snapshot,
+    )
+except ImportError:  # Direct execution with scripts/ on sys.path.
+    from config import load_config
+    from status_store import (
+        HealthAlert,
+        ObserverState,
+        RunDetails,
+        StatusReadError,
+        StatusRun,
+        StatusSnapshot,
+        acknowledge_run,
+        load_observer_state,
+        observer_state_path,
+        read_run_details,
+        read_snapshot,
+    )
 
 SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
@@ -89,6 +106,10 @@ class StatusDashboard(App[None]):
     StatusDashboard.nocolor #health-banner,
     StatusDashboard.nocolor #delayed-banner,
     StatusDashboard.nocolor #diagnostic { color: $text; }
+    StatusDashboard.nocolor .run-row.selected { text-style: bold; }
+    StatusDashboard.nocolor #runs-pane,
+    StatusDashboard.nocolor #details-pane,
+    StatusDashboard.nocolor #compile-panel { border: round ansi_bright_black; }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -127,7 +148,7 @@ class StatusDashboard(App[None]):
         self._acknowledger = acknowledger
         self._clock = clock
         self._health_loader = health_loader
-        self.no_color = bool(os.environ.get("NO_COLOR")) if no_color is None else no_color
+        self.no_color = bool(no_color or "NO_COLOR" in os.environ)
         self.observer_path = observer_state_path(self.memory_home)
         try:
             self.observer_state = observer_loader(self.observer_path)
@@ -135,7 +156,9 @@ class StatusDashboard(App[None]):
             self.observer_state = ObserverState.empty()
         self.snapshot: StatusSnapshot | None = None
         self.selected_run_id: int | None = None
+        self.preferred_run_id: int | None = None
         self.filter_query = ""
+        self._spinner_frame = 0
 
     def compose(self) -> ComposeResult:
         yield Static(id="app-header")
@@ -156,6 +179,7 @@ class StatusDashboard(App[None]):
     async def on_mount(self) -> None:
         if self.no_color:
             self.add_class("nocolor")
+            self.screen.add_class("nocolor")
         self._set_layout(self.size.width)
         await self.refresh_snapshot()
         self.set_interval(1.0, self.refresh_snapshot)
@@ -172,13 +196,39 @@ class StatusDashboard(App[None]):
     def _all_runs(self) -> tuple[StatusRun, ...]:
         if self.snapshot is None:
             return ()
-        return (*self.snapshot.active, *self.snapshot.attention, *self.snapshot.recent)
+        grouped = tuple(
+            run
+            for run in (
+                *self.snapshot.active,
+                *self.snapshot.attention,
+                *self.snapshot.recent,
+            )
+            if run.kind != "compile"
+        )
+        compile_run = self.snapshot.compile.run
+        return (*grouped, compile_run) if compile_run is not None else grouped
 
     def _choose_selection(self) -> None:
         runs = self._all_runs()
-        if self.selected_run_id in {run.id for run in runs}:
+        visible = {run.id for run in runs}
+        if self.preferred_run_id in visible:
+            self.selected_run_id = self.preferred_run_id
             return
-        self.selected_run_id = runs[0].id if runs else None
+        if self.selected_run_id not in visible:
+            self.selected_run_id = runs[0].id if runs else None
+        if self.preferred_run_id is None:
+            self.preferred_run_id = self.selected_run_id
+
+    @staticmethod
+    def _is_busy_error(error: BaseException) -> bool:
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, sqlite3.OperationalError):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     async def refresh_snapshot(self) -> None:
         try:
@@ -190,17 +240,21 @@ class StatusDashboard(App[None]):
                 health_alerts=self._health_loader(),
                 memory_home=self.memory_home,
             )
-        except sqlite3.OperationalError:
-            if self.snapshot is not None:
+        except (StatusReadError, sqlite3.Error, OSError, ValueError) as error:
+            if self._is_busy_error(error):
                 self.query_one("#delayed-banner", Static).display = True
-            return
-        except (StatusReadError, OSError, ValueError) as error:
+                if self.snapshot is None:
+                    diagnostic = self.query_one("#diagnostic", Static)
+                    diagnostic.update(Text("Status refresh delayed: database is busy"))
+                    diagnostic.display = True
+                return
             diagnostic = self.query_one("#diagnostic", Static)
             path = getattr(error, "path", self.queue_path)
             diagnostic.update(Text(f"Status unavailable: {path} — {error}"))
             diagnostic.display = True
             return
         self.snapshot = result
+        self._spinner_frame = (self._spinner_frame + 1) % 2
         self.query_one("#delayed-banner", Static).display = False
         self.query_one("#diagnostic", Static).display = False
         self._choose_selection()
@@ -226,9 +280,9 @@ class StatusDashboard(App[None]):
             ("RECENT", self.snapshot.recent),
         ):
             await run_list.mount(Static(label, classes="section-label"))
-            for run in runs:
+            for run in (item for item in runs if item.kind != "compile"):
                 icon = {
-                    "running": "●",
+                    "running": ("●", "◉")[self._spinner_frame],
                     "queued": "◌",
                     "retrying": "↻",
                     "succeeded": "✓",
@@ -249,6 +303,11 @@ class StatusDashboard(App[None]):
         )
         self.query_one("#compile-panel", Static).set_class(
             compile_status.run is not None, "selectable"
+        )
+        self.query_one("#compile-panel", Static).set_class(
+            compile_status.run is not None
+            and compile_status.run.id == self.selected_run_id,
+            "selected",
         )
         self._render_details()
 
@@ -301,6 +360,7 @@ class StatusDashboard(App[None]):
         ids = [run.id for run in runs]
         index = ids.index(self.selected_run_id) if self.selected_run_id in ids else 0
         self.selected_run_id = ids[(index + delta) % len(ids)]
+        self.preferred_run_id = self.selected_run_id
         self.call_later(self._render_snapshot)
 
     def action_next_run(self) -> None:
@@ -355,3 +415,14 @@ class StatusDashboard(App[None]):
 
     def action_help(self) -> None:
         self.notify("↑/↓ or j/k select · Enter details · / filter · a acknowledge · q quit")
+
+
+def run_dashboard(*, no_color: bool) -> int:
+    """Run the default read-only dashboard and return after a clean exit."""
+    config = load_config(os.environ)
+    StatusDashboard(
+        config.queue_path,
+        memory_home=config.root_dir,
+        no_color=no_color,
+    ).run()
+    return 0
