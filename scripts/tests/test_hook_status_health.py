@@ -18,7 +18,6 @@ import pytest
 
 from scripts import hook_logging
 
-
 ROOT = Path(__file__).resolve().parents[2]
 HOOKS = ROOT / "hooks"
 NOW = datetime(2026, 8, 18, 18, 0, tzinfo=UTC)

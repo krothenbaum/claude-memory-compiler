@@ -17,7 +17,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-
 # This must precede imports of the capture/queue modules: those modules can
 # create runtime state when their public entry points are used.
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
@@ -38,7 +37,6 @@ from scripts.utils import (
     open_secure_runtime_file,
     validate_secure_runtime_file,
 )
-
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000

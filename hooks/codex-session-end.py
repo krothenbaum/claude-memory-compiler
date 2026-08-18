@@ -12,7 +12,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
     sys.exit(0)
 
@@ -26,7 +25,6 @@ from scripts.hook_logging import (
     log_hook_event,
 )
 from scripts.transcripts import parse_codex_transcript
-
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
