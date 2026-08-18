@@ -15,6 +15,7 @@ import sysconfig
 from typing import Callable, Literal, Mapping, TypeAlias
 
 try:
+    from .privacy import normalize_persistence_reason
     from .providers import ProviderResult
     from .transcripts import NormalizedSession, render_turns
     from .usage import (
@@ -25,6 +26,7 @@ try:
         recover_usage_log,
     )
 except ImportError:  # Direct execution with scripts/ on sys.path.
+    from privacy import normalize_persistence_reason
     from providers import ProviderResult
     from transcripts import NormalizedSession, render_turns
     from usage import (
@@ -63,10 +65,7 @@ AutoCompileContentRead: TypeAlias = (
 )
 SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 5
-MAX_ERROR_CHARS = 1_000
 AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
-_SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
-_SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 
 _STATUS_SCHEMA_SQL = """
 CREATE TABLE status_runs (
@@ -108,28 +107,6 @@ CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id);
 
 class LeaseOwnershipError(RuntimeError):
     """Raised when a worker mutates a lease it does not own."""
-
-
-def normalize_persistence_reason(
-    reason: object,
-    env: Mapping[str, str],
-) -> str:
-    """Bound and redact metadata persisted at queue failure boundaries."""
-    normalized = " ".join(str(reason).split()) or "unspecified failure"
-    secrets = {
-        value
-        for name, value in env.items()
-        if value
-        and (
-            name in _SECRET_NAMES
-            or name.startswith("OPENAI_")
-            or name.startswith("AZURE_OPENAI_")
-            or name.endswith(_SECRET_SUFFIXES)
-        )
-    }
-    for secret in sorted(secrets, key=len, reverse=True):
-        normalized = normalized.replace(secret, "[REDACTED]")
-    return normalized[:MAX_ERROR_CHARS]
 
 
 def _utc_now() -> datetime:

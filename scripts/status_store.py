@@ -3,21 +3,25 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import InitVar, dataclass
+from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Literal, TypeAlias
+from typing import Literal
 
 try:
-    from .queue import normalize_persistence_reason
+    from .privacy import normalize_persistence_reason
 except ImportError:  # Direct execution with scripts/ on sys.path.
-    from queue import normalize_persistence_reason  # type: ignore[attr-defined]
+    from privacy import normalize_persistence_reason
 
 
 RunState = Literal["queued", "running", "retrying", "succeeded", "failed", "dead"]
 EventLevel = Literal["info", "warning", "error"]
-JsonScalar: TypeAlias = str | int | float | bool | None
+type JsonScalar = str | int | float | bool | None
+
+_RUN_STATES = frozenset({"queued", "running", "retrying", "succeeded", "failed", "dead"})
+_EVENT_LEVELS = frozenset({"info", "warning", "error"})
 
 ALLOWED_PHASES = frozenset(
     {
@@ -50,6 +54,12 @@ MAX_DETAIL_STRING_CHARS = 1_000
 _ALLOWED_DETAIL_KEYS = frozenset(
     {"chars_saved", "changed_files", "retry_at", "elapsed_ms"}
 )
+_NONNEGATIVE_INTEGER_DETAIL_KEYS = frozenset(
+    {"chars_saved", "changed_files", "elapsed_ms"}
+)
+_RETRY_AT_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def normalize_status_reason(
@@ -62,12 +72,17 @@ def normalize_status_reason(
     return normalize_persistence_reason(value, env)
 
 
-def normalize_summary(value: object | None) -> str | None:
-    """Normalize optional summary text and cap its persisted size."""
+def normalize_summary(
+    value: object | None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Normalize, redact, and bound optional persisted summary text."""
     if value is None:
         return None
     normalized = " ".join(str(value).split())
-    return normalized[:MAX_SUMMARY_CHARS] or None
+    if not normalized:
+        return None
+    return normalize_persistence_reason(normalized, env or {})[:MAX_SUMMARY_CHARS]
 
 
 def normalize_details(
@@ -92,7 +107,27 @@ def normalize_details(
                 f"status detail {key!r} must contain at most "
                 f"{MAX_DETAIL_STRING_CHARS} characters"
             )
-        normalized[key] = value
+        if key in _NONNEGATIVE_INTEGER_DETAIL_KEYS:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"status detail {key!r} must be a nonnegative integer")
+            normalized[key] = value
+            continue
+        if not isinstance(value, str) or _RETRY_AT_TIMESTAMP.fullmatch(value) is None:
+            raise ValueError("status detail 'retry_at' must be a timezone-aware ISO-8601 timestamp")
+        try:
+            retry_at = datetime.fromisoformat(value)
+            canonical_retry_at = retry_at.astimezone(UTC).isoformat(
+                timespec="microseconds"
+            )
+        except (OverflowError, ValueError) as error:
+            raise ValueError(
+                "status detail 'retry_at' must be a timezone-aware ISO-8601 timestamp"
+            ) from error
+        if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+            raise ValueError(
+                "status detail 'retry_at' must be a timezone-aware ISO-8601 timestamp"
+            )
+        normalized[key] = canonical_retry_at
     return MappingProxyType(normalized)
 
 
@@ -112,6 +147,16 @@ class StatusRun:
     started_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    redaction_env: InitVar[Mapping[str, str] | None] = None
+
+    def __post_init__(self, redaction_env: Mapping[str, str] | None) -> None:
+        if self.state not in _RUN_STATES:
+            raise ValueError(f"invalid status run state: {self.state!r}")
+        if self.phase not in ALLOWED_PHASES:
+            raise ValueError(f"invalid status phase: {self.phase!r}")
+        env = redaction_env or {}
+        object.__setattr__(self, "summary", normalize_summary(self.summary, env))
+        object.__setattr__(self, "error", normalize_status_reason(self.error, env))
 
 
 @dataclass(frozen=True)
@@ -125,6 +170,16 @@ class StatusEvent:
     message: str | None
     details: Mapping[str, JsonScalar]
     created_at: datetime
+    redaction_env: InitVar[Mapping[str, str] | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, redaction_env: Mapping[str, str] | None) -> None:
+        if self.phase not in ALLOWED_PHASES:
+            raise ValueError(f"invalid status phase: {self.phase!r}")
+        if self.level not in _EVENT_LEVELS:
+            raise ValueError(f"invalid status event level: {self.level!r}")
+        object.__setattr__(
+            self,
+            "message",
+            normalize_status_reason(self.message, redaction_env or {}),
+        )
         object.__setattr__(self, "details", normalize_details(self.details))
