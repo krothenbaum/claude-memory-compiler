@@ -39,9 +39,7 @@ LOG_FILE = SCRIPTS_DIR / "flush.log"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from utils import (  # noqa: E402
     ExclusiveFileLock,
-    _resolve_tty_path,
     append_daily_entry,
-    notify_terminal,
     open_secure_log_stream,
     read_text_with_baseline,
 )
@@ -53,6 +51,14 @@ from providers import (  # noqa: E402
     TaskKind,
     TextRequest,
 )
+
+
+def _resolve_tty_path() -> None:
+    """Compatibility seam retained for older tests; TTY routing is disabled."""
+
+
+def notify_terminal(_message: str) -> None:
+    """Compatibility no-op; background work never writes to an interactive TTY."""
 
 
 class _SecureLogHandler(logging.StreamHandler):
@@ -593,13 +599,17 @@ def _auto_compile_lock_is_held(root: Path) -> bool:
     return not acquired
 
 
-def _compile_process_options(root: Path, log_handle: object) -> dict[str, object]:
+def _compile_process_options(
+    root: Path,
+    log_handle: object,
+    status_run_id: int | None = None,
+) -> dict[str, object]:
     options: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": subprocess.STDOUT,
         "cwd": str(root),
-        "env": _auto_compile_environment(root),
+        "env": _auto_compile_environment(root, status_run_id),
         "close_fds": True,
     }
     if sys.platform == "win32":
@@ -611,15 +621,18 @@ def _compile_process_options(root: Path, log_handle: object) -> dict[str, object
     return options
 
 
-def _auto_compile_environment(root: Path) -> dict[str, str]:
+def _auto_compile_environment(
+    root: Path, status_run_id: int | None = None
+) -> dict[str, str]:
     environment = os.environ.copy()
     environment["AI_MEMORY_HOME"] = str(root)
     environment.pop("CLAUDE_MEMORY_HOME", None)
     environment["AI_MEMORY_INTERNAL_JOB"] = "1"
     environment["AI_MEMORY_AUTO_COMPILE"] = "1"
-    tty_path = _resolve_tty_path()
-    if tty_path:
-        environment["CLAUDE_MEMORY_TTY"] = tty_path
+    environment.pop("CLAUDE_MEMORY_TTY", None)
+    environment.pop("AI_MEMORY_STATUS_RUN_ID", None)
+    if status_run_id is not None:
+        environment["AI_MEMORY_STATUS_RUN_ID"] = str(status_run_id)
     return environment
 
 
@@ -783,7 +796,6 @@ def maybe_trigger_compilation(
         return False
 
     logging.info("End-of-day compilation reserved (after %d:00)", COMPILE_AFTER_HOUR)
-    notify_terminal("end-of-day compile scheduled")
     return True
 
 
@@ -1075,6 +1087,7 @@ def run_auto_compile_coordinator(
                 if owned is None or owned[0] != active_fingerprint:
                     return False
                 required_markers = owned[4]
+                status_run_id = owned[5]
                 if required_markers is None:
                     return False
 
@@ -1101,7 +1114,10 @@ def run_auto_compile_coordinator(
                         root / "scripts" / "compile.log"
                     ) as log_handle:
                         return compile_launcher(
-                            command, **_compile_process_options(root, log_handle)
+                            command,
+                            **_compile_process_options(
+                                root, log_handle, status_run_id
+                            ),
                         )
 
                 try:
@@ -1472,7 +1488,6 @@ def main():
         return
 
     logging.info("Flushing session %s: %d chars", session_id, len(context))
-    notify_terminal(f"flush started — project={project_key} ({len(context)} chars)")
 
     # Run the LLM extraction
     response = asyncio.run(run_flush(context, project_key, cwd))
@@ -1496,7 +1511,6 @@ def main():
         # No dedup-state update here: the dedup path deletes the context
         # file, which would defeat an immediate retry.
         logging.error("Context file preserved for retry: %s", context_file)
-        notify_terminal(f"flush FAILED — context preserved at {context_file.name}")
         return
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
@@ -1509,7 +1523,6 @@ def main():
     # Clean up context file
     context_file.unlink(missing_ok=True)
 
-    notify_terminal(f"flush complete — {result_summary}")
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.

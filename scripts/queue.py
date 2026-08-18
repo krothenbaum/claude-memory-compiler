@@ -1351,6 +1351,174 @@ class QueueRepository:
             """
         ).fetchone() is not None
 
+    @staticmethod
+    def _auto_compile_operation_key(log_name: str, fingerprint: str) -> str:
+        return f"auto-compile:{log_name}:{fingerprint}"
+
+    def _create_auto_compile_run_unlocked(
+        self,
+        log_name: str,
+        fingerprint: str,
+        now: datetime,
+    ) -> int:
+        operation_key = self._auto_compile_operation_key(log_name, fingerprint)
+        row = self._connection.execute(
+            "SELECT id FROM status_runs WHERE operation_key = ?", (operation_key,)
+        ).fetchone()
+        if row is not None:
+            return row["id"]
+        project = self.memory_home.name
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", project):
+            project = "global"
+        run_id = create_operation_run_unlocked(
+            self._connection,
+            operation_key=operation_key,
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project=project,
+            phase="reserved",
+            now=now,
+            redaction_env=self._redaction_env,
+        )
+        append_event_unlocked(
+            self._connection,
+            run_id,
+            "reserved",
+            now=now,
+            redaction_env=self._redaction_env,
+        )
+        return run_id
+
+    def _auto_compile_run_unlocked(
+        self, reservation: Mapping[str, object], *, pending: bool = False
+    ) -> StatusRun | None:
+        key = "pending_status_run_id" if pending else "status_run_id"
+        run_id = reservation.get(key)
+        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+            (run_id,),
+        ).fetchone()
+        return (
+            status_run_from_row(row, redaction_env=self._redaction_env)
+            if row is not None
+            else None
+        )
+
+    def _transition_auto_compile_run_unlocked(
+        self,
+        reservation: Mapping[str, object],
+        state: RunState,
+        phase: str,
+        *,
+        now: datetime,
+        summary: str | None = None,
+        error: str | None = None,
+        level: EventLevel = "info",
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        run = self._auto_compile_run_unlocked(reservation)
+        if run is None or run.state in {"succeeded", "failed", "dead"}:
+            return
+        if run.state == state:
+            validate_operation_event(run.state, phase)
+        else:
+            validate_operation_transition(run.state, state, phase)
+        transition_run_unlocked(
+            self._connection,
+            run.id,
+            state,
+            phase,
+            now=now,
+            summary=summary,
+            error=error,
+            completed_at=now if state in {"succeeded", "failed", "dead"} else None,
+            level=level,
+            message=message,
+            details=details,
+            redaction_env=self._redaction_env,
+        )
+
+    def active_auto_compile_status_run(
+        self, run_id: int, *, now: datetime | str | int | float
+    ) -> StatusRun | None:
+        row = self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            reservation = json.loads(row["value"])
+            unexpired = _datetime(reservation["expires_at"]) > _datetime(now)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        run = self._auto_compile_run_unlocked(reservation)
+        return run if unexpired and run is not None and run.id == run_id else None
+
+    def record_active_auto_compile_phase(
+        self,
+        run_id: int,
+        phase: str,
+        *,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> bool:
+        """Record a child phase only while its exact reservation remains active."""
+        now = self._now()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is None:
+                self._connection.execute("COMMIT")
+                return False
+            try:
+                reservation = json.loads(row["value"])
+                unexpired = _datetime(reservation["expires_at"]) > now
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                unexpired = False
+                reservation = {}
+            run = self._auto_compile_run_unlocked(reservation)
+            if not unexpired or run is None or run.id != run_id:
+                self._connection.execute("COMMIT")
+                return False
+            if phase == "staging_started" and run.state == "queued":
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            elif phase == "staging_started" and run.state == "retrying":
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "generation_recovered",
+                    now=now,
+                    summary="Retrying automatic compile",
+                )
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            elif run.state == "running":
+                if run.phase == phase and phase == "staging_started":
+                    self._connection.execute("COMMIT")
+                    return True
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            else:
+                self._connection.execute("COMMIT")
+                return False
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
     def reserve_auto_compile(
         self,
         token: str,
@@ -1471,9 +1639,19 @@ class QueueRepository:
                     "log_name": log_name,
                     "required_marker_prefix": [],
                     "expires_at": _stored_time(expires_dt),
+                    "status_run_id": self._create_auto_compile_run_unlocked(
+                        log_name, fingerprint, now_dt
+                    ),
                 }
                 role = "owner"
             else:
+                reservation["pending_status_run_id"] = (
+                    reservation.get("status_run_id")
+                    if reservation.get("fingerprint") == fingerprint
+                    else self._create_auto_compile_run_unlocked(
+                        log_name, fingerprint, now_dt
+                    )
+                )
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
                 reservation["pending_required_marker_prefix"] = []
@@ -1560,6 +1738,9 @@ class QueueRepository:
             status = reservation.get("status")
             predecessor_token: str | None = None
             if not reservation or status == "failed":
+                status_run_id = self._create_auto_compile_run_unlocked(
+                    log_name, fingerprint, now_dt
+                )
                 reservation = {
                     "token": owner_token,
                     "fingerprint": fingerprint,
@@ -1568,14 +1749,40 @@ class QueueRepository:
                     "watcher_token": watchdog_token,
                     "watcher_expires_at": _stored_time(expires_dt),
                     "required_marker_prefix": list(required_marker_prefix),
+                    "status_run_id": status_run_id,
                 }
                 roles = ("owner", "watchdog")
             else:
+                if reservation.get("fingerprint") == fingerprint:
+                    pending_status_run_id = reservation.get("status_run_id")
+                else:
+                    pending_status_run_id = self._create_auto_compile_run_unlocked(
+                        log_name, fingerprint, now_dt
+                    )
+                prior_pending = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                if (
+                    prior_pending is not None
+                    and prior_pending.id != pending_status_run_id
+                    and prior_pending.state not in {"succeeded", "failed", "dead"}
+                ):
+                    transition_run_unlocked(
+                        self._connection,
+                        prior_pending.id,
+                        "failed",
+                        "failed",
+                        now=now_dt,
+                        summary="Superseded by newer uncompiled content",
+                        completed_at=now_dt,
+                        redaction_env=self._redaction_env,
+                    )
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
                 reservation["pending_required_marker_prefix"] = list(
                     required_marker_prefix
                 )
+                reservation["pending_status_run_id"] = pending_status_run_id
                 try:
                     watcher_live = (
                         _datetime(reservation["watcher_expires_at"]) > now_dt
@@ -1833,6 +2040,9 @@ class QueueRepository:
                 "expires_at": _stored_time(now_dt),
                 "watcher_token": watchdog_token,
                 "watcher_expires_at": _stored_time(watcher_expiry),
+                "status_run_id": self._create_auto_compile_run_unlocked(
+                    log_name, fingerprint, now_dt
+                ),
             }
             self._connection.execute(
                 "INSERT INTO queue_metadata(key, value) VALUES (?, ?)",
@@ -2122,6 +2332,7 @@ class QueueRepository:
             reservation.pop("pending_fingerprint", None)
             reservation.pop("pending_log_name", None)
             reservation.pop("pending_required_marker_prefix", None)
+            reservation.pop("pending_status_run_id", None)
             reservation.pop("contender_token", None)
             reservation.pop("contender_predecessor_token", None)
             reservation.pop("contender_expires_at", None)
@@ -2130,6 +2341,10 @@ class QueueRepository:
             )
             reservation.update(observed)
             fingerprint = reservation["fingerprint"]
+            if changed_generation:
+                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
+                    str(reservation["log_name"]), str(fingerprint), now_dt
+                )
             reservation["token"] = token
             reservation["expires_at"] = _stored_time(owner_expiry)
             reservation["watcher_token"] = successor_token
@@ -2139,6 +2354,13 @@ class QueueRepository:
                 reservation.pop("last_error_class", None)
             reservation.pop("next_retry_at", None)
             reservation.pop("status", None)
+            self._transition_auto_compile_run_unlocked(
+                reservation,
+                "running",
+                "generation_recovered",
+                now=now_dt,
+                summary="Recovered interrupted automatic compile",
+            )
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
                 (
@@ -2297,6 +2519,57 @@ class QueueRepository:
                     reservation["expires_at"] = _stored_time(retry_at)
                     reservation["watcher_expires_at"] = _stored_time(expires_dt)
                     outcome = "retry_wait"
+            if changed:
+                prior_run = self._auto_compile_run_unlocked(reservation)
+                if (
+                    prior_run is not None
+                    and prior_run.state not in {"succeeded", "failed", "dead"}
+                ):
+                    transition_run_unlocked(
+                        self._connection,
+                        prior_run.id,
+                        "failed",
+                        "failed",
+                        now=now_dt,
+                        summary="Generation changed before compile completed",
+                        completed_at=now_dt,
+                        redaction_env=self._redaction_env,
+                    )
+                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
+                    str(reservation["log_name"]), str(observed), now_dt
+                )
+            run = self._auto_compile_run_unlocked(reservation)
+            if run is not None and run.state not in {"succeeded", "failed", "dead"}:
+                if outcome == "retry_wait":
+                    if run.state == "queued":
+                        self._transition_auto_compile_run_unlocked(
+                            reservation,
+                            "running",
+                            "staging_started",
+                            now=now_dt,
+                        )
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "retrying",
+                        "retry_wait",
+                        now=now_dt,
+                        summary=safe_error or "compile_failure",
+                        error=safe_error or "compile_failure",
+                        level="warning",
+                        message=safe_error or "compile_failure",
+                        details={"retry_at": reservation["next_retry_at"]},
+                    )
+                else:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "dead",
+                        "dead",
+                        now=now_dt,
+                        summary=safe_error or "compile_failure",
+                        error=safe_error or "compile_failure",
+                        level="error",
+                        message=safe_error or "compile_failure",
+                    )
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
                 (
@@ -2437,6 +2710,42 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return None
+            changed_generation = observed != fingerprint
+            if changed_generation:
+                if read_status == "covered" and marker_advanced:
+                    finishing = self._auto_compile_run_unlocked(reservation)
+                    if finishing is not None and finishing.state in {
+                        "queued",
+                        "retrying",
+                    }:
+                        self._transition_auto_compile_run_unlocked(
+                            reservation,
+                            "running",
+                            "staging_started",
+                            now=now_dt,
+                        )
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "succeeded",
+                        "succeeded",
+                        now=now_dt,
+                        summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                    )
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                expected_key = self._auto_compile_operation_key(
+                    str(promoted_log_name), str(observed)
+                )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if pending_run is not None
+                    and pending_run.operation_key == expected_key
+                    else self._create_auto_compile_run_unlocked(
+                        str(promoted_log_name), str(observed), now_dt
+                    )
+                )
+                reservation.pop("pending_status_run_id", None)
             reservation["fingerprint"] = observed
             reservation["log_name"] = promoted_log_name
             if promoted_marker_prefix is not None:
@@ -2473,7 +2782,7 @@ class QueueRepository:
         *,
         now: datetime | str | int | float,
     ) -> tuple[
-        str, str | None, str | None, str | None, tuple[str, ...] | None
+        str, str | None, str | None, str | None, tuple[str, ...] | None, int
     ] | None:
         """Return an owned active/pending fingerprint and source-name pair."""
         now_dt = _datetime(now)
@@ -2524,7 +2833,22 @@ class QueueRepository:
             required_markers = tuple(required_marker_prefix)
         else:
             required_markers = None
-        return fingerprint, pending, log_name, pending_log_name, required_markers
+        run = self._auto_compile_run_unlocked(reservation)
+        expected_key = (
+            self._auto_compile_operation_key(log_name, fingerprint)
+            if isinstance(log_name, str)
+            else None
+        )
+        if run is None or run.operation_key != expected_key:
+            return None
+        return (
+            fingerprint,
+            pending,
+            log_name,
+            pending_log_name,
+            required_markers,
+            run.id,
+        )
 
     def promote_pending_auto_compile(
         self,
@@ -2624,6 +2948,32 @@ class QueueRepository:
                 return False
             reservation["fingerprint"] = pending_fingerprint
             reservation.pop("pending_fingerprint", None)
+            active_run = self._auto_compile_run_unlocked(reservation)
+            if (
+                active_run is not None
+                and active_run.state not in {"succeeded", "failed", "dead"}
+            ):
+                transition_run_unlocked(
+                    self._connection,
+                    active_run.id,
+                    "failed",
+                    "failed",
+                    now=now_dt,
+                    summary="Superseded before automatic compile launch",
+                    completed_at=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+            pending_run = self._auto_compile_run_unlocked(reservation, pending=True)
+            reservation["status_run_id"] = (
+                pending_run.id
+                if pending_run is not None
+                else self._create_auto_compile_run_unlocked(
+                    str(reservation.get("pending_log_name", reservation.get("log_name"))),
+                    pending_fingerprint,
+                    now_dt,
+                )
+            )
+            reservation.pop("pending_status_run_id", None)
             pending_log_name = reservation.pop("pending_log_name", None)
             if isinstance(pending_log_name, str):
                 reservation["log_name"] = pending_log_name
@@ -2771,9 +3121,41 @@ class QueueRepository:
                 observed_fingerprint is not None
                 and observed_fingerprint != fingerprint
             )
+            finishing_run = self._auto_compile_run_unlocked(reservation)
+            if finishing_run is not None and finishing_run.state in {
+                "queued",
+                "retrying",
+            }:
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "staging_started",
+                    now=now_dt,
+                )
+            self._transition_auto_compile_run_unlocked(
+                reservation,
+                "succeeded",
+                "succeeded",
+                now=now_dt,
+                summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+            )
             if should_promote:
                 reservation["fingerprint"] = observed_fingerprint
                 reservation["log_name"] = promoted_log_name
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                expected_key = self._auto_compile_operation_key(
+                    str(promoted_log_name), str(observed_fingerprint)
+                )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if pending_run is not None
+                    and pending_run.operation_key == expected_key
+                    else self._create_auto_compile_run_unlocked(
+                        str(promoted_log_name), str(observed_fingerprint), now_dt
+                    )
+                )
                 if promoted_marker_prefix is not None:
                     reservation["required_marker_prefix"] = list(
                         promoted_marker_prefix
@@ -2787,6 +3169,7 @@ class QueueRepository:
                     reservation.pop("pending_fingerprint", None)
                     reservation.pop("pending_log_name", None)
                     reservation.pop("pending_required_marker_prefix", None)
+                    reservation.pop("pending_status_run_id", None)
                 reservation["expires_at"] = _stored_time(expires_dt)
                 self._connection.execute(
                     "UPDATE queue_metadata SET value = ? WHERE key = ?",
@@ -2945,6 +3328,14 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return None
+            run = self._auto_compile_run_unlocked(reservation)
+            if run is not None and run.state in {"queued", "retrying"}:
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "staging_started",
+                    now=now_dt,
+                )
             process = launch()
             self._connection.execute("COMMIT")
             return process
