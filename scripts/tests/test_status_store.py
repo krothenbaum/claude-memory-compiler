@@ -1495,7 +1495,7 @@ def test_snapshot_groups_active_attention_and_seven_day_recent(tmp_path):
         observer_state=observer,
     )
 
-    assert [run.id for run in snapshot.active] == [7, 1, 2]
+    assert [run.id for run in snapshot.active] == [1, 2]
     assert [run.id for run in snapshot.attention] == [3]
     assert [run.id for run in snapshot.recent] == [4, 5]
     assert snapshot.compile.run is not None

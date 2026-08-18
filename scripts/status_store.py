@@ -1020,18 +1020,29 @@ def _read_runs(
     def safe_match(*values: object) -> int:
         return int(any(needle in (normalize_summary(value, os.environ) or "").casefold() for value in values))
     connection.create_function("safe_status_match", -1, safe_match, deterministic=True)
+    def safe_legacy_match(*values: object) -> int:
+        kind, source, session, project, status = values
+        mapping = {
+            "pending": ("queued", "queued", "Queued"),
+            "leased": ("running", "worker_claimed", "Worker claimed"),
+            "failed": ("retrying", "retry_wait", "Waiting to retry"),
+            "succeeded": ("succeeded", "succeeded", "Completed"),
+            "dead": ("dead", "dead", "Attempts exhausted"),
+        }.get(str(status), ("unknown", "unknown", ""))
+        return safe_match(kind, source, session, project, *mapping)
+    connection.create_function("safe_legacy_match", 5, safe_legacy_match, deterministic=True)
     if "status_runs" in tables:
-        status_sql = "SELECT * FROM status_runs"
+        status_sql = "SELECT * FROM status_runs WHERE kind != 'compile'"
         status_parameters: tuple[object, ...] = ()
         if not all_history:
             status_sql += (
-                " WHERE state IN ('queued', 'running', 'retrying', 'failed', 'dead')"
+                " AND (state IN ('queued', 'running', 'retrying', 'failed', 'dead')"
                 " OR (state = 'succeeded'"
-                " AND julianday(updated_at) >= julianday(?))"
+                " AND julianday(updated_at) >= julianday(?)))"
             )
             status_parameters = (cutoff,)
         if needle:
-            status_sql += (" AND " if " WHERE " in status_sql else " WHERE ") + (
+            status_sql += " AND " + (
                 "safe_status_match(kind,source_agent,session_id,project,state,phase,summary)=1"
             )
         status_sql += (
@@ -1044,7 +1055,7 @@ def _read_runs(
         status_parameters = (*status_parameters, *sorted(acknowledged_run_ids))
         if max_runs is not None:
             status_sql += " LIMIT ?"
-            status_parameters = (*status_parameters, max_runs)
+            status_parameters = (*status_parameters, max_runs + 1)
         runs.extend(
             _safe_projection_run(status_run_from_row(row, redaction_env=os.environ))
             for row in connection.execute(status_sql, status_parameters)
@@ -1056,7 +1067,7 @@ def _read_runs(
                 jobs.updated_at, jobs.completed_at
             FROM jobs
             LEFT JOIN status_runs ON status_runs.job_id = jobs.id
-            WHERE status_runs.id IS NULL
+            WHERE status_runs.id IS NULL AND jobs.kind != 'compile'
             """
         legacy_parameters: tuple[object, ...] = ()
         if not all_history:
@@ -1067,7 +1078,7 @@ def _read_runs(
             )
             legacy_parameters = (cutoff,)
         if needle:
-            legacy_sql += " AND safe_status_match(jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,jobs.status,NULL,NULL)=1"
+            legacy_sql += " AND safe_legacy_match(jobs.kind,jobs.source_agent,jobs.session_id,jobs.project,jobs.status)=1"
         legacy_sql += (
             " ORDER BY CASE WHEN jobs.status IN ('failed','dead') THEN 0 "
             "WHEN jobs.status IN ('pending','leased') THEN 1 ELSE 2 END, "
@@ -1075,24 +1086,24 @@ def _read_runs(
         )
         if max_runs is not None:
             legacy_sql += " LIMIT ?"
-            legacy_parameters = (*legacy_parameters, max_runs)
+            legacy_parameters = (*legacy_parameters, max_runs + 1)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     else:
         legacy_sql = """
             SELECT id, kind, source_agent, session_id, project, status,
                 last_error, created_at, updated_at, completed_at
-            FROM jobs
+            FROM jobs WHERE kind != 'compile'
             """
         legacy_parameters = ()
         if not all_history:
             legacy_sql += (
-                " WHERE status IN ('pending', 'leased', 'failed', 'dead')"
+                " AND (status IN ('pending', 'leased', 'failed', 'dead')"
                 " OR (status = 'succeeded'"
-                " AND julianday(updated_at) >= julianday(?))"
+                " AND julianday(updated_at) >= julianday(?)))"
             )
             legacy_parameters = (cutoff,)
         if needle:
-            legacy_sql += (" AND " if " WHERE " in legacy_sql else " WHERE ") + "safe_status_match(kind,source_agent,session_id,project,status,NULL,NULL)=1"
+            legacy_sql += " AND safe_legacy_match(kind,source_agent,session_id,project,status)=1"
         legacy_sql += (
             " ORDER BY CASE WHEN status IN ('failed','dead') THEN 0 "
             "WHEN status IN ('pending','leased') THEN 1 ELSE 2 END, "
@@ -1100,7 +1111,7 @@ def _read_runs(
         )
         if max_runs is not None:
             legacy_sql += " LIMIT ?"
-            legacy_parameters = (*legacy_parameters, max_runs)
+            legacy_parameters = (*legacy_parameters, max_runs + 1)
         legacy_rows = connection.execute(legacy_sql, legacy_parameters)
     runs.extend(_synthetic_run_from_job(row) for row in legacy_rows)
     return tuple(runs)
@@ -1442,19 +1453,20 @@ def read_snapshot(
     has_more = False
     if max_runs is not None:
         has_more = len(active) + len(attention) + len(recent) > max_runs
-        quotas = (max(1, max_runs * 2 // 5), max(1, max_runs * 2 // 5))
-        chosen_attention = list(attention[: quotas[0]])
-        chosen_active = list(active[: quotas[1]])
-        remaining = max_runs - len(chosen_attention) - len(chosen_active)
-        chosen_recent = list(recent[: max(0, remaining)])
-        remaining = max_runs - len(chosen_attention) - len(chosen_active) - len(chosen_recent)
-        for source, target in ((attention, chosen_attention), (active, chosen_active), (recent, chosen_recent)):
+        sources = (attention, active, recent)
+        targets: list[list[StatusRun]] = [[], [], []]
+        nonempty = [index for index, source in enumerate(sources) if source]
+        initial = nonempty if max_runs >= len(nonempty) else nonempty[:max_runs]
+        for index in initial:
+            targets[index].append(sources[index][0])
+        remaining = max_runs - len(initial)
+        for index in (0, 1, 2):
             if remaining <= 0:
                 break
-            extra = source[len(target): len(target) + remaining]
-            target.extend(extra)
+            extra = sources[index][len(targets[index]): len(targets[index]) + remaining]
+            targets[index].extend(extra)
             remaining -= len(extra)
-        attention, active, recent = tuple(chosen_attention), tuple(chosen_active), tuple(chosen_recent)
+        attention, active, recent = map(tuple, targets)
     return StatusSnapshot(
         active=active,
         attention=attention,
