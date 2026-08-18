@@ -421,6 +421,7 @@ class CompileReadinessProbes:
     session_count: Callable[[], int]
     daily_state: Callable[[], str]
     reservation_state: Callable[[], str | None]
+    reservation_attempt: Callable[[], int | None] = lambda: None
 
 
 @dataclass(frozen=True)
@@ -930,7 +931,7 @@ def _synthetic_run_from_job(row: sqlite3.Row) -> StatusRun:
         state=state,
         phase=phase,
         summary=summary_by_state[state],
-        error=row["last_error"],
+        error=normalize_status_reason(row["last_error"], os.environ),
         started_at=started_at,
         updated_at=updated_at,
         completed_at=_loaded_time(row["completed_at"]),
@@ -983,6 +984,8 @@ def _safe_projection_run(run: StatusRun) -> StatusRun:
             run.project,
             max_chars=MAX_OPERATION_IDENTITY_CHARS,
         ),
+        summary=normalize_summary(run.summary, os.environ),
+        error=normalize_status_reason(run.error, os.environ),
         redaction_env=os.environ,
     )
 
@@ -1268,6 +1271,25 @@ def project_compile_status(
         return replace(status, run=compile_run) if compile_run is not None else status
 
     reservation = probes.reservation_state()
+    if (
+        reservation == "failed"
+        and compile_run is not None
+        and compile_run.state in {"failed", "dead"}
+    ):
+        summary = (
+            compile_run.error
+            or compile_run.summary
+            or "Automatic compile attempts exhausted"
+        )
+        attempt = probes.reservation_attempt()
+        if attempt is not None and attempt > 0:
+            summary = f"{summary} · attempt {attempt}"
+        return CompileStatus(
+            state="failed",
+            summary=summary,
+            run=compile_run,
+            ready=False,
+        )
     if reservation is not None:
         reservation_state = {
             "failed": "failed",
@@ -1347,11 +1369,12 @@ def _read_compile_database_state(
     connection: sqlite3.Connection,
     tables: frozenset[str],
     now: datetime,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, int | None]:
     queue_active_count = connection.execute(
         "SELECT count(*) FROM jobs WHERE status IN ('pending', 'leased', 'failed')"
     ).fetchone()[0]
     reservation_state: str | None = None
+    reservation_attempt: int | None = None
     if "queue_metadata" in tables:
         row = connection.execute(
             "SELECT value FROM queue_metadata WHERE key = 'auto_compile_reservation'"
@@ -1384,7 +1407,14 @@ def _read_compile_database_state(
                     reservation_state = (
                         raw_state if isinstance(raw_state, str) else "reserved"
                     )
-    return int(queue_active_count), reservation_state
+                    raw_attempt = reservation.get("attempt_count")
+                    if (
+                        not isinstance(raw_attempt, bool)
+                        and isinstance(raw_attempt, int)
+                        and raw_attempt > 0
+                    ):
+                        reservation_attempt = raw_attempt
+    return int(queue_active_count), reservation_state, reservation_attempt
 
 
 def _default_session_count() -> int:
@@ -1465,9 +1495,11 @@ def read_snapshot(
             acknowledged_run_ids=observer_state.acknowledged_run_ids,
         )
         latest_compile_run = _read_latest_compile_run(connection, tables)
-        queue_active_count, reservation_state = _read_compile_database_state(
-            connection, tables, now
-        )
+        (
+            queue_active_count,
+            reservation_state,
+            reservation_attempt,
+        ) = _read_compile_database_state(connection, tables, now)
     except StatusReadError:
         raise
     except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as error:
@@ -1538,6 +1570,7 @@ def read_snapshot(
                     else (lambda: _default_daily_state(resolved, now))
                 ),
                 reservation_state=lambda: reservation_state,
+                reservation_attempt=lambda: reservation_attempt,
             )
         ),
     )

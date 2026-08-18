@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from functools import wraps
 
 import pytest
+from rich.text import Text
+from textual.content import Content
 
 from scripts.status_app import StatusDashboard, run_dashboard
 from scripts.status_store import (
@@ -170,6 +172,63 @@ async def test_selection_persists_by_run_id_across_regrouping(tmp_path):
 
 
 @async_test
+@pytest.mark.parametrize(
+    ("active", "attention", "recent", "expected"),
+    [
+        (
+            (run(10, "queued", "queued"), run(11, "running", "provider_started")),
+            (run(12, "dead", "dead", error="failed"),),
+            (run(13, "succeeded", "succeeded"),),
+            11,
+        ),
+        (
+            (run(10, "queued", "queued"), run(14, "retrying", "retry_wait")),
+            (run(12, "dead", "dead", error="failed"),),
+            (run(13, "succeeded", "succeeded"),),
+            12,
+        ),
+        (
+            (run(10, "queued", "queued"), run(14, "retrying", "retry_wait")),
+            (),
+            (run(13, "succeeded", "succeeded"),),
+            13,
+        ),
+        (
+            (run(10, "queued", "queued"), run(14, "retrying", "retry_wait")),
+            (),
+            (),
+            10,
+        ),
+    ],
+)
+async def test_initial_selection_uses_explicit_triage_priority(
+    tmp_path, active, attention, recent, expected
+):
+    value = StatusSnapshot(
+        active=active,
+        attention=attention,
+        recent=recent,
+        compile=CompileStatus("before_window", "Not ready"),
+        health_alerts=(),
+    )
+    runs = (*active, *attention, *recent)
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: value,
+        details_reader=lambda _path, run_id: RunDetails(
+            next(item for item in runs if item.id == run_id), (), (), True
+        ),
+        observer_loader=lambda _path: ObserverState.empty(),
+        clock=lambda: NOW,
+    )
+
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.selected_run_id == expected
+
+
+@async_test
 async def test_keyboard_selection_filter_and_acknowledgment(tmp_path):
     queries = []
     acknowledged = []
@@ -250,16 +309,85 @@ async def test_live_resize_changes_visible_column_contract(tmp_path):
     async with dashboard.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         wide = str(dashboard.query_one("#run-positive-1").render())
-        assert "session-1" in wide and "provider" in wide and "elapsed" in wide
+        assert "session-1" in wide
+        assert "provider=" not in wide and "elapsed=" not in wide
         await pilot.resize_terminal(80, 40)
         await pilot.pause()
         stacked = str(dashboard.query_one("#run-positive-1").render())
-        assert "session-1" not in stacked and "provider" in stacked
+        assert "session-1" not in stacked
+        assert "provider=" not in stacked and "elapsed=" not in stacked
         await pilot.resize_terminal(60, 30)
         await pilot.pause()
         compact = str(dashboard.query_one("#run-positive-1").render())
         assert "provider=" not in compact and "elapsed=" not in compact
         assert "memory" in compact and "running" in compact
+
+
+@async_test
+async def test_rows_style_only_icon_and_state_and_render_no_terminal_controls(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    unsafe = "saved\x1b[31mred\x1b[0m\x1b]0;title\x07\rline\bback\x85c1"
+    active = run(20, "running", "provider_started")
+    active = replace(active, summary=unsafe)
+    value = StatusSnapshot(
+        active=(active,),
+        attention=(),
+        recent=(),
+        compile=CompileStatus("before_window", "Not ready"),
+        health_alerts=(),
+    )
+    details = RunDetails(
+        active,
+        (
+            StatusEvent(
+                id=20,
+                run_id=20,
+                phase="provider_started",
+                level="info",
+                provider="codex",
+                attempt=1,
+                message=unsafe,
+                details={},
+                created_at=NOW,
+            ),
+        ),
+        (),
+        True,
+    )
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: value,
+        details_reader=lambda *_args: details,
+        observer_loader=lambda _path: ObserverState.empty(),
+        clock=lambda: NOW,
+    )
+
+    async with dashboard.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        rendered = dashboard.query_one("#run-positive-20").render()
+        assert isinstance(rendered, Content)
+        rich_row = dashboard._row_text(active, "●")
+        assert isinstance(rich_row, Text)
+        styled = "".join(
+            rich_row.plain[span.start : span.end] for span in rich_row.spans
+        )
+        assert any(icon in styled for icon in ("●", "◉"))
+        assert "running" in styled
+        assert "memory" not in styled
+        assert "result=" not in styled
+        rendered_details = dashboard.query_one("#details").render()
+        assert isinstance(rendered_details, Content)
+        captured = rendered.plain + rendered_details.plain
+        assert "provider=—" not in captured and "elapsed=—" not in captured
+        assert "\x1b" not in captured
+        assert all(
+            character == "\n"
+            or not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+            for character in captured
+        )
 
 
 @async_test

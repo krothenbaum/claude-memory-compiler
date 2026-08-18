@@ -782,6 +782,22 @@ def test_summaries_are_bounded_and_normalized_without_fabricating_text():
     assert normalize_summary(None, {}) is None
 
 
+def test_status_values_strip_terminal_controls_before_storage_and_readback():
+    unsafe = "before\x1b[31mred\x1b[0m\x1b]0;title\x07after\rline\bback\x85c1"
+
+    run = _status_run(summary=unsafe, error=unsafe)
+    event = _status_event(message=unsafe)
+
+    assert run.summary == "beforeredafter line back c1"
+    assert run.error == "beforeredafter line back c1"
+    assert event.message == "beforeredafter line back c1"
+    assert all(
+        not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+        for value in (run.summary, run.error, event.message)
+        for character in value
+    )
+
+
 def _status_run(**overrides):
     values = {
         "id": 1,
@@ -1794,6 +1810,31 @@ def test_version_2_queue_is_synthesized_without_migration_or_writes(tmp_path):
         connection.close()
 
 
+def test_legacy_projection_sanitizes_terminal_controls_defensively(tmp_path):
+    path = tmp_path / "legacy-controls.sqlite3"
+    _create_version_2_queue(path)
+    unsafe = "failed\x1b[31mred\x1b[0m\x1b]8;;https://unsafe\x07link\x1b]8;;\x07\rback\bspace\x85c1"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE jobs SET status = 'dead', last_error = ?, completed_at = ? WHERE id = 41",
+            (unsafe, READ_NOW.isoformat()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+    )
+
+    legacy = snapshot.attention[0]
+    assert legacy.error == "failedredlink back space c1"
+    assert "\x1b" not in legacy.error
+
+
 def test_legacy_projection_replaces_unsafe_identity_and_excludes_it_from_search(
     tmp_path, monkeypatch
 ):
@@ -2678,6 +2719,69 @@ def test_compile_status_prefers_an_active_authoritative_compile_run():
     assert status.state == "running"
     assert status.summary == "Validating staged changes"
     assert status.run == running
+
+
+@pytest.mark.parametrize(
+    ("error", "attempt"),
+    [("validation_failed", 3), ("provider_failed", 1)],
+)
+def test_exhausted_compile_status_surfaces_terminal_error_and_attempt(error, attempt):
+    failed = _status_run(
+        id=94,
+        job_id=None,
+        operation_key="auto-compile:2026-08-18:hash",
+        kind="compile",
+        source_agent="system",
+        session_id="2026-08-18",
+        project="memory",
+        state="dead",
+        phase="dead",
+        summary=error,
+        error=error,
+        completed_at=NOW,
+    )
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: pytest.fail("failed reservation should avoid readiness"),
+        session_count=lambda: pytest.fail("failed reservation should avoid readiness"),
+        daily_state=lambda: pytest.fail("failed reservation should avoid readiness"),
+        reservation_state=lambda: "failed",
+        reservation_attempt=lambda: attempt,
+    )
+
+    status = status_store_module.project_compile_status(
+        compile_run=failed,
+        queue_active_count=0,
+        probes=probes,
+    )
+
+    assert status.state == "failed"
+    assert status.summary == f"{error} · attempt {attempt}"
+    assert status.run == failed
+    assert status.ready is False
+
+
+def test_compile_database_projection_reads_failed_attempt_count(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        repository._connection.execute(
+            """
+            INSERT OR REPLACE INTO queue_metadata(key, value)
+            VALUES (
+                'auto_compile_reservation',
+                '{"status":"failed","attempt_count":3}'
+            )
+            """
+        )
+        repository._connection.commit()
+        tables = status_store_module._database_tables(repository._connection)
+
+        queue_count, state, attempt = status_store_module._read_compile_database_state(
+            repository._connection, tables, NOW
+        )
+
+    assert queue_count == 0
+    assert state == "failed"
+    assert attempt == 3
 
 
 @pytest.mark.parametrize("terminal_state", ["succeeded", "failed"])

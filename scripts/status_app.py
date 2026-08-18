@@ -98,11 +98,6 @@ class StatusDashboard(App[None]):
     .section-label { color: $text-muted; text-style: bold; margin-top: 1; }
     .run-row { height: 1; padding: 0 1; }
     .run-row.selected { text-style: bold reverse; }
-    .state-running { color: cyan; }
-    .state-succeeded { color: green; }
-    .state-retrying { color: yellow; }
-    .state-failed, .state-dead { color: red; }
-    .state-queued { color: $text-muted; }
     #compile-panel { height: 3; border: round $panel; padding: 0 1; }
     #compile-panel.selected { border: round ansi_bright_cyan; text-style: bold reverse; }
     #status-footer { height: 1; }
@@ -240,7 +235,21 @@ class StatusDashboard(App[None]):
             self.selected_run_id = self.preferred_run_id
             return
         if self.selected_run_id not in visible:
-            self.selected_run_id = runs[0].id if runs else None
+            assert self.snapshot is not None
+            candidates = (
+                tuple(
+                    run for run in self.snapshot.active if run.state == "running"
+                )
+                or self.snapshot.attention
+                or self.snapshot.recent
+                or tuple(
+                    run
+                    for run in self.snapshot.active
+                    if run.state in {"queued", "retrying"}
+                )
+                or runs
+            )
+            self.selected_run_id = candidates[0].id if candidates else None
         if self.preferred_run_id is None:
             self.preferred_run_id = self.selected_run_id
 
@@ -357,7 +366,7 @@ class StatusDashboard(App[None]):
                     "dead": "✗",
                 }[run.state]
                 row = Static(
-                    Text(self._row_text(run, icon)),
+                    self._row_text(run, icon),
                     id=self._row_id(run.id),
                     classes=f"run-row state-{run.state}",
                 )
@@ -388,19 +397,24 @@ class StatusDashboard(App[None]):
         )
         await self._render_details()
 
-    def _row_text(self, run: StatusRun, icon: str) -> str:
+    def _row_text(self, run: StatusRun, icon: str) -> Text:
+        semantic_style = None if self.no_color else {
+            "queued": "dim",
+            "running": "cyan",
+            "retrying": "yellow",
+            "succeeded": "green",
+            "failed": "red",
+            "dead": "red",
+        }[run.state]
         result = run.summary or run.error or "—"
+        row = Text()
+        row.append(icon, style=semantic_style)
+        row.append(f" {run.project} ")
+        row.append(run.state, style=semantic_style)
+        row.append(f" {run.phase} result={result}")
         if self.has_class("wide"):
-            return (
-                f"{icon} {run.project} {run.state} {run.phase} result={result} "
-                f"session={run.session_id} provider=— elapsed=—"
-            )
-        if self.has_class("stacked"):
-            return (
-                f"{icon} {run.project} {run.state} {run.phase} result={result} "
-                "provider=— elapsed=—"
-            )
-        return f"{icon} {run.project} {run.state} {run.phase} result={result}"
+            row.append(f" session={run.session_id}")
+        return row
 
     async def _render_details(self) -> None:
         target = self.query_one("#details", Static)
