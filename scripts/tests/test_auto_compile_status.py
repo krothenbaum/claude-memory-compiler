@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import compile as compile_module
 import flush as flush_module
+import pytest
 
 from scripts.queue import QueueRepository
 
@@ -328,6 +329,124 @@ def test_changed_content_failure_creates_fresh_reserved_generation(tmp_path):
         assert [event.phase for event in repository.status_events(second.id)] == [
             "reserved"
         ]
+
+
+def test_takeover_replaces_active_and_pending_with_one_recovered_generation(tmp_path):
+    third = "c" * 64
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        schedule(repository, SECOND)
+        before = reservation(repository)
+        active_id = before["status_run_id"]
+        pending_id = before["pending_status_run_id"]
+
+        status, claimed = repository.poll_auto_compile_watcher(
+            WATCHDOG,
+            SUCCESSOR,
+            lambda _reservation: (
+                "uncompiled",
+                {
+                    "fingerprint": third,
+                    "log_name": LOG_NAME,
+                    "required_marker_prefix": ["prior"],
+                },
+            ),
+            lambda _token: None,
+            predecessor_token=None,
+            now=NOW + timedelta(seconds=31),
+            watcher_expires_at=NOW + timedelta(seconds=60),
+            owner_expires_at=NOW + timedelta(seconds=60),
+        )
+
+        assert (status, claimed) == ("claimed", third)
+        current = reservation(repository)
+        replacement = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{third}"
+        )
+        assert replacement is not None
+        assert current["status_run_id"] == replacement.id
+        assert replacement.state == "running"
+        assert replacement.phase == "generation_recovered"
+        assert repository._connection.execute(
+            "SELECT state FROM status_runs WHERE id = ?", (active_id,)
+        ).fetchone()[0] == "failed"
+        assert repository._connection.execute(
+            "SELECT state FROM status_runs WHERE id = ?", (pending_id,)
+        ).fetchone()[0] == "failed"
+
+
+@pytest.mark.parametrize("terminal_state", ["failed", "dead"])
+def test_reschedule_same_fingerprint_never_relinks_terminal_run(
+    tmp_path, terminal_state
+):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        first = reservation(repository)
+        first_id = first["status_run_id"]
+        repository.transition_operation_run(first_id, terminal_state, terminal_state)
+        repository.release_auto_compile(OWNER, FIRST)
+
+        assert repository.schedule_auto_compile(
+            "4" * 64,
+            "5" * 64,
+            FIRST,
+            log_name=LOG_NAME,
+            required_marker_prefix=("prior",),
+            now=NOW + timedelta(seconds=1),
+            expires_at=NOW + timedelta(seconds=31),
+        ) == ("owner", "watchdog")
+
+        current = reservation(repository)
+        assert current["status_run_id"] != first_id
+        rerun = repository._connection.execute(
+            "SELECT operation_key, state, phase FROM status_runs WHERE id = ?",
+            (current["status_run_id"],),
+        ).fetchone()
+        assert rerun[0].startswith(f"auto-compile:{LOG_NAME}:{FIRST}:")
+        assert tuple(rerun[1:]) == ("queued", "reserved")
+
+
+def test_legacy_reservation_is_backfilled_with_matching_nonterminal_run(tmp_path):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        assert repository.reserve_auto_compile(
+            OWNER,
+            FIRST,
+            log_name=LOG_NAME,
+            now=NOW,
+            expires_at=NOW + timedelta(seconds=30),
+        )
+
+        owned = repository.auto_compile_reservation(OWNER, now=NOW)
+        assert owned is not None
+        run = repository.status_run_for_operation(
+            f"auto-compile:{LOG_NAME}:{FIRST}"
+        )
+        assert run is not None
+        assert owned[5] == run.id
+        assert run.state == "queued"
+
+
+@pytest.mark.parametrize("removal", ["rollback", "release"])
+def test_reservation_removal_terminalizes_all_linked_runs(tmp_path, removal):
+    with QueueRepository(tmp_path / "jobs.sqlite3", sync_usage=False) as repository:
+        schedule(repository)
+        if removal == "release":
+            schedule(repository, SECOND)
+        linked = reservation(repository)
+        if removal == "rollback":
+            assert repository.rollback_auto_compile_schedule(
+                OWNER, WATCHDOG, now=NOW + timedelta(seconds=1)
+            )
+        else:
+            assert repository.release_auto_compile(OWNER, FIRST)
+
+        run_ids = {linked["status_run_id"]}
+        if "pending_status_run_id" in linked:
+            run_ids.add(linked["pending_status_run_id"])
+        for run_id in run_ids:
+            assert repository._connection.execute(
+                "SELECT state FROM status_runs WHERE id = ?", (run_id,)
+            ).fetchone()[0] == "failed"
 
 
 def test_manual_compile_has_no_automatic_status_run(monkeypatch):

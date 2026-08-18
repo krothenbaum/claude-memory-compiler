@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 import sysconfig
@@ -1360,13 +1361,25 @@ class QueueRepository:
         log_name: str,
         fingerprint: str,
         now: datetime,
+        execution_token: str | None = None,
     ) -> int:
-        operation_key = self._auto_compile_operation_key(log_name, fingerprint)
+        base_key = self._auto_compile_operation_key(log_name, fingerprint)
+        operation_key = base_key
         row = self._connection.execute(
-            "SELECT id FROM status_runs WHERE operation_key = ?", (operation_key,)
+            "SELECT * FROM status_runs WHERE operation_key = ?", (operation_key,)
         ).fetchone()
         if row is not None:
-            return row["id"]
+            existing = status_run_from_row(row, redaction_env=self._redaction_env)
+            if existing.state not in {"succeeded", "failed", "dead"}:
+                return existing.id
+            suffix = (execution_token or secrets.token_hex(8))[:16]
+            operation_key = f"{base_key}:{suffix}"
+            counter = 1
+            while self._connection.execute(
+                "SELECT 1 FROM status_runs WHERE operation_key = ?", (operation_key,)
+            ).fetchone() is not None:
+                operation_key = f"{base_key}:{suffix}-{counter}"
+                counter += 1
         project = self.memory_home.name
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", project):
             project = "global"
@@ -1389,6 +1402,85 @@ class QueueRepository:
             redaction_env=self._redaction_env,
         )
         return run_id
+
+    def _ensure_auto_compile_links_unlocked(
+        self, reservation: dict[str, object], now: datetime
+    ) -> bool:
+        changed = False
+        fingerprint = reservation.get("fingerprint")
+        log_name = reservation.get("log_name")
+        if isinstance(fingerprint, str) and isinstance(log_name, str):
+            run = self._auto_compile_run_unlocked(reservation)
+            if run is None or run.state in {"succeeded", "failed", "dead"}:
+                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
+                    log_name,
+                    fingerprint,
+                    now,
+                    execution_token=str(reservation.get("token", "legacy")),
+                )
+                changed = True
+        pending = reservation.get("pending_fingerprint")
+        pending_log = reservation.get("pending_log_name")
+        if isinstance(pending, str) and isinstance(pending_log, str):
+            run = self._auto_compile_run_unlocked(reservation, pending=True)
+            if run is None or run.state in {"succeeded", "failed", "dead"}:
+                reservation["pending_status_run_id"] = (
+                    self._create_auto_compile_run_unlocked(
+                        pending_log,
+                        pending,
+                        now,
+                        execution_token=str(
+                            reservation.get("watcher_token", "legacy-pending")
+                        ),
+                    )
+                )
+                changed = True
+        return changed
+
+    def _delete_auto_compile_reservation_unlocked(
+        self,
+        reservation: Mapping[str, object],
+        *,
+        now: datetime,
+        active_succeeded: bool,
+        reason: str,
+    ) -> None:
+        active = self._auto_compile_run_unlocked(reservation)
+        pending = self._auto_compile_run_unlocked(reservation, pending=True)
+        for run, succeeded in ((active, active_succeeded), (pending, False)):
+            if run is None or run.state in {"succeeded", "failed", "dead"}:
+                continue
+            if succeeded:
+                if run.state in {"queued", "retrying"}:
+                    self._transition_auto_compile_run_unlocked(
+                        {"status_run_id": run.id},
+                        "running",
+                        "generation_recovered",
+                        now=now,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    {"status_run_id": run.id},
+                    "succeeded",
+                    "succeeded",
+                    now=now,
+                    summary=reason,
+                )
+            else:
+                transition_run_unlocked(
+                    self._connection,
+                    run.id,
+                    "failed",
+                    "failed",
+                    now=now,
+                    summary=reason,
+                    completed_at=now,
+                    redaction_env=self._redaction_env,
+                )
+        self._connection.execute(
+            "DELETE FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        )
 
     def _auto_compile_run_unlocked(
         self, reservation: Mapping[str, object], *, pending: bool = False
@@ -1640,7 +1732,7 @@ class QueueRepository:
                     "required_marker_prefix": [],
                     "expires_at": _stored_time(expires_dt),
                     "status_run_id": self._create_auto_compile_run_unlocked(
-                        log_name, fingerprint, now_dt
+                        log_name, fingerprint, now_dt, execution_token=token
                     ),
                 }
                 role = "owner"
@@ -1649,7 +1741,7 @@ class QueueRepository:
                     reservation.get("status_run_id")
                     if reservation.get("fingerprint") == fingerprint
                     else self._create_auto_compile_run_unlocked(
-                        log_name, fingerprint, now_dt
+                        log_name, fingerprint, now_dt, execution_token=token
                     )
                 )
                 reservation["pending_fingerprint"] = fingerprint
@@ -1735,11 +1827,16 @@ class QueueRepository:
                     reservation = json.loads(row["value"])
                 except (TypeError, json.JSONDecodeError):
                     reservation = {}
+            if reservation:
+                self._ensure_auto_compile_links_unlocked(reservation, now_dt)
             status = reservation.get("status")
             predecessor_token: str | None = None
             if not reservation or status == "failed":
                 status_run_id = self._create_auto_compile_run_unlocked(
-                    log_name, fingerprint, now_dt
+                    log_name,
+                    fingerprint,
+                    now_dt,
+                    execution_token=owner_token,
                 )
                 reservation = {
                     "token": owner_token,
@@ -1757,7 +1854,10 @@ class QueueRepository:
                     pending_status_run_id = reservation.get("status_run_id")
                 else:
                     pending_status_run_id = self._create_auto_compile_run_unlocked(
-                        log_name, fingerprint, now_dt
+                        log_name,
+                        fingerprint,
+                        now_dt,
+                        execution_token=watchdog_token,
                     )
                 prior_pending = self._auto_compile_run_unlocked(
                     reservation, pending=True
@@ -1878,9 +1978,11 @@ class QueueRepository:
                     ),
                 )
             elif matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Automatic compile scheduling rolled back",
                 )
             self._connection.execute("COMMIT")
             return matched
@@ -2130,9 +2232,11 @@ class QueueRepository:
                     ),
                 )
             elif matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Automatic compile owner failed to start",
                 )
             self._connection.execute("COMMIT")
             return matched
@@ -2321,9 +2425,11 @@ class QueueRepository:
                     now=now_dt,
                     summary=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=True,
+                    reason=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
                 self._connection.execute("COMMIT")
                 return "done", None
@@ -2348,6 +2454,51 @@ class QueueRepository:
                 )
             ):
                 raise ValueError("invalid watcher generation observation")
+            changed_generation = (
+                observed.get("fingerprint") != reservation.get("fingerprint")
+            )
+            if changed_generation:
+                active_run = self._auto_compile_run_unlocked(reservation)
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                observed_key = self._auto_compile_operation_key(
+                    observed_log_name, observed_fingerprint
+                )
+                reused_pending = (
+                    pending_run is not None
+                    and pending_run.operation_key == observed_key
+                    and pending_run.state not in {"succeeded", "failed", "dead"}
+                )
+                for discarded in (
+                    active_run,
+                    None if reused_pending else pending_run,
+                ):
+                    if discarded is not None and discarded.state not in {
+                        "succeeded",
+                        "failed",
+                        "dead",
+                    }:
+                        transition_run_unlocked(
+                            self._connection,
+                            discarded.id,
+                            "failed",
+                            "failed",
+                            now=now_dt,
+                            summary="Superseded during automatic compile takeover",
+                            completed_at=now_dt,
+                            redaction_env=self._redaction_env,
+                        )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if reused_pending and pending_run is not None
+                    else self._create_auto_compile_run_unlocked(
+                        observed_log_name,
+                        observed_fingerprint,
+                        now_dt,
+                        execution_token=token,
+                    )
+                )
             reservation.pop("pending_fingerprint", None)
             reservation.pop("pending_log_name", None)
             reservation.pop("pending_required_marker_prefix", None)
@@ -2355,15 +2506,8 @@ class QueueRepository:
             reservation.pop("contender_token", None)
             reservation.pop("contender_predecessor_token", None)
             reservation.pop("contender_expires_at", None)
-            changed_generation = (
-                observed.get("fingerprint") != reservation.get("fingerprint")
-            )
             reservation.update(observed)
             fingerprint = reservation["fingerprint"]
-            if changed_generation:
-                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
-                    str(reservation["log_name"]), str(fingerprint), now_dt
-                )
             reservation["token"] = token
             reservation["expires_at"] = _stored_time(owner_expiry)
             reservation["watcher_token"] = successor_token
@@ -2746,16 +2890,19 @@ class QueueRepository:
                     now=now_dt,
                     summary=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=True,
+                    reason=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
                 self._connection.execute("COMMIT")
                 return None
             changed_generation = observed != fingerprint
             if changed_generation:
+                active_run = self._auto_compile_run_unlocked(reservation)
                 if read_status == "covered" and marker_advanced:
-                    finishing = self._auto_compile_run_unlocked(reservation)
+                    finishing = active_run
                     if finishing is not None and finishing.state in {
                         "queued",
                         "retrying",
@@ -2779,12 +2926,40 @@ class QueueRepository:
                 expected_key = self._auto_compile_operation_key(
                     str(promoted_log_name), str(observed)
                 )
+                reused_pending = (
+                    pending_run is not None
+                    and pending_run.operation_key == expected_key
+                    and pending_run.state not in {"succeeded", "failed", "dead"}
+                )
+                for discarded in (
+                    active_run
+                    if not (read_status == "covered" and marker_advanced)
+                    else None,
+                    None if reused_pending else pending_run,
+                ):
+                    if discarded is not None and discarded.state not in {
+                        "succeeded",
+                        "failed",
+                        "dead",
+                    }:
+                        transition_run_unlocked(
+                            self._connection,
+                            discarded.id,
+                            "failed",
+                            "failed",
+                            now=now_dt,
+                            summary="Superseded during deferred automatic compile",
+                            completed_at=now_dt,
+                            redaction_env=self._redaction_env,
+                        )
                 reservation["status_run_id"] = (
                     pending_run.id
-                    if pending_run is not None
-                    and pending_run.operation_key == expected_key
+                    if reused_pending and pending_run is not None
                     else self._create_auto_compile_run_unlocked(
-                        str(promoted_log_name), str(observed), now_dt
+                        str(promoted_log_name),
+                        str(observed),
+                        now_dt,
+                        execution_token=str(reservation.get("token", "deferred")),
                     )
                 )
                 reservation.pop("pending_status_run_id", None)
@@ -2828,17 +3003,36 @@ class QueueRepository:
     ] | None:
         """Return an owned active/pending fingerprint and source-name pair."""
         now_dt = _datetime(now)
-        row = self._connection.execute(
-            "SELECT value FROM queue_metadata WHERE key = ?",
-            (AUTO_COMPILE_RESERVATION_KEY,),
-        ).fetchone()
-        if row is None:
-            return None
+        self._connection.execute("BEGIN IMMEDIATE")
         try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is None:
+                self._connection.execute("COMMIT")
+                return None
             reservation = json.loads(row["value"])
+            if self._ensure_auto_compile_links_unlocked(reservation, now_dt):
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
             unexpired = _datetime(reservation["expires_at"]) > now_dt
+            self._connection.execute("COMMIT")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
             return None
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
         fingerprint = reservation.get("fingerprint")
         pending = reservation.get("pending_fingerprint")
         if (
@@ -2881,7 +3075,14 @@ class QueueRepository:
             if isinstance(log_name, str)
             else None
         )
-        if run is None or run.operation_key != expected_key:
+        if run is None or not (
+            run.operation_key == expected_key
+            or (
+                expected_key is not None
+                and run.operation_key is not None
+                and run.operation_key.startswith(f"{expected_key}:")
+            )
+        ):
             return None
         return (
             fingerprint,
@@ -3224,9 +3425,11 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return observed_fingerprint
-            self._connection.execute(
-                "DELETE FROM queue_metadata WHERE key = ?",
-                (AUTO_COMPILE_RESERVATION_KEY,),
+            self._delete_auto_compile_reservation_unlocked(
+                reservation,
+                now=now_dt,
+                active_succeeded=True,
+                reason=f"Compiled {reservation.get('log_name', 'daily log')}",
             )
             self._connection.execute("COMMIT")
             return None
@@ -3254,9 +3457,11 @@ class QueueRepository:
                     and reservation.get("fingerprint") == fingerprint
                 )
             if matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=self._now(),
+                    active_succeeded=False,
+                    reason="Automatic compile reservation released",
                 )
             self._connection.execute("COMMIT")
             return matched

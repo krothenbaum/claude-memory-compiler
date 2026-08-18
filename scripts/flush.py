@@ -1501,11 +1501,9 @@ def main():
             project_key,
             cwd,
         )
-        result_summary = "FLUSH_OK (nothing worth saving)"
     elif "FLUSH_ERROR" in response:
         logging.error("Result: %s", response)
         append_to_daily_log(response, "Memory Flush", project_key, cwd)
-        result_summary = "FLUSH_ERROR (see flush.log)"
         # Keep the context file so the flush can be retried by hand:
         #   uv run python scripts/flush.py <context_file> <session_id> [project] [cwd]
         # No dedup-state update here: the dedup path deletes the context
@@ -1515,7 +1513,6 @@ def main():
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session", project_key, cwd)
-        result_summary = f"saved {len(response)} chars to daily log"
 
     # Update dedup state
     save_flush_state({"session_id": session_id, "timestamp": time.time()})
