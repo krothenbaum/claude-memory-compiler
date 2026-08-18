@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import cast
 
 import pytest
+from rich.cells import cell_len
 from status_store import (
     CompileStatus,
     ObserverState,
@@ -18,6 +22,7 @@ from status_store import (
 from scripts.queue import QueueRepository
 
 NOW = datetime(2026, 8, 18, 19, 0, tzinfo=UTC)
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class TTYBuffer(StringIO):
@@ -392,3 +397,181 @@ def test_default_mode_lazy_loads_interactive_dashboard(monkeypatch):
 
     assert status_cli.main(["--no-color"]) == 7
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("safe\x1b[31mred\x1b[0mtext", "saferedtext"),
+        ("safe\x1b]8;;https://unsafe.example\x07click\x1b]8;;\x07", "safeclick"),
+        ("left\rright", "left right"),
+        ("left\bright", "left right"),
+        ("left\x85right", "left right"),
+        ("left\nright", "left right"),
+    ],
+)
+def test_safe_terminal_text_strips_escape_and_control_sequences(value, expected):
+    import status as status_cli
+
+    assert status_cli._safe_terminal_text(value) == expected
+
+
+def test_every_dynamic_snapshot_field_is_terminal_safe(tmp_path, monkeypatch):
+    malicious = SimpleNamespace(
+        id=1,
+        job_id=1,
+        operation_key=None,
+        kind="cap\x1b[31mture",
+        source_agent="claude\x9b31m",
+        session_id="session",
+        project="project\rforged\nline\bback\x85c1",
+        state="running",
+        phase="codex_started\x1b]0;owned\x07",
+        summary="working\x1b[2Jstill",
+        error=None,
+        started_at=NOW,
+        updated_at=NOW,
+        completed_at=None,
+    )
+    snapshot = StatusSnapshot(
+        active=(cast(StatusRun, malicious),),
+        attention=(),
+        recent=(),
+        compile=CompileStatus(
+            state="ready\x1b[31m",
+            summary="compile\nforged\x1b]8;;unsafe\x07text\x1b]8;;\x07",
+        ),
+        health_alerts=(),
+    )
+    status_cli = _install_snapshot(monkeypatch, snapshot)
+    output = StringIO()
+
+    assert (
+        status_cli.main(
+            ["--snapshot"],
+            env={"AI_MEMORY_HOME": str(tmp_path)},
+            now=NOW,
+            output=output,
+        )
+        == 0
+    )
+
+    rendered = output.getvalue()
+    assert len(rendered.splitlines()) == 13
+    assert "owned" not in rendered
+    assert "unsafe" not in rendered
+    assert "project forged line back c1" in rendered
+    assert all(
+        character == "\n" or not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+        for character in rendered
+    )
+
+
+def test_diagnostic_text_is_terminal_safe(monkeypatch):
+    import status as status_cli
+
+    monkeypatch.setattr(
+        status_cli,
+        "load_config",
+        lambda _env: (_ for _ in ()).throw(
+            ValueError("bad\rpath\nforged\x1b[31mred\x1b]0;owned\x07")
+        ),
+    )
+    output = StringIO()
+
+    assert status_cli.main(["--snapshot"], env={}, now=NOW, output=output) == 2
+    assert output.getvalue() == "MEMORY STATUS\n\nInspection failed: bad path forgedred\n"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        [sys.executable, str(ROOT / "scripts" / "status.py"), "--snapshot"],
+        [sys.executable, "-m", "scripts.status", "--snapshot"],
+    ],
+    ids=["direct", "module"],
+)
+def test_invalid_environment_is_guarded_without_traceback(command):
+    env = dict(os.environ)
+    env["AI_MEMORY_PROVIDER_ORDER"] = "bad"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == (
+        "MEMORY STATUS\n\nInspection failed: AI_MEMORY_PROVIDER_ORDER must be codex,claude\n"
+    )
+    assert completed.stderr == ""
+
+
+def test_ascii_output_uses_encoding_safe_semantic_glyphs(tmp_path, monkeypatch):
+    snapshot = StatusSnapshot(
+        active=(_run(1, state="running", phase="codex_started", summary="Working"),),
+        attention=(_run(2, state="failed", phase="failed", error="Failed"),),
+        recent=(_run(3, state="succeeded", phase="succeeded", summary="Saved"),),
+        compile=CompileStatus(state="complete", summary="Compiled"),
+        health_alerts=(),
+    )
+    status_cli = _install_snapshot(monkeypatch, snapshot)
+    raw = BytesIO()
+    output = TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+
+    assert (
+        status_cli.main(
+            ["--snapshot", "--no-color"],
+            env={"AI_MEMORY_HOME": str(tmp_path)},
+            now=NOW,
+            output=output,
+        )
+        == 0
+    )
+
+    rendered = raw.getvalue().decode("ascii")
+    assert "MEMORY STATUS - 2026-08-18 19:00 UTC" in rendered
+    assert "  * Capture | Claude | memory | codex started | Working | 1m ago" in rendered
+    assert "  ! Capture | Claude | memory | failed | Failed | 1m ago" in rendered
+    assert "  + Capture | Claude | memory | succeeded | Saved | 1m ago" in rendered
+    assert "  + complete | Compiled" in rendered
+
+
+def test_fit_uses_terminal_cells_and_preserves_graphemes():
+    import status as status_cli
+
+    fitted = status_cli._fit("界e\u0301界e\u0301界", 7)
+
+    assert fitted == "界e\u0301界e\u0301…"
+    assert cell_len(fitted) == 7
+
+
+def test_pipe_output_uses_full_width_policy(tmp_path, monkeypatch):
+    summary = "result-" + ("x" * 300)
+    snapshot = StatusSnapshot(
+        active=(),
+        attention=(),
+        recent=(_run(1, summary=summary),),
+        compile=CompileStatus(state="complete", summary="Compiled"),
+        health_alerts=(),
+    )
+    status_cli = _install_snapshot(monkeypatch, snapshot)
+    output = StringIO()
+
+    assert (
+        status_cli.main(
+            ["--snapshot"],
+            env={"AI_MEMORY_HOME": str(tmp_path)},
+            now=NOW,
+            output=output,
+        )
+        == 0
+    )
+
+    assert summary in output.getvalue()
+    assert "…" not in output.getvalue()

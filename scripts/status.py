@@ -5,32 +5,20 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import re
 import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TextIO, cast
+from typing import TYPE_CHECKING, Any, TextIO, cast
 
-if __package__:
-    from .config import load_config
-    from .status_store import (
-        StatusReadError,
-        StatusRun,
-        StatusSnapshot,
-        load_observer_state,
-        observer_state_path,
-        read_snapshot,
-    )
-else:
-    from config import load_config
-    from status_store import (
-        StatusReadError,
-        StatusRun,
-        StatusSnapshot,
-        load_observer_state,
-        observer_state_path,
-        read_snapshot,
-    )
+from rich.cells import cell_len, split_text
+
+if TYPE_CHECKING:
+    if __package__:
+        from .status_store import StatusRun, StatusSnapshot
+    else:
+        from status_store import StatusRun, StatusSnapshot
 
 
 _KIND_LABELS = {
@@ -69,13 +57,78 @@ _STATE_COLORS = {
     "dead": "\x1b[31m",
     "unavailable": "\x1b[31m",
 }
+_OSC_PATTERN = re.compile(
+    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|\Z)",
+    re.DOTALL,
+)
+_CSI_PATTERN = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
+_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_UNICODE_GLYPH_PROBE = "·○●↻✓↳—…"
 
 
-def _fit(line: str, width: int) -> str:
-    width = max(1, width)
-    if len(line) <= width:
+def load_config(env: Mapping[str, str]):
+    """Import configuration lazily so invalid environments remain diagnosable."""
+    module_name = f"{__package__}.config" if __package__ else "config"
+    return importlib.import_module(module_name).load_config(env)
+
+
+def _status_store_module() -> Any:
+    module_name = f"{__package__}.status_store" if __package__ else "status_store"
+    return importlib.import_module(module_name)
+
+
+def observer_state_path(memory_home):
+    return _status_store_module().observer_state_path(memory_home)
+
+
+def load_observer_state(path):
+    return _status_store_module().load_observer_state(path)
+
+
+def read_snapshot(*args, **kwargs):
+    return _status_store_module().read_snapshot(*args, **kwargs)
+
+
+def _safe_terminal_text(value: object) -> str:
+    """Remove terminal controls while retaining readable single-line text."""
+    text = _OSC_PATTERN.sub("", str(value))
+    text = _CSI_PATTERN.sub("", text)
+    text = _CONTROL_PATTERN.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _output_encoding(stream: TextIO) -> str:
+    return getattr(stream, "encoding", None) or "utf-8"
+
+
+def _supports_unicode_glyphs(encoding: str) -> bool:
+    try:
+        _UNICODE_GLYPH_PROBE.encode(encoding, errors="strict")
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _encoding_safe_text(text: str, encoding: str) -> str:
+    try:
+        return text.encode(encoding, errors="replace").decode(encoding)
+    except LookupError:
+        return text.encode("ascii", errors="replace").decode("ascii")
+
+
+def _write_output(stream: TextIO, text: str, *, encoding: str) -> None:
+    stream.write(_encoding_safe_text(text, encoding))
+
+
+def _fit(line: str, width: int | None, ellipsis: str = "…") -> str:
+    if width is None or cell_len(line) <= width:
         return line
-    return "…" if width == 1 else line[: width - 1] + "…"
+    width = max(1, width)
+    ellipsis_width = cell_len(ellipsis)
+    if width <= ellipsis_width:
+        return split_text(ellipsis, width)[0]
+    prefix, _ = split_text(line, width - ellipsis_width)
+    return prefix + ellipsis
 
 
 def _relative_time(updated_at: datetime, now: datetime) -> str:
@@ -96,17 +149,35 @@ def _run_line(
     run: StatusRun,
     *,
     now: datetime,
+    unicode_glyphs: bool,
     prefix: str = "  ",
     include_state_icon: bool = True,
 ) -> str:
-    icon = f"{_STATE_ICONS.get(run.state, '○')} " if include_state_icon else ""
-    label = _KIND_LABELS.get(run.kind, run.kind.replace("_", " ").title())
-    source = _SOURCE_LABELS.get(run.source_agent, run.source_agent.title())
-    phase = run.phase.replace("_", " ")
-    result = run.summary or run.error or run.state.replace("_", " ")
+    state = _safe_terminal_text(run.state)
+    icons = (
+        _STATE_ICONS
+        if unicode_glyphs
+        else {
+            "queued": "o",
+            "running": "*",
+            "retrying": "~",
+            "succeeded": "+",
+            "failed": "!",
+            "dead": "!",
+        }
+    )
+    icon = f"{icons.get(state, 'o')} " if include_state_icon else ""
+    kind = _safe_terminal_text(run.kind)
+    label = _KIND_LABELS.get(kind, kind.replace("_", " ").title())
+    agent = _safe_terminal_text(run.source_agent)
+    source = _SOURCE_LABELS.get(agent, agent.title())
+    project = _safe_terminal_text(run.project)
+    phase = _safe_terminal_text(run.phase).replace("_", " ")
+    result = _safe_terminal_text(run.summary or run.error or state.replace("_", " "))
+    separator = " · " if unicode_glyphs else " | "
     return (
-        f"{prefix}{icon}{label} · {source} · {run.project} · {phase} · "
-        f"{result} · {_relative_time(run.updated_at, now)}"
+        f"{prefix}{icon}{label}{separator}{source}{separator}{project}{separator}"
+        f"{phase}{separator}{result}{separator}{_relative_time(run.updated_at, now)}"
     )
 
 
@@ -120,11 +191,18 @@ def _render_snapshot(
     snapshot: StatusSnapshot,
     *,
     now: datetime,
-    width: int,
+    width: int | None,
     color: bool,
+    unicode_glyphs: bool,
 ) -> str:
+    title_separator = " · " if unicode_glyphs else " - "
+    empty_label = "— None" if unicode_glyphs else "- None"
+    ellipsis = "…" if unicode_glyphs else "..."
     lines: list[tuple[str, str | None]] = [
-        (f"MEMORY STATUS · {now.astimezone(UTC):%Y-%m-%d %H:%M} UTC", _TITLE_COLOR)
+        (
+            f"MEMORY STATUS{title_separator}{now.astimezone(UTC):%Y-%m-%d %H:%M} UTC",
+            _TITLE_COLOR,
+        )
     ]
     for heading, runs in (
         ("ACTIVE", snapshot.active),
@@ -136,22 +214,36 @@ def _render_snapshot(
         if visible_runs:
             lines.extend(
                 (
-                    _run_line(run, now=now),
+                    _run_line(run, now=now, unicode_glyphs=unicode_glyphs),
                     _STATE_COLORS.get(run.state),
                 )
                 for run in visible_runs
             )
         else:
-            lines.append(("  — None", None))
-    compile_label = snapshot.compile.state.replace("_", " ")
-    compile_icon = _COMPILE_ICONS.get(snapshot.compile.state, "○")
+            lines.append((f"  {empty_label}", None))
+    compile_state = _safe_terminal_text(snapshot.compile.state)
+    compile_label = compile_state.replace("_", " ")
+    compile_icons = (
+        _COMPILE_ICONS
+        if unicode_glyphs
+        else {
+            "running": "*",
+            "retrying": "~",
+            "complete": "+",
+            "failed": "!",
+            "unavailable": "!",
+        }
+    )
+    compile_icon = compile_icons.get(compile_state, "○" if unicode_glyphs else "o")
+    separator = " · " if unicode_glyphs else " | "
+    compile_summary = _safe_terminal_text(snapshot.compile.summary)
     lines.extend(
         (
             ("", None),
             ("END-OF-DAY COMPILE", _HEADING_COLOR),
             (
-                f"  {compile_icon} {compile_label} · {snapshot.compile.summary}",
-                _STATE_COLORS.get(snapshot.compile.state),
+                f"  {compile_icon} {compile_label}{separator}{compile_summary}",
+                _STATE_COLORS.get(compile_state),
             ),
         )
     )
@@ -161,14 +253,18 @@ def _render_snapshot(
                 _run_line(
                     snapshot.compile.run,
                     now=now,
-                    prefix="  ↳ ",
+                    unicode_glyphs=unicode_glyphs,
+                    prefix="  ↳ " if unicode_glyphs else "  -> ",
                     include_state_icon=False,
                 ),
                 _STATE_COLORS.get(snapshot.compile.run.state),
             )
         )
     return (
-        "\n".join(_colorize(_fit(line, width), code, enabled=color) for line, code in lines) + "\n"
+        "\n".join(
+            _colorize(_fit(line, width, ellipsis), code, enabled=color) for line, code in lines
+        )
+        + "\n"
     )
 
 
@@ -209,8 +305,14 @@ def main(
     source_env = os.environ if env is None else env
     stream = sys.stdout if output is None else output
     current = datetime.now(UTC) if now is None else now
-    width = terminal_width or shutil.get_terminal_size((100, 24)).columns
     is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    width = (
+        terminal_width
+        if terminal_width is not None
+        else (shutil.get_terminal_size((100, 24)).columns if is_tty else None)
+    )
+    encoding = _output_encoding(stream)
+    unicode_glyphs = _supports_unicode_glyphs(encoding)
     color = is_tty and not args.no_color and "NO_COLOR" not in source_env
     try:
         config = load_config(source_env)
@@ -222,11 +324,23 @@ def main(
             memory_home=config.root_dir,
             health_alerts=(),
         )
-    except (StatusReadError, OSError, ValueError) as error:
-        stream.write(f"MEMORY STATUS\n\nInspection failed: {error}\n")
+    except (OSError, RuntimeError, ValueError) as error:
+        diagnostic = _safe_terminal_text(error)
+        _write_output(
+            stream,
+            f"MEMORY STATUS\n\nInspection failed: {diagnostic}\n",
+            encoding=encoding,
+        )
         return 2
 
-    stream.write(_render_snapshot(snapshot, now=current, width=width, color=color))
+    rendered = _render_snapshot(
+        snapshot,
+        now=current,
+        width=width,
+        color=color,
+        unicode_glyphs=unicode_glyphs,
+    )
+    _write_output(stream, rendered, encoding=encoding)
     return 0
 
 
