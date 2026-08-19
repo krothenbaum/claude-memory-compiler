@@ -87,6 +87,57 @@ class DetailsOverlay(ModalScreen[None]):
         self.dismiss()
 
 
+class RunRow(Static):
+    """A keyed run row that updates only when its visible view changes."""
+
+    def __init__(
+        self,
+        run: StatusRun,
+        content: Text,
+        *,
+        widget_id: str,
+        content_signature: tuple[object, ...],
+        selected: bool,
+    ) -> None:
+        super().__init__(
+            content,
+            id=widget_id,
+            classes=f"run-row state-{run.state}",
+        )
+        self.run_id = run.id
+        self._state = run.state
+        self._content_signature = content_signature
+        self._selected = selected
+        self.view_signature = (content_signature, selected)
+        self.view_update_count = 1
+        self.set_class(selected, "selected")
+
+    def update_view(
+        self,
+        run: StatusRun,
+        content: Text,
+        *,
+        content_signature: tuple[object, ...],
+        selected: bool,
+    ) -> None:
+        """Apply only changed content, state classes, or selection."""
+        if content_signature != self._content_signature:
+            if run.state != self._state:
+                self.remove_class(f"state-{self._state}")
+                self.add_class(f"state-{run.state}")
+                self._state = run.state
+            self.update(content)
+            self._content_signature = content_signature
+            self.view_update_count += 1
+        self.set_selected(selected)
+
+    def set_selected(self, selected: bool) -> None:
+        if selected != self._selected:
+            self.set_class(selected, "selected")
+            self._selected = selected
+        self.view_signature = (self._content_signature, self._selected)
+
+
 class StatusDashboard(App[None]):
     """Triage dashboard that observes, but never controls, execution."""
 
@@ -103,6 +154,7 @@ class StatusDashboard(App[None]):
     #runs-pane { width: 1fr; }
     #details-pane { width: 1fr; }
     #run-list { height: 1fr; }
+    .run-section, .run-rows { height: auto; }
     .section-label { color: $text-muted; text-style: bold; margin-top: 1; }
     .run-row { height: 1; padding: 0 1; }
     .run-row.selected { text-style: bold reverse; }
@@ -183,6 +235,8 @@ class StatusDashboard(App[None]):
         self._refresh_generation = 0
         self._detail_generation = 0
         self._details_run_id: int | None = None
+        self._run_rows: dict[int, RunRow] = {}
+        self._run_groups: dict[int, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Static(id="app-header")
@@ -194,7 +248,21 @@ class StatusDashboard(App[None]):
         )
         with Horizontal(id="main-grid"):
             with Vertical(id="runs-pane"):
-                yield VerticalScroll(id="run-list")
+                with VerticalScroll(id="run-list"):
+                    with Vertical(id="active-section", classes="run-section"):
+                        yield Static("ACTIVE", classes="section-label")
+                        yield Vertical(id="active-runs", classes="run-rows")
+                    with Vertical(id="attention-section", classes="run-section"):
+                        yield Static("NEEDS ATTENTION", classes="section-label")
+                        yield Vertical(id="attention-runs", classes="run-rows")
+                    with Vertical(id="recent-section", classes="run-section"):
+                        yield Static("RECENT", classes="section-label")
+                        yield Vertical(id="recent-runs", classes="run-rows")
+                    yield Static(
+                        f"Showing first {MAX_RENDERED_RUNS} matching runs — refine filter",
+                        id="truncation-notice",
+                        classes="section-label",
+                    )
             with Vertical(id="details-pane"):
                 yield Static("Select a run", id="details")
         yield Static(id="compile-panel")
@@ -343,6 +411,102 @@ class StatusDashboard(App[None]):
     def _row_id(run_id: int) -> str:
         return f"run-positive-{run_id}" if run_id > 0 else f"run-legacy-{abs(run_id)}"
 
+    @staticmethod
+    def _run_icon(run: StatusRun, spinner_frame: int) -> str:
+        return {
+            "running": ("●", "◉")[spinner_frame],
+            "queued": "◌",
+            "retrying": "↻",
+            "succeeded": "✓",
+            "failed": "✗",
+            "dead": "✗",
+        }[run.state]
+
+    def _row_content_signature(self, run: StatusRun, icon: str) -> tuple[object, ...]:
+        return (
+            icon,
+            run.project,
+            run.source_agent,
+            run.state,
+            run.phase,
+            run.summary,
+            run.error,
+            run.session_id,
+            "compact"
+            if self.has_class("compact")
+            else "wide"
+            if self.has_class("wide")
+            else "stacked",
+            self.no_color,
+        )
+
+    def _visible_run_groups(self) -> tuple[dict[str, tuple[StatusRun, ...]], bool]:
+        assert self.snapshot is not None
+        rendered_count = 0
+        truncated = self.snapshot.has_more
+        groups: dict[str, tuple[StatusRun, ...]] = {}
+        for group, runs in (
+            ("active", self.snapshot.active),
+            ("attention", self.snapshot.attention),
+            ("recent", self.snapshot.recent),
+        ):
+            visible: list[StatusRun] = []
+            for run in (item for item in runs if item.kind != "compile"):
+                if rendered_count >= MAX_RENDERED_RUNS:
+                    truncated = True
+                    break
+                visible.append(run)
+                rendered_count += 1
+            groups[group] = tuple(visible)
+        return groups, truncated
+
+    async def _reconcile_run_rows(
+        self, groups: Mapping[str, tuple[StatusRun, ...]]
+    ) -> None:
+        desired_groups = {
+            run.id: group for group, runs in groups.items() for run in runs
+        }
+        for run_id, row in tuple(self._run_rows.items()):
+            if (
+                run_id not in desired_groups
+                or self._run_groups.get(run_id) != desired_groups[run_id]
+            ):
+                await row.remove()
+                self._run_rows.pop(run_id, None)
+                self._run_groups.pop(run_id, None)
+
+        for group, runs in groups.items():
+            container = self.query_one(f"#{group}-runs", Vertical)
+            for run in runs:
+                icon = self._run_icon(run, self._spinner_frame)
+                signature = self._row_content_signature(run, icon)
+                selected = run.id == self.selected_run_id
+                row = self._run_rows.get(run.id)
+                if row is None:
+                    row = RunRow(
+                        run,
+                        self._row_text(run, icon),
+                        widget_id=self._row_id(run.id),
+                        content_signature=signature,
+                        selected=selected,
+                    )
+                    await container.mount(row)
+                    self._run_rows[run.id] = row
+                    self._run_groups[run.id] = group
+                else:
+                    row.update_view(
+                        run,
+                        self._row_text(run, icon),
+                        content_signature=signature,
+                        selected=selected,
+                    )
+
+            desired_rows = [self._run_rows[run.id] for run in runs]
+            for index, row in enumerate(desired_rows):
+                current = list(container.children)
+                if current[index] is not row:
+                    container.move_child(row, before=current[index])
+
     async def _render_snapshot_unlocked(self) -> None:
         assert self.snapshot is not None
         self.query_one("#app-header", Static).update(
@@ -357,44 +521,11 @@ class StatusDashboard(App[None]):
         health.display = bool(alerts)
         run_list = self.query_one("#run-list", VerticalScroll)
         scroll_y = run_list.scroll_y
-        await run_list.remove_children()
-        rendered_count = 0
-        truncated = self.snapshot.has_more
-        for label, runs in (
-            ("ACTIVE", self.snapshot.active),
-            ("NEEDS ATTENTION", self.snapshot.attention),
-            ("RECENT", self.snapshot.recent),
-        ):
-            await run_list.mount(Static(label, classes="section-label"))
-            for run in (item for item in runs if item.kind != "compile"):
-                if rendered_count >= MAX_RENDERED_RUNS:
-                    truncated = True
-                    break
-                icon = {
-                    "running": ("●", "◉")[self._spinner_frame],
-                    "queued": "◌",
-                    "retrying": "↻",
-                    "succeeded": "✓",
-                    "failed": "✗",
-                    "dead": "✗",
-                }[run.state]
-                row = Static(
-                    self._row_text(run, icon),
-                    id=self._row_id(run.id),
-                    classes=f"run-row state-{run.state}",
-                )
-                row.run_id = run.id  # type: ignore[attr-defined]
-                row.set_class(run.id == self.selected_run_id, "selected")
-                await run_list.mount(row)
-                rendered_count += 1
-        if truncated:
-            await run_list.mount(
-                Static(
-                    f"Showing first {MAX_RENDERED_RUNS} matching runs — refine filter",
-                    id="truncation-notice",
-                    classes="section-label",
-                )
-            )
+        groups, truncated = self._visible_run_groups()
+        await self._reconcile_run_rows(groups)
+        notice = self.query_one("#truncation-notice", Static)
+        if notice.display != truncated:
+            notice.display = truncated
         run_list.scroll_to(y=scroll_y, animate=False)
         compile_status = self.snapshot.compile
         self.query_one("#compile-panel", Static).update(
@@ -503,9 +634,8 @@ class StatusDashboard(App[None]):
 
     def _update_selection_classes(self) -> None:
         for row in self.query(".run-row"):
-            row.set_class(
-                getattr(row, "run_id", None) == self.selected_run_id, "selected"
-            )
+            if isinstance(row, RunRow):
+                row.set_selected(row.run_id == self.selected_run_id)
         if self.snapshot is not None:
             compile_run = self.snapshot.compile.run
             self.query_one("#compile-panel", Static).set_class(

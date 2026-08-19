@@ -551,6 +551,240 @@ async def test_only_active_rows_animate_between_refresh_ticks(tmp_path):
 
 
 @async_test
+async def test_reconcile_identical_snapshot_preserves_widget_identity_and_scroll(
+    tmp_path, monkeypatch
+):
+    value = replace(
+        snapshot(),
+        recent=tuple(run(run_id, "succeeded", "succeeded") for run_id in range(3, 23)),
+    )
+    dashboard = app(tmp_path, lambda *_args, **_kwargs: value)
+    async with dashboard.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        sections_before = tuple(dashboard.query(".run-section"))
+        labels_before = tuple(dashboard.query(".section-label"))
+        rows_before = {
+            row.run_id: row for row in dashboard.query(".run-row")  # type: ignore[attr-defined]
+        }
+        run_list = dashboard.query_one("#run-list")
+        run_list.scroll_to(y=1, animate=False)
+        await pilot.pause()
+        scroll_before = run_list.scroll_y
+        assert scroll_before > 0
+        dashboard.selected_run_id = 2
+        dashboard.preferred_run_id = 2
+        dashboard._update_selection_classes()
+
+        mounts = 0
+        removals = 0
+        container_type = type(dashboard.query_one("#active-runs"))
+        row_type = type(rows_before[1])
+        original_mount = container_type.mount
+        original_remove = row_type.remove
+
+        def tracked_mount(self, *widgets, **kwargs):
+            nonlocal mounts
+            mounts += len(widgets)
+            return original_mount(self, *widgets, **kwargs)
+
+        def tracked_remove(self):
+            nonlocal removals
+            removals += 1
+            return original_remove(self)
+
+        monkeypatch.setattr(container_type, "mount", tracked_mount)
+        monkeypatch.setattr(row_type, "remove", tracked_remove)
+        await dashboard.refresh_snapshot()
+
+        assert len(sections_before) == 3
+        assert tuple(dashboard.query(".run-section")) == sections_before
+        assert tuple(dashboard.query(".section-label")) == labels_before
+        assert {
+            row.run_id: row for row in dashboard.query(".run-row")  # type: ignore[attr-defined]
+        } == rows_before
+        assert mounts == 0 and removals == 0
+        assert dashboard.selected_run_id == 2
+        assert rows_before[2].has_class("selected")
+        assert run_list.scroll_y == scroll_before
+
+
+@async_test
+async def test_spinner_updates_only_active_row_without_replacing_widgets(tmp_path):
+    dashboard = app(tmp_path)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        active = dashboard.query_one("#run-positive-1")
+        recent = dashboard.query_one("#run-positive-3")
+        active_before = active.render()
+        recent_before = recent.render()
+        recent_signature = recent.view_signature  # type: ignore[attr-defined]
+        recent_updates = recent.view_update_count  # type: ignore[attr-defined]
+
+        await dashboard.refresh_snapshot()
+
+        assert dashboard.query_one("#run-positive-1") is active
+        assert dashboard.query_one("#run-positive-3") is recent
+        assert active.render() != active_before
+        assert recent.render() is recent_before
+        assert recent.view_signature == recent_signature  # type: ignore[attr-defined]
+        assert recent.view_update_count == recent_updates  # type: ignore[attr-defined]
+
+
+@async_test
+async def test_reconcile_adds_and_removes_only_changed_row(tmp_path, monkeypatch):
+    current = snapshot()
+
+    def reader(*_args, **_kwargs):
+        return current
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        stable = dashboard.query_one("#run-positive-3")
+        mounted_ids = []
+        removed_ids = []
+        container_type = type(dashboard.query_one("#recent-runs"))
+        row_type = type(stable)
+        original_mount = container_type.mount
+        original_remove = row_type.remove
+
+        def tracked_mount(self, *widgets, **kwargs):
+            mounted_ids.extend(widget.id for widget in widgets)
+            return original_mount(self, *widgets, **kwargs)
+
+        def tracked_remove(self):
+            removed_ids.append(self.run_id)
+            return original_remove(self)
+
+        monkeypatch.setattr(container_type, "mount", tracked_mount)
+        monkeypatch.setattr(row_type, "remove", tracked_remove)
+        added = run(5, "succeeded", "succeeded")
+        current = replace(current, recent=(*current.recent, added))
+        await dashboard.refresh_snapshot()
+
+        added_row = dashboard.query_one("#run-positive-5")
+        assert dashboard.query_one("#run-positive-3") is stable
+        assert added_row.run_id == 5  # type: ignore[attr-defined]
+        assert mounted_ids == ["run-positive-5"]
+        assert removed_ids == []
+
+        mounted_ids.clear()
+        current = replace(current, recent=(added,))
+        await dashboard.refresh_snapshot()
+
+        assert len(dashboard.query("#run-positive-3")) == 0
+        assert dashboard.query_one("#run-positive-5") is added_row
+        assert dashboard.query_one("#run-positive-1")
+        assert dashboard.query_one("#run-positive-2")
+        assert mounted_ids == []
+        assert removed_ids == [3]
+
+
+@async_test
+async def test_reconcile_group_transition_keeps_unrelated_sections_and_rows(tmp_path):
+    current = snapshot()
+
+    def reader(*_args, **_kwargs):
+        return current
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        sections = tuple(dashboard.query(".run-section"))
+        active = dashboard.query_one("#run-positive-1")
+        recent = dashboard.query_one("#run-positive-3")
+        failed = current.attention[0]
+        current = replace(
+            current,
+            attention=(),
+            recent=(
+                replace(failed, state="succeeded", phase="succeeded", error=None),
+                *current.recent,
+            ),
+        )
+        dashboard.selected_run_id = 3
+        dashboard.preferred_run_id = 3
+        await dashboard.refresh_snapshot()
+
+        assert tuple(dashboard.query(".run-section")) == sections
+        assert dashboard.query_one("#run-positive-1") is active
+        assert dashboard.query_one("#run-positive-3") is recent
+        assert dashboard.selected_run_id == 3
+        assert recent.has_class("selected")
+
+
+@async_test
+async def test_reconcile_reorders_rows_in_place_within_one_section(tmp_path):
+    first = run(3, "succeeded", "succeeded")
+    second = run(5, "succeeded", "succeeded")
+    current = replace(snapshot(), recent=(first, second))
+
+    def reader(*_args, **_kwargs):
+        return current
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        first_row = dashboard.query_one("#run-positive-3")
+        second_row = dashboard.query_one("#run-positive-5")
+        current = replace(current, recent=(second, first))
+        await dashboard.refresh_snapshot()
+
+        rows = tuple(dashboard.query_one("#recent-runs").query(".run-row"))
+        assert rows == (second_row, first_row)
+        assert dashboard.query_one("#run-positive-3") is first_row
+        assert dashboard.query_one("#run-positive-5") is second_row
+
+
+@async_test
+async def test_filter_and_resize_preserve_rows_that_remain_visible(tmp_path):
+    def reader(*_args, **kwargs):
+        value = snapshot()
+        if kwargs["query"]:
+            return replace(value, attention=())
+        return value
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        active = dashboard.query_one("#run-positive-1")
+        recent = dashboard.query_one("#run-positive-3")
+        dashboard.filter_query = "safe"
+        await dashboard.refresh_snapshot()
+        assert dashboard.query_one("#run-positive-1") is active
+        assert dashboard.query_one("#run-positive-3") is recent
+
+        await pilot.resize_terminal(60, 30)
+        await pilot.pause()
+        assert dashboard.query_one("#run-positive-1") is active
+        assert dashboard.query_one("#run-positive-3") is recent
+        assert "Claude" not in str(active.render())
+
+
+@async_test
+async def test_reconcile_truncation_notice_updates_only_when_state_changes(tmp_path):
+    current = replace(snapshot(), has_more=False)
+
+    def reader(*_args, **_kwargs):
+        return current
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        notice = dashboard.query_one("#truncation-notice")
+        signature = notice.render()
+        await dashboard.refresh_snapshot()
+        assert dashboard.query_one("#truncation-notice") is notice
+        assert notice.render() is signature
+        assert notice.display is False
+
+        current = replace(current, has_more=True)
+        await dashboard.refresh_snapshot()
+        assert dashboard.query_one("#truncation-notice") is notice
+        assert notice.display is True
+
+
+@async_test
 async def test_no_color_environment_presence_and_constructor_are_additive(
     tmp_path, monkeypatch
 ):
