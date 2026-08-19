@@ -317,10 +317,9 @@ def read_recent_hook_alerts(
     utc_now = now.astimezone(UTC)
     cutoff = utc_now - _ALERT_WINDOW
     redaction_env = _canonical_redaction_env()
-    deduplicated: dict[
-        tuple[datetime, str, str],
-        set[str],
-    ] = {}
+    candidates: list[
+        tuple[tuple[datetime, str, str], str | None]
+    ] = []
     for line in tail.splitlines():
         if not line.strip():
             continue
@@ -350,9 +349,9 @@ def read_recent_hook_alerts(
         message = _safe_message(record.get("message"), redaction_env)
         if message is None:
             continue
-        key = (timestamp, component, message)
-        operation_keys = deduplicated.setdefault(key, set())
+        display_key = (timestamp, component, message)
         occurrence_id = record.get("occurrence_id")
+        operation_key: str | None = None
         if (
             event in _DIAGNOSTIC_EVENTS
             and isinstance(occurrence_id, str)
@@ -360,20 +359,24 @@ def read_recent_hook_alerts(
             and occurrence_id.isascii()
             and occurrence_id.isalnum()
         ):
-            operation_keys.add(
-                f"hook-diagnostic:{event}:{occurrence_id.lower()}"
-            )
+            operation_key = f"hook-diagnostic:{event}:{occurrence_id.lower()}"
+        candidates.append((display_key, operation_key))
 
     durable = _durable_diagnostic_keys(
         memory_home,
-        set().union(*deduplicated.values()) if deduplicated else set(),
+        {
+            operation_key
+            for _display_key, operation_key in candidates
+            if operation_key is not None
+        },
     )
+    deduplicated = {
+        display_key
+        for display_key, operation_key in candidates
+        if operation_key is None or operation_key not in durable
+    }
     ordered = sorted(
-        (
-            key
-            for key, operation_keys in deduplicated.items()
-            if not operation_keys.intersection(durable)
-        ),
+        deduplicated,
         key=lambda value: (
             value[0],
             value[1],

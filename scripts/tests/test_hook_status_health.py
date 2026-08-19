@@ -1236,6 +1236,67 @@ def test_health_alert_suppressed_only_when_durable_occurrence_exists(tmp_path):
     assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
 
 
+def test_health_suppression_is_per_occurrence_before_display_dedup(tmp_path):
+    health = _health_module()
+    first_occurrence = "1" * 32
+    second_occurrence = "2" * 32
+    _write_hook_log(
+        tmp_path,
+        [
+            _error_record(message="same failure", occurrence_id=first_occurrence),
+            _error_record(message="same failure", occurrence_id=second_occurrence),
+        ],
+    )
+
+    assert len(health.read_recent_hook_alerts(tmp_path, now=NOW)) == 1
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="first",
+        project="memory",
+        message="same failure",
+        occurrence_id=first_occurrence,
+    )
+    assert len(health.read_recent_hook_alerts(tmp_path, now=NOW)) == 1
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="second",
+        project="memory",
+        message="same failure",
+        occurrence_id=second_occurrence,
+    )
+    assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
+
+
+def test_health_suppression_keeps_unpersisted_different_message(tmp_path):
+    health = _health_module()
+    persisted_occurrence = "3" * 32
+    fallback_occurrence = "4" * 32
+    _write_hook_log(
+        tmp_path,
+        [
+            _error_record(message="persisted failure", occurrence_id=persisted_occurrence),
+            _error_record(message="fallback failure", occurrence_id=fallback_occurrence),
+        ],
+    )
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="codex",
+        session_id="persisted",
+        project="memory",
+        message="persisted failure",
+        occurrence_id=persisted_occurrence,
+    )
+
+    alerts = health.read_recent_hook_alerts(tmp_path, now=NOW)
+
+    assert [alert.message for alert in alerts] == ["fallback failure"]
+
+
 @pytest.mark.parametrize("event", ["queue_unavailable", "capture_succeeded", "hook_log"])
 def test_record_hook_diagnostic_ignores_log_only_or_nonfailure_events(tmp_path, event):
     health = _health_module()
