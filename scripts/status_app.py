@@ -55,6 +55,7 @@ SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
 HealthLoader = Callable[[], tuple[HealthAlert, ...]]
 MAX_RENDERED_RUNS = 200
+_SOURCE_LABELS = {"claude": "Claude", "codex": "Codex", "system": "System"}
 
 
 def _diagnostic_text(value: object) -> str:
@@ -421,7 +422,11 @@ class StatusDashboard(App[None]):
         result = run.summary or run.error or "—"
         row = Text()
         row.append(icon, style=semantic_style)
-        row.append(f" {run.project} ")
+        row.append(f" {run.project}")
+        if not self.has_class("compact"):
+            source = _SOURCE_LABELS.get(run.source_agent, run.source_agent.title())
+            row.append(f" {source}")
+        row.append(" ")
         row.append(run.state, style=semantic_style)
         row.append(f" {run.phase} result={result}")
         if self.has_class("wide"):

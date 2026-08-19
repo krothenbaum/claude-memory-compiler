@@ -309,18 +309,58 @@ async def test_live_resize_changes_visible_column_contract(tmp_path):
     async with dashboard.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         wide = str(dashboard.query_one("#run-positive-1").render())
-        assert "session-1" in wide
+        assert "session-1" in wide and "Claude" in wide
         assert "provider=" not in wide and "elapsed=" not in wide
         await pilot.resize_terminal(80, 40)
         await pilot.pause()
         stacked = str(dashboard.query_one("#run-positive-1").render())
-        assert "session-1" not in stacked
+        assert "session-1" not in stacked and "Claude" in stacked
         assert "provider=" not in stacked and "elapsed=" not in stacked
         await pilot.resize_terminal(60, 30)
         await pilot.pause()
         compact = str(dashboard.query_one("#run-positive-1").render())
         assert "provider=" not in compact and "elapsed=" not in compact
         assert "memory" in compact and "running" in compact
+        assert "Claude" not in compact
+
+
+@async_test
+async def test_source_agent_labels_distinguish_rows_without_color(tmp_path):
+    rows = (
+        replace(run(21, "running", "provider_started"), source_agent="claude"),
+        replace(run(22, "queued", "queued"), source_agent="codex"),
+        replace(run(23, "retrying", "retry_wait"), source_agent="system"),
+    )
+    value = StatusSnapshot(
+        active=rows,
+        attention=(),
+        recent=(),
+        compile=CompileStatus("before_window", "Not ready"),
+        health_alerts=(),
+    )
+    dashboard = StatusDashboard(
+        tmp_path / "jobs.sqlite3",
+        memory_home=tmp_path,
+        snapshot_reader=lambda *_args, **_kwargs: value,
+        details_reader=lambda _path, run_id: RunDetails(
+            next(item for item in rows if item.id == run_id), (), (), True
+        ),
+        observer_loader=lambda _path: ObserverState.empty(),
+        clock=lambda: NOW,
+        no_color=True,
+    )
+
+    async with dashboard.run_test(size=(80, 40)) as pilot:
+        await pilot.pause()
+        rendered = {}
+        for run_id in (21, 22, 23):
+            content = dashboard.query_one(f"#run-positive-{run_id}").render()
+            assert isinstance(content, Content)
+            rendered[run_id] = content.plain
+        assert "Claude" in rendered[21]
+        assert "Codex" in rendered[22]
+        assert "System" in rendered[23]
+        assert all("provider=" not in row for row in rendered.values())
 
 
 @async_test
