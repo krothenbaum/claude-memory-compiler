@@ -561,14 +561,26 @@ async def test_signed_ids_and_concurrent_refreshes_do_not_duplicate_rows(tmp_pat
 
 @async_test
 async def test_non_busy_operational_error_and_ack_failure_are_diagnostic(tmp_path):
+    unsafe = "failure\x1b[31mred\x1b[0m\x1b]0;title\x07\rforged\bback\x85c1"
+    unsafe_path = tmp_path / "queue\x1b[32mgreen\x1b[0m\x1b]0;path-title\x07\rline"
+
     def broken(*_args, **_kwargs):
-        raise sqlite3.OperationalError("no such table")
+        raise StatusDataInvalid(unsafe_path, unsafe)
 
     diagnostic = app(tmp_path, broken)
     async with diagnostic.run_test() as pilot:
         await pilot.pause()
         assert diagnostic.query_one("#diagnostic").display is True
         assert diagnostic.query_one("#delayed-banner").display is False
+        rendered = diagnostic.query_one("#diagnostic").render()
+        assert isinstance(rendered, Content)
+        assert "failure" in rendered.plain and "queuegreen" in rendered.plain
+        assert len(rendered.plain.splitlines()) == 1
+        assert "\x1b" not in rendered.plain
+        assert all(
+            not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+            for character in rendered.plain
+        )
 
     dashboard = StatusDashboard(
         tmp_path / "jobs.sqlite3",
@@ -576,7 +588,7 @@ async def test_non_busy_operational_error_and_ack_failure_are_diagnostic(tmp_pat
         snapshot_reader=lambda *_args, **_kwargs: snapshot(),
         details_reader=lambda _path, run_id: details_for(run_id),
         observer_loader=lambda _path: ObserverState.empty(),
-        acknowledger=lambda *_args: (_ for _ in ()).throw(PermissionError("denied")),
+        acknowledger=lambda *_args: (_ for _ in ()).throw(PermissionError(unsafe)),
         clock=lambda: NOW,
     )
     async with dashboard.run_test() as pilot:
@@ -584,4 +596,12 @@ async def test_non_busy_operational_error_and_ack_failure_are_diagnostic(tmp_pat
         await pilot.press("j", "a")
         await pilot.pause()
         assert dashboard.snapshot is not None
-        assert "denied" in str(dashboard.query_one("#diagnostic").render())
+        rendered = dashboard.query_one("#diagnostic").render()
+        assert isinstance(rendered, Content)
+        assert "failure" in rendered.plain
+        assert len(rendered.plain.splitlines()) == 1
+        assert "\x1b" not in rendered.plain
+        assert all(
+            not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+            for character in rendered.plain
+        )

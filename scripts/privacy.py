@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import re
+from collections.abc import Mapping
 
 MAX_PERSISTENCE_REASON_CHARS = 1_000
 SECRET_ENV_NAMES = frozenset({"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"})

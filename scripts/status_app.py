@@ -20,6 +20,7 @@ from textual.widgets import Footer, Input, Static
 
 try:
     from scripts.config import load_config
+    from scripts.privacy import normalize_persistence_reason
     from scripts.status_store import (
         HealthAlert,
         ObserverState,
@@ -35,6 +36,7 @@ try:
     )
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from config import load_config
+    from privacy import normalize_persistence_reason
     from status_store import (
         HealthAlert,
         ObserverState,
@@ -53,6 +55,11 @@ SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
 HealthLoader = Callable[[], tuple[HealthAlert, ...]]
 MAX_RENDERED_RUNS = 200
+
+
+def _diagnostic_text(value: object) -> str:
+    """Return bounded, redacted terminal-safe diagnostic text."""
+    return normalize_persistence_reason(value, os.environ)
 
 
 def read_recent_hook_alerts(*args, **kwargs) -> tuple[HealthAlert, ...]:
@@ -303,7 +310,12 @@ class StatusDashboard(App[None]):
             self.query_one("#delayed-banner", Static).display = False
             diagnostic = self.query_one("#diagnostic", Static)
             path = getattr(error, "path", self.queue_path)
-            diagnostic.update(Text(f"Status unavailable: {path} — {error}"))
+            diagnostic.update(
+                Text(
+                    f"Status unavailable: {_diagnostic_text(path)} — "
+                    f"{_diagnostic_text(error)}"
+                )
+            )
             diagnostic.display = True
             return
         if generation != self._refresh_generation:
@@ -552,7 +564,9 @@ class StatusDashboard(App[None]):
             )
         except (OSError, PermissionError, sqlite3.Error, ValueError) as error:
             diagnostic = self.query_one("#diagnostic", Static)
-            diagnostic.update(Text(f"Could not acknowledge failure: {error}"))
+            diagnostic.update(
+                Text(f"Could not acknowledge failure: {_diagnostic_text(error)}")
+            )
             diagnostic.display = True
             return
         await self.refresh_snapshot()
