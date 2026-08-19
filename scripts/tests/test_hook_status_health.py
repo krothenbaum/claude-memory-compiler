@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -93,7 +94,12 @@ def test_precompact_structured_input_errors_are_visible_to_health_reader(
     if case == "malformed":
         payload = "{"
     elif case == "missing":
-        payload = json.dumps({"session_id": "precompact-session"})
+        payload = json.dumps(
+            {
+                "session_id": "precompact-session",
+                "cwd": str(tmp_path / "cwd-precompact-project"),
+            }
+        )
     else:
         transcript = tmp_path / "transcript-directory"
         transcript.mkdir()
@@ -121,18 +127,19 @@ def test_precompact_structured_input_errors_are_visible_to_health_reader(
         memory_home,
         now=datetime.now(UTC),
     )
-    assert len(alerts) == 1
-    assert alerts[0].component == "pre-compact"
+    assert alerts == ()
     runs = _diagnostic_runs(memory_home)
     assert len(runs) == 1
     assert runs[0]["state"] == "failed"
     assert runs[0]["phase"] == "failed"
+    if case == "missing":
+        assert runs[0]["project"] == "cwd-precompact-project"
 
 
 @pytest.mark.parametrize(
     ("result", "expected_event", "is_error"),
     [
-        (ValueError("capture problem"), "capture_failed", True),
+        (ValueError("capture problem"), "capture_failed", False),
         (
             capture_module.CaptureQueueUnavailableError("queue denied"),
             "queue_unavailable",
@@ -173,10 +180,14 @@ def test_precompact_structured_capture_outcomes_are_visible(
             raise result
         return result
 
+    real_helpers = hook._live_capture_helpers()
     helpers = SimpleNamespace(
         bounded_transcript_slice=selected,
         require_time_remaining=lambda *_args, **_kwargs: None,
         enqueue_capture_with_deadline=enqueue,
+        persist_hook_diagnostic_with_deadline=(
+            real_helpers.persist_hook_diagnostic_with_deadline
+        ),
         MIN_CAPTURE_REMAINING_SECONDS=0.75,
     )
     monkeypatch.setattr(hook, "_live_capture_helpers", lambda: helpers)
@@ -341,10 +352,11 @@ def test_missing_transcript_records_error_without_exposing_path(
         "stdin",
         io.StringIO(
             json.dumps(
-                {
-                    "session_id": "session-missing",
-                    "transcript_path": str(secret_path),
-                }
+                    {
+                        "session_id": "session-missing",
+                        "transcript_path": str(secret_path),
+                        "cwd": str(tmp_path / "cwd-hook-project"),
+                    }
             )
         ),
     )
@@ -357,7 +369,9 @@ def test_missing_transcript_records_error_without_exposing_path(
     assert record.source_agent == source_agent
     assert record.session_id == "session-missing"
     assert str(secret_path) not in record.getMessage()
-    assert len(_diagnostic_runs(tmp_path / "memory")) == 1
+    runs = _diagnostic_runs(tmp_path / "memory")
+    assert len(runs) == 1
+    assert runs[0]["project"] == "cwd-hook-project"
 
 
 @pytest.mark.parametrize(
@@ -466,6 +480,9 @@ def test_codex_capture_failure_records_diagnostic(tmp_path, monkeypatch):
         enqueue_capture_with_deadline=lambda *_args, **_kwargs: (
             _ for _ in ()
         ).throw(ValueError("capture failed")),
+        persist_hook_diagnostic_with_deadline=(
+            _load_hook("session-end.py").persist_hook_diagnostic_with_deadline
+        ),
         MIN_CAPTURE_REMAINING_SECONDS=0.75,
     )
     monkeypatch.setattr(hook, "_live_capture_helpers", lambda: helpers)
@@ -626,6 +643,7 @@ def test_real_capture_child_classifies_unsafe_queue_boundary(
 
 def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeypatch):
     secret = "credential-value-never-log"
+    occurrence_id = "e" * 32
     monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
     logger = hook_logging.configure_hook_logger("health-json", "session-end", tmp_path)
     try:
@@ -636,6 +654,7 @@ def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeyp
             f"failure {secret}\nwith control\x00" + "x" * 2_000,
             source_agent="claude",
             session_id=f"session-{secret}",
+            occurrence_id=occurrence_id,
         )
     finally:
         for handler in list(logger.handlers):
@@ -648,6 +667,7 @@ def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeyp
     record = json.loads(lines[0])
     assert record["event"] == "capture_failed"
     assert record["source_agent"] == "claude"
+    assert record["occurrence_id"] == occurrence_id
     assert secret not in json.dumps(record)
     assert "\n" not in record["message"]
     assert "\x00" not in record["message"]
@@ -692,6 +712,41 @@ def test_hook_log_handler_failure_never_writes_record_to_stdio(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_hook_logger_retries_transient_secure_open_once(tmp_path, monkeypatch):
+    logger_name = "transient-hook-open"
+    logger = logging.getLogger(logger_name)
+    _close_logger(logger)
+    real_open = hook_logging.open_secure_log_stream
+    attempts = 0
+
+    def transient_open(path):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("concurrent first-file creation")
+        return real_open(path)
+
+    monkeypatch.setattr(hook_logging, "open_secure_log_stream", transient_open)
+    try:
+        configured = hook_logging.configure_hook_logger(
+            logger_name,
+            "session-end",
+            tmp_path,
+        )
+        configured.info("retry succeeded")
+    finally:
+        _close_logger(logger)
+
+    assert attempts == 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "scripts" / "logs" / "hooks.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["message"] for record in records] == ["retry succeeded"]
 
 
 @pytest.mark.parametrize(
@@ -880,6 +935,7 @@ def _error_record(
     event: str = "capture_failed",
     message: str = "capture failed",
     session_id: str | None = "session-1",
+    occurrence_id: str | None = None,
 ) -> dict[str, object]:
     record: dict[str, object] = {
         "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
@@ -891,6 +947,8 @@ def _error_record(
     }
     if session_id is not None:
         record["session_id"] = session_id
+    if occurrence_id is not None:
+        record["occurrence_id"] = occurrence_id
     return record
 
 
@@ -1054,7 +1112,7 @@ def test_record_hook_diagnostic_persists_safe_terminal_run(tmp_path, monkeypatch
     recorded = health.record_hook_diagnostic(
         tmp_path,
         event="malformed_input",
-        source_agent="invalid-agent",
+        source_agent="claude",
         session_id=f"session-{secret}\nprivate",
         project="",
         message=f"Malformed {secret}\ninput",
@@ -1073,13 +1131,109 @@ def test_record_hook_diagnostic_persists_safe_terminal_run(tmp_path, monkeypatch
         run = repository.status_run_for_operation(rows[0]["operation_key"])
         assert run is not None
         assert run.state == "failed"
-        assert run.source_agent == "unknown"
+        assert run.source_agent == "claude"
         assert run.session_id == "unknown"
         assert run.project == "unknown"
         assert secret not in (run.error or "")
         assert "raw-private-token" not in (run.operation_key or "")
         assert len(repository.status_events(run.id)) == 1
         assert repository._connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_diagnostic_child_is_killed_by_parent_deadline_without_partial_run(tmp_path):
+    hook = _load_hook("session-end.py")
+    queue_path = tmp_path / "scripts" / "jobs.sqlite3"
+    with QueueRepository(queue_path, sync_usage=False):
+        pass
+    code = (
+        "import sqlite3,sys,time; "
+        "db=sqlite3.connect(sys.argv[1], isolation_level=None); "
+        "db.execute('BEGIN IMMEDIATE'); "
+        "db.execute(\"INSERT INTO status_runs "
+        "(operation_key,kind,source_agent,session_id,project,state,phase,"
+        "started_at,updated_at,completed_at) VALUES "
+        "('hook-diagnostic:capture_failed:" + "a" * 32 + "','capture','claude',"
+        "'deadline-session','memory','failed','failed',"
+        "'2026-08-18T00:00:00+00:00','2026-08-18T00:00:00+00:00',"
+        "'2026-08-18T00:00:00+00:00')\"); "
+        "time.sleep(2)"
+    )
+    started = time.monotonic()
+
+    recorded = hook.persist_hook_diagnostic_with_deadline(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="deadline-session",
+        project="memory",
+        message="capture failed",
+        occurrence_id="a" * 32,
+        deadline=started + 0.3,
+        clock=time.monotonic,
+        command=[sys.executable, "-c", code, str(queue_path)],
+    )
+
+    assert recorded is False
+    assert time.monotonic() - started < 0.7
+    with QueueRepository(queue_path, sync_usage=False) as repository:
+        assert (
+            repository.status_run_for_operation(
+                "hook-diagnostic:capture_failed:" + "a" * 32
+            )
+            is None
+        )
+
+
+def test_normal_diagnostic_child_persists_matching_occurrence(tmp_path):
+    hook = _load_hook("session-end.py")
+    occurrence_id = "b" * 32
+
+    assert hook.persist_hook_diagnostic_with_deadline(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="child-session",
+        project="memory",
+        message="capture failed",
+        occurrence_id=occurrence_id,
+        deadline=time.monotonic() + 2,
+        clock=time.monotonic,
+    )
+
+    with QueueRepository(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        sync_usage=False,
+    ) as repository:
+        run = repository.status_run_for_operation(
+            f"hook-diagnostic:capture_failed:{occurrence_id}"
+        )
+        assert run is not None
+        assert run.state == "failed"
+
+
+def test_health_alert_suppressed_only_when_durable_occurrence_exists(tmp_path):
+    health = _health_module()
+    occurrence_id = "c" * 32
+    record = _error_record(
+        message="capture failed",
+        occurrence_id=occurrence_id,
+    )
+    _write_hook_log(tmp_path, [record])
+
+    assert len(health.read_recent_hook_alerts(tmp_path, now=NOW)) == 1
+    assert not (tmp_path / "scripts" / "jobs.sqlite3").exists()
+
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="session-1",
+        project="memory",
+        message="capture failed",
+        occurrence_id=occurrence_id,
+    )
+
+    assert health.read_recent_hook_alerts(tmp_path, now=NOW) == ()
 
 
 @pytest.mark.parametrize("event", ["queue_unavailable", "capture_succeeded", "hook_log"])
@@ -1139,7 +1293,6 @@ def test_hook_diagnostic_failure_or_deadline_does_not_change_hook_outcome(
     tmp_path, monkeypatch, failure_mode
 ):
     hook = _load_hook("session-end.py")
-    health = _health_module()
     logger, handler = _record_logger(f"diagnostic-{failure_mode}")
     memory_home = tmp_path / "memory"
     monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
@@ -1152,11 +1305,9 @@ def test_hook_diagnostic_failure_or_deadline_does_not_change_hook_outcome(
     )
     if failure_mode == "persistence":
         monkeypatch.setattr(
-            health,
-            "QueueRepository",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                sqlite3.OperationalError("diagnostic unavailable")
-            ),
+            hook,
+            "persist_hook_diagnostic_with_deadline",
+            lambda *_args, **_kwargs: False,
         )
         clock = lambda: 0.0
     else:

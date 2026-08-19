@@ -770,6 +770,23 @@ def test_failed_operation_run_is_idempotent_but_occurrences_are_distinct(tmp_pat
         assert len(repository.status_events(second.id)) == 1
 
 
+def test_failed_operation_run_rejects_unknown_source(tmp_path):
+    with QueueRepository(
+        tmp_path / "jobs.sqlite3",
+        clock=lambda: NOW,
+        sync_usage=False,
+    ) as repository:
+        with pytest.raises(ValueError, match="source_agent"):
+            repository.create_failed_operation_run(
+                "hook-diagnostic:capture_failed:unknown-source",
+                source_agent="unknown",
+                session_id="unknown",
+                project="unknown",
+                summary="Capture failed",
+                error="Capture failed",
+            )
+
+
 def test_failed_operation_run_redacts_and_rolls_back_event_failure(
     tmp_path, monkeypatch
 ):

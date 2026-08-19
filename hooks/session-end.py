@@ -46,6 +46,7 @@ from scripts.hook_logging import (
     classify_capture_error,
     classify_transcript_path,
     configure_hook_logger,
+    diagnostic_project,
     log_hook_event,
 )
 from scripts.transcripts import parse_claude_transcript, render_turns
@@ -219,6 +220,81 @@ def enqueue_capture_with_deadline(
     return value
 
 
+def new_diagnostic_occurrence_id() -> str:
+    return secrets.token_hex(16)
+
+
+def persist_hook_diagnostic_with_deadline(
+    memory_home: Path,
+    *,
+    event: str,
+    source_agent: str,
+    session_id: object,
+    project: object,
+    message: str,
+    occurrence_id: str,
+    deadline: float,
+    clock: Callable[[], float],
+    command: list[str] | None = None,
+) -> bool:
+    """Run synchronous diagnostic persistence only in a killable child."""
+    try:
+        remaining = deadline - clock()
+    except Exception:
+        return False
+    if remaining < 0.1:
+        return False
+    request = {
+        "memory_home": str(memory_home),
+        "event": event,
+        "source_agent": source_agent,
+        "session_id": session_id,
+        "project": project,
+        "message": message,
+        "occurrence_id": occurrence_id,
+        "budget_seconds": max(0.01, remaining - 0.05),
+    }
+    try:
+        output = run_process_until_deadline(
+            command
+            or [sys.executable, str(Path(__file__).resolve()), "--diagnostic-child"],
+            input_text=json.dumps(request, separators=(",", ":")),
+            deadline=deadline,
+            clock=clock,
+        )
+        response = json.loads(output)
+        return isinstance(response, dict) and response.get("recorded") is True
+    except Exception:
+        return False
+
+
+def _diagnostic_child_main() -> None:
+    recorded = False
+    try:
+        request = json.loads(sys.stdin.read())
+        if not isinstance(request, dict):
+            raise ValueError("diagnostic child input must be an object")
+        budget = request.get("budget_seconds")
+        if not isinstance(budget, (int, float)) or budget <= 0:
+            raise ValueError("diagnostic child budget must be positive")
+        from scripts.status_health import record_hook_diagnostic
+
+        recorded = record_hook_diagnostic(
+            Path(request["memory_home"]),
+            event=request["event"],
+            source_agent=request["source_agent"],
+            session_id=request.get("session_id"),
+            project=request.get("project"),
+            message=request.get("message"),
+            occurrence_id=request.get("occurrence_id"),
+            deadline=time.monotonic() + budget,
+            clock=time.monotonic,
+        )
+    except Exception:
+        recorded = False
+    sys.stdout.write(json.dumps({"recorded": recorded}, separators=(",", ":")))
+
+
 def _capture_child_main() -> None:
     try:
         request = json.loads(sys.stdin.read())
@@ -285,19 +361,19 @@ def _record_diagnostic(
     session_id: object,
     project: object,
     message: str,
+    occurrence_id: str,
     deadline: float,
     clock: Callable[[], float],
 ) -> bool:
     try:
-        from scripts.status_health import record_hook_diagnostic
-
-        return record_hook_diagnostic(
+        return persist_hook_diagnostic_with_deadline(
             _runtime_root(),
             event=event,
             source_agent="claude",
             session_id=session_id,
             project=project,
             message=message,
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -1168,25 +1244,31 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
     try:
         hook_input = _read_hook_input()
     except (json.JSONDecodeError, ValueError, EOFError):
+        occurrence_id = new_diagnostic_occurrence_id()
         log_hook_event(
             logger,
             logging.ERROR,
             "malformed_input",
             "failed to parse hook input",
             source_agent="claude",
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event="malformed_input",
             session_id="unknown",
             project="unknown",
             message="failed to parse hook input",
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
         return
 
+    project = diagnostic_project(hook_input)
+
     transcript_value = hook_input.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
+        occurrence_id = new_diagnostic_occurrence_id()
         log_hook_event(
             logger,
             logging.ERROR,
@@ -1194,12 +1276,14 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             "hook input did not include a transcript",
             source_agent="claude",
             session_id=hook_input.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event="transcript_missing",
             session_id=hook_input.get("session_id"),
-            project=hook_input.get("project"),
+            project=project,
             message="hook input did not include a transcript",
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -1207,6 +1291,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
     transcript_path = Path(transcript_value).expanduser()
     transcript_event = classify_transcript_path(transcript_path)
     if transcript_event is not None:
+        occurrence_id = new_diagnostic_occurrence_id()
         log_hook_event(
             logger,
             logging.ERROR,
@@ -1218,16 +1303,18 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             ),
             source_agent="claude",
             session_id=hook_input.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event=transcript_event,
             session_id=hook_input.get("session_id"),
-            project=hook_input.get("project"),
+            project=project,
             message=(
                 "transcript is missing"
                 if transcript_event == "transcript_missing"
                 else "transcript is unreadable"
             ),
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -1262,6 +1349,12 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             clock=clock,
         ) as selected:
             live_slice, preview = selected
+            project = diagnostic_project(
+                {
+                    "project": getattr(preview, "project", None),
+                    "cwd": cwd,
+                }
+            )
             context = render_turns(preview)
             if len(context) > MAX_CONTEXT_CHARS:
                 context = context[-MAX_CONTEXT_CHARS:]
@@ -1300,6 +1393,9 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
     except Exception as error:
         # Hooks are advisory. A capture failure must never block the host agent.
         event = classify_capture_error(error)
+        occurrence_id = (
+            new_diagnostic_occurrence_id() if event == "capture_failed" else None
+        )
         log_hook_event(
             logger,
             logging.ERROR,
@@ -1311,13 +1407,16 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             ),
             source_agent="claude",
             session_id=hook_input.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         if event == "capture_failed":
+            assert occurrence_id is not None
             _record_diagnostic(
                 event=event,
                 session_id=hook_input.get("session_id"),
-                project=hook_input.get("project"),
+                project=project,
                 message="capture failed",
+                occurrence_id=occurrence_id,
                 deadline=deadline,
                 clock=clock,
             )
@@ -1326,5 +1425,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--capture-child":
         _capture_child_main()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--diagnostic-child":
+        _diagnostic_child_main()
     else:
         main()

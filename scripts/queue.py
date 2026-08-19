@@ -741,10 +741,7 @@ class QueueRepository:
     ) -> StatusRun:
         """Atomically create one terminal diagnostic run and failed event."""
         persisted_source = source_agent
-        validation_source = cast(
-            SourceAgent,
-            "system" if source_agent == "unknown" else source_agent,
-        )
+        validation_source = cast(SourceAgent, source_agent)
         operation_key, kind, _source, session_id, project = (
             validate_operation_identity(
                 operation_key,
@@ -755,7 +752,7 @@ class QueueRepository:
                 redaction_env=self._redaction_env,
             )
         )
-        if source_agent not in {"claude", "codex", "system", "unknown"}:
+        if source_agent not in {"claude", "codex", "system"}:
             raise ValueError(f"invalid diagnostic source_agent: {source_agent!r}")
         now = self._now()
         candidate = StatusRun(

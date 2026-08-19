@@ -474,6 +474,7 @@ def test_hook_diagnostic_outlives_health_tail_and_observer_acknowledges(
     tmp_path,
 ):
     occurred_at = datetime.now(UTC)
+    occurrence_id = "d" * 32
     assert record_hook_diagnostic(
         tmp_path,
         event="capture_failed",
@@ -481,7 +482,7 @@ def test_hook_diagnostic_outlives_health_tail_and_observer_acknowledges(
         session_id="durable-session",
         project="memory",
         message="capture failed",
-        token_factory=lambda: "durable-occurrence",
+        occurrence_id=occurrence_id,
     )
     logs = tmp_path / "scripts" / "logs"
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -498,6 +499,7 @@ def test_hook_diagnostic_outlives_health_tail_and_observer_acknowledges(
                 "message": "capture failed",
                 "source_agent": "codex",
                 "session_id": "durable-session",
+                "occurrence_id": occurrence_id,
             },
             separators=(",", ":"),
         )
@@ -506,7 +508,7 @@ def test_hook_diagnostic_outlives_health_tail_and_observer_acknowledges(
     )
     hook_log.chmod(0o600)
 
-    assert len(read_recent_hook_alerts(tmp_path, now=occurred_at)) == 1
+    assert read_recent_hook_alerts(tmp_path, now=occurred_at) == ()
     later = occurred_at + timedelta(days=2)
     assert read_recent_hook_alerts(tmp_path, now=later) == ()
 

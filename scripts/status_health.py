@@ -17,12 +17,12 @@ from typing import Final
 try:
     from .config import load_config
     from .privacy import normalize_persistence_reason
-    from .status_store import HealthAlert
+    from .status_store import HealthAlert, StatusReadError, _open_read_only_database
     from .utils import inspect_secure_read_file
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from config import load_config
     from privacy import normalize_persistence_reason
-    from status_store import HealthAlert
+    from status_store import HealthAlert, StatusReadError, _open_read_only_database
     from utils import inspect_secure_read_file
 
 try:
@@ -95,9 +95,15 @@ def record_hook_diagnostic(
     deadline: float | None = None,
     clock: Callable[[], float] = time.monotonic,
     token_factory: Callable[[], object] = secrets.token_hex,
+    occurrence_id: str | None = None,
 ) -> bool:
     """Best-effort persistence for one pre-queue hook failure occurrence."""
     if event not in _DIAGNOSTIC_EVENTS:
+        return False
+    if (
+        not isinstance(source_agent, str)
+        or source_agent not in {"claude", "codex"}
+    ):
         return False
     if deadline is not None:
         remaining = deadline - clock()
@@ -107,16 +113,21 @@ def record_hook_diagnostic(
     else:
         busy_timeout_ms = 100
     redaction_env = _canonical_redaction_env()
-    safe_source = (
-        source_agent
-        if isinstance(source_agent, str) and source_agent in {"claude", "codex"}
-        else "unknown"
-    )
+    safe_source = source_agent
     safe_session = _safe_diagnostic_identity(session_id, redaction_env)
     safe_project = _safe_diagnostic_identity(project, redaction_env)
     try:
-        token = token_factory()
-        occurrence = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:32]
+        if occurrence_id is None:
+            token = token_factory()
+            occurrence = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:32]
+        elif (
+            len(occurrence_id) == 32
+            and occurrence_id.isascii()
+            and occurrence_id.isalnum()
+        ):
+            occurrence = occurrence_id.lower()
+        else:
+            return False
         operation_key = f"hook-diagnostic:{event}:{occurrence}"
         root = Path(os.path.abspath(memory_home.expanduser()))
         config = load_config(
@@ -153,6 +164,43 @@ def record_hook_diagnostic(
         return True
     except Exception:
         return False
+
+
+def _durable_diagnostic_keys(
+    memory_home: Path,
+    operation_keys: set[str],
+) -> set[str]:
+    if not operation_keys:
+        return set()
+    try:
+        root = Path(os.path.abspath(memory_home.expanduser()))
+        config = load_config(
+            {
+                **os.environ,
+                "AI_MEMORY_HOME": str(root),
+                "CLAUDE_MEMORY_HOME": str(root),
+            }
+        )
+        connection = _open_read_only_database(config.queue_path)
+    except (OSError, ValueError, StatusReadError):
+        return set()
+    try:
+        found: set[str] = set()
+        ordered = sorted(operation_keys)
+        for offset in range(0, len(ordered), 250):
+            batch = ordered[offset : offset + 250]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                f"SELECT operation_key FROM status_runs "
+                f"WHERE operation_key IN ({placeholders})",
+                batch,
+            ).fetchall()
+            found.update(row[0] for row in rows)
+        return found
+    except Exception:
+        return set()
+    finally:
+        connection.close()
 
 
 def _safe_message(
@@ -271,7 +319,7 @@ def read_recent_hook_alerts(
     redaction_env = _canonical_redaction_env()
     deduplicated: dict[
         tuple[datetime, str, str],
-        tuple[datetime, str, str],
+        set[str],
     ] = {}
     for line in tail.splitlines():
         if not line.strip():
@@ -303,10 +351,29 @@ def read_recent_hook_alerts(
         if message is None:
             continue
         key = (timestamp, component, message)
-        deduplicated[key] = key
+        operation_keys = deduplicated.setdefault(key, set())
+        occurrence_id = record.get("occurrence_id")
+        if (
+            event in _DIAGNOSTIC_EVENTS
+            and isinstance(occurrence_id, str)
+            and len(occurrence_id) == 32
+            and occurrence_id.isascii()
+            and occurrence_id.isalnum()
+        ):
+            operation_keys.add(
+                f"hook-diagnostic:{event}:{occurrence_id.lower()}"
+            )
 
+    durable = _durable_diagnostic_keys(
+        memory_home,
+        set().union(*deduplicated.values()) if deduplicated else set(),
+    )
     ordered = sorted(
-        deduplicated.values(),
+        (
+            key
+            for key, operation_keys in deduplicated.items()
+            if not operation_keys.intersection(durable)
+        ),
         key=lambda value: (
             value[0],
             value[1],

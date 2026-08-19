@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from scripts.hook_logging import (
     classify_capture_error,
     classify_transcript_path,
     configure_hook_logger,
+    diagnostic_project,
     log_hook_event,
 )
 from scripts.transcripts import parse_codex_transcript
@@ -75,19 +77,20 @@ def _record_diagnostic(
     session_id: object,
     project: object,
     message: str,
+    occurrence_id: str,
     deadline: float,
     clock: Callable[[], float],
 ) -> bool:
     try:
-        from scripts.status_health import record_hook_diagnostic
-
-        return record_hook_diagnostic(
+        helpers = _live_capture_helpers()
+        return helpers.persist_hook_diagnostic_with_deadline(
             _runtime_root(),
             event=event,
             source_agent="codex",
             session_id=session_id,
             project=project,
             message=message,
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -122,25 +125,31 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(value, dict):
             raise ValueError("hook input must be a JSON object")
     except (json.JSONDecodeError, ValueError, EOFError):
+        occurrence_id = secrets.token_hex(16)
         log_hook_event(
             logger,
             logging.ERROR,
             "malformed_input",
             "failed to parse hook input",
             source_agent="codex",
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event="malformed_input",
             session_id="unknown",
             project="unknown",
             message="failed to parse hook input",
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
         return
 
+    project = diagnostic_project(value)
+
     transcript_value = value.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
+        occurrence_id = secrets.token_hex(16)
         log_hook_event(
             logger,
             logging.ERROR,
@@ -148,12 +157,14 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             "hook input did not include a transcript",
             source_agent="codex",
             session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event="transcript_missing",
             session_id=value.get("session_id"),
-            project=value.get("project"),
+            project=project,
             message="hook input did not include a transcript",
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -161,6 +172,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
     transcript_path = Path(transcript_value).expanduser()
     transcript_event = classify_transcript_path(transcript_path)
     if transcript_event is not None:
+        occurrence_id = secrets.token_hex(16)
         log_hook_event(
             logger,
             logging.ERROR,
@@ -172,16 +184,18 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             ),
             source_agent="codex",
             session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         _record_diagnostic(
             event=transcript_event,
             session_id=value.get("session_id"),
-            project=value.get("project"),
+            project=project,
             message=(
                 "transcript is missing"
                 if transcript_event == "transcript_missing"
                 else "transcript is unreadable"
             ),
+            occurrence_id=occurrence_id,
             deadline=deadline,
             clock=clock,
         )
@@ -213,6 +227,12 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             clock=clock,
         ) as selected:
             live_slice, preview = selected
+            project = diagnostic_project(
+                {
+                    "project": getattr(preview, "project", None),
+                    "cwd": value.get("cwd"),
+                }
+            )
             if not preview.turns:
                 logger.info("skip: empty normalized transcript")
                 return
@@ -239,6 +259,7 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
         )
     except Exception as error:
         event = classify_capture_error(error)
+        occurrence_id = secrets.token_hex(16) if event == "capture_failed" else None
         log_hook_event(
             logger,
             logging.ERROR,
@@ -250,13 +271,16 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             ),
             source_agent="codex",
             session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
         )
         if event == "capture_failed":
+            assert occurrence_id is not None
             _record_diagnostic(
                 event=event,
                 session_id=value.get("session_id"),
-                project=value.get("project"),
+                project=project,
                 message="capture failed",
+                occurrence_id=occurrence_id,
                 deadline=deadline,
                 clock=clock,
             )

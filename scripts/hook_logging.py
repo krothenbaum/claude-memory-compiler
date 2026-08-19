@@ -47,6 +47,31 @@ def _safe_context(value: object, env: dict[str, str]) -> str | None:
     return value
 
 
+def _safe_occurrence_id(value: object) -> str | None:
+    if (
+        isinstance(value, str)
+        and len(value) == 32
+        and value.isascii()
+        and value.isalnum()
+    ):
+        return value.lower()
+    return None
+
+
+def diagnostic_project(payload: dict[str, object]) -> str:
+    """Derive bounded project attribution without persisting raw cwd data."""
+    environment = dict(os.environ)
+    project = _safe_context(payload.get("project"), environment)
+    if project is not None:
+        return project
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        derived = _safe_context(Path(cwd).name, environment)
+        if derived is not None:
+            return derived
+    return "unknown"
+
+
 def _safe_event_message(value: object, env: dict[str, str]) -> str:
     text = "".join(
         character if ord(character) >= 32 and ord(character) != 127 else " "
@@ -147,6 +172,11 @@ class HookJsonFormatter(logging.Formatter):
         )
         if session_id is not None:
             value["session_id"] = session_id
+        occurrence_id = _safe_occurrence_id(
+            getattr(record, "occurrence_id", None)
+        )
+        if occurrence_id is not None:
+            value["occurrence_id"] = occurrence_id
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -198,10 +228,15 @@ def configure_hook_logger(
         return logger
 
     _remove_owned_handlers(logger)
-    try:
-        prepare_secure_log_directory(memory_root)
-        handler: logging.Handler = _HookLogHandler(open_secure_log_stream(target))
-    except (OSError, ValueError):
+    handler: logging.Handler | None = None
+    for _attempt in range(2):
+        try:
+            prepare_secure_log_directory(memory_root)
+            handler = _HookLogHandler(open_secure_log_stream(target))
+            break
+        except (OSError, ValueError):
+            continue
+    if handler is None:
         handler = logging.NullHandler()
     handler.setFormatter(HookJsonFormatter(label))
     handler._memory_hook_file = True  # type: ignore[attr-defined]
@@ -220,6 +255,7 @@ def log_hook_event(
     *,
     source_agent: str,
     session_id: object = None,
+    occurrence_id: object = None,
 ) -> None:
     """Emit one structured, bounded hook event without exception metadata."""
     logger.log(
@@ -230,6 +266,7 @@ def log_hook_event(
             "hook_event": event,
             "source_agent": source_agent,
             "session_id": session_id,
+            "occurrence_id": occurrence_id,
         },
     )
 
