@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import random
 import sys
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Protocol, cast
 import uuid
 
 
@@ -23,6 +23,8 @@ if str(ROOT) not in sys.path:
 
 from scripts.config import load_config
 from scripts.providers import (
+    AttemptCallback,
+    AttemptStartCallback,
     ClaudeProvider,
     CodexProvider,
     ProviderResult,
@@ -31,10 +33,14 @@ from scripts.providers import (
     TaskKind,
     TextRequest,
 )
-from scripts.queue import Job, QueueRepository
+from scripts.queue import Job, LeaseOwnershipError, QueueRepository
 from scripts.staging import recover_incomplete_apply
+from scripts.status_store import EventLevel, ProviderName
 from scripts.utils import ExclusiveFileLock, append_daily_entry
 from scripts.flush import build_flush_prompt, maybe_trigger_compilation
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -67,6 +73,16 @@ class LeaseLostError(RuntimeError):
     """Raised when the active worker can no longer prove lease ownership."""
 
 
+class TextRouter(Protocol):
+    """Text routing surface used by the live extraction worker."""
+
+    async def generate_text(self, request: TextRequest) -> RoutedResult: ...
+
+
+LegacyRouterFactory = Callable[[AttemptCallback], TextRouter]
+StatusRouterFactory = Callable[[AttemptStartCallback, AttemptCallback], TextRouter]
+
+
 class SingletonDrainLock(ExclusiveFileLock):
     """Cross-platform OS file lock; file contents are diagnostic only."""
 
@@ -75,14 +91,19 @@ class SingletonDrainLock(ExclusiveFileLock):
 
 
 class MemoryWorker:
-    """Claim and process jobs while preserving retry and attempt history."""
+    """Claim jobs while preserving retries and the selected status fidelity.
+
+    A direct router emits no provider phases. A legacy factory emits attempt-end
+    phases. A status factory emits both attempt-start and attempt-end phases.
+    """
 
     def __init__(
         self,
         queue: QueueRepository,
-        router: object | None = None,
+        router: TextRouter | None = None,
         *,
-        router_factory: Callable[[Callable[[ProviderResult], None]], object] | None = None,
+        router_factory: LegacyRouterFactory | None = None,
+        status_router_factory: StatusRouterFactory | None = None,
         daily_writer: Callable[[Job, str], object] = daily_writer_boundary,
         clock: Callable[[], datetime] = _utc_now,
         owner: str | None = None,
@@ -107,11 +128,16 @@ class MemoryWorker:
             raise ValueError("max_idle_sleep_seconds must be positive")
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
-        if (router is None) == (router_factory is None):
-            raise ValueError("provide exactly one of router or router_factory")
+        construction_modes = sum(
+            candidate is not None
+            for candidate in (router, router_factory, status_router_factory)
+        )
+        if construction_modes != 1:
+            raise ValueError("provide exactly one router construction mode")
         self.queue = queue
         self.router = router
         self.router_factory = router_factory
+        self.status_router_factory = status_router_factory
         self.daily_writer = daily_writer
         self.clock = clock
         self.owner = owner or str(uuid.uuid4())
@@ -210,9 +236,88 @@ class MemoryWorker:
         if inspect.isawaitable(outcome):
             await outcome
 
-    async def _record_attempt(self, job_id: int, attempt: ProviderResult) -> None:
+    def _append_status_event(
+        self,
+        job: Job,
+        phase: str,
+        *,
+        provider: ProviderName | None = None,
+        level: EventLevel = "info",
+        message: str | None = None,
+        details: dict[str, int] | None = None,
+    ) -> bool:
+        try:
+            self.queue.append_job_event(
+                job.id,
+                self.owner,
+                phase,
+                expected_attempt_count=job.attempt_count,
+                provider=provider,
+                level=level,
+                message=message,
+                details=details,
+            )
+        except LeaseOwnershipError as exc:
+            raise LeaseLostError("lease ownership was lost") from exc
+        except Exception:
+            # Informative events may be omitted when their isolated transaction
+            # fails. Queue complete/retry remains the authoritative terminal
+            # transition, so continuing cannot create two terminal outcomes.
+            LOGGER.exception("Failed to append %s status event", phase)
+            return False
+        return True
+
+    async def _provider_started(
+        self,
+        job: Job,
+        provider: ProviderName,
+        _model: str,
+        _task: TaskKind,
+    ) -> None:
         async with self._writer_lock:
-            self.queue.record_attempt(job_id, attempt)
+            self._append_status_event(
+                job,
+                f"{provider}_started",
+                provider=provider,
+            )
+
+    async def _provider_ended(self, job: Job, attempt: ProviderResult) -> None:
+        succeeded = attempt.outcome == "success"
+        phase = f"{attempt.provider}_{'succeeded' if succeeded else 'failed'}"
+        level = "info" if succeeded else (
+            "warning" if attempt.provider == "codex" else "error"
+        )
+        async with self._writer_lock:
+            try:
+                self._append_status_event(
+                    job,
+                    phase,
+                    provider=attempt.provider,
+                    level=level,
+                    message=None if succeeded else (attempt.reason or attempt.outcome),
+                    details={"elapsed_ms": max(0, attempt.elapsed_ms)},
+                )
+            except LeaseLostError:
+                self.queue.record_attempt(job.id, attempt)
+                raise
+            self.queue.record_attempt(job.id, attempt)
+
+    def _build_router(self, job: Job) -> TextRouter:
+        async def attempt_callback(attempt: ProviderResult) -> None:
+            await self._provider_ended(job, attempt)
+
+        if self.status_router_factory is not None:
+            async def start_callback(
+                provider: ProviderName, model: str, task: TaskKind
+            ) -> None:
+                await self._provider_started(job, provider, model, task)
+
+            return self.status_router_factory(start_callback, attempt_callback)
+        if self.router_factory is not None:
+            return self.router_factory(attempt_callback)
+        if self.router is None:  # Defensive: constructor validates this.
+            raise RuntimeError("worker router is unavailable")
+        return self.router
 
     async def _run_serialized_with_lease(
         self,
@@ -230,14 +335,24 @@ class MemoryWorker:
         job: Job,
         text: str,
         attempts: tuple[ProviderResult, ...],
+        *,
+        claude_fallback: bool,
     ) -> None:
         async def write_and_complete() -> None:
             self._require_lease(job.id)
             for attempt in attempts:
                 self.queue.record_attempt(job.id, attempt)
+            self._append_status_event(
+                job,
+                "daily_log_write_started",
+                details={"chars_saved": len(text)},
+            )
             await self._write(job, text)
             self._require_lease(job.id)
-            self.queue.complete(job.id, self.owner)
+            summary = f"Saved {len(text):,} characters"
+            if claude_fallback:
+                summary += " through Claude fallback"
+            self.queue.complete(job.id, self.owner, summary=summary)
 
         await self._run_serialized_with_lease(job.id, write_and_complete)
 
@@ -270,21 +385,29 @@ class MemoryWorker:
                 cwd=Path(job.cwd or ROOT),
                 timeout_seconds=self.provider_timeout_seconds,
             )
-            eagerly_persisted = self.router_factory is not None
-            if self.router_factory is not None:
-                router = self.router_factory(
-                    lambda attempt: self._record_attempt(job.id, attempt)
-                )
-            else:
-                router = self.router
-            result = await self._run_with_lease(job.id, router.generate_text(request))
+            eagerly_persisted = (
+                self.router_factory is not None
+                or self.status_router_factory is not None
+            )
+            router = self._build_router(job)
+            result = cast(
+                RoutedResult,
+                await self._run_with_lease(job.id, router.generate_text(request)),
+            )
             attempts = () if eagerly_persisted else result.attempts
             if result.outcome != "success":
                 await self._retry_failure(
                     job, self._failure_reason(result), attempts
                 )
                 return False
-            await self._complete_success(job, result.text, attempts)
+            await self._complete_success(
+                job,
+                result.text,
+                attempts,
+                claude_fallback=(
+                    result.provider == "claude" and result.fallback_reason is not None
+                ),
+            )
             return True
         except LeaseLostError:
             return False
@@ -380,8 +503,11 @@ def _default_worker() -> tuple[MemoryWorker, QueueRepository]:
     claude = ClaudeProvider(model=config.claude_model)
     worker = MemoryWorker(
         repository,
-        router_factory=lambda callback: ProviderRouter(
-            codex, claude, attempt_callback=callback
+        status_router_factory=lambda start_callback, callback: ProviderRouter(
+            codex,
+            claude,
+            attempt_start_callback=start_callback,
+            attempt_callback=callback,
         ),
         lock_path=config.root_dir / "scripts" / "memory-worker.lock",
         lease_seconds=config.job_timeout_seconds + 120,

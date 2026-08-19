@@ -329,16 +329,22 @@ llm-personal-kb/
 |   |-- compile.py                   #   Compile daily logs -> knowledge articles
 |   |-- connections.py               #   Cross-graph connection discovery
 |   |-- providers.py                 # Subscription providers and fallback router
+|   |-- privacy.py                   # Shared redaction and safe operational text
 |   |-- queue.py                     # SQLite jobs, leases, attempts, and retry
 |   |-- query.py                     #   Ask questions (index-guided, no RAG)
 |   |-- lint.py                      #   7 health checks
 |   |-- flush.py                     # Extraction prompt and daily-log writer
 |   |-- staging.py                   # Staged validation and atomic apply journal
+|   |-- status.py                    # Interactive dashboard and snapshot CLI
+|   |-- status_app.py                # Read-only Textual dashboard
+|   |-- status_health.py             # Bounded hook-log health projection
+|   |-- status_store.py              # Status schema, events, and read projections
 |   |-- transcripts.py               # Claude/Codex normalizers
 |   |-- usage.py                     # Provider-neutral usage JSONL
 |   |-- worker.py                    # Detached queue drain
 |   |-- config.py                    #   Path constants
 |   |-- utils.py                     #   Shared helpers
+|   |-- tests/                       # Queue, status, provider, and integration tests
 |-- hooks/                           # Claude Code and Codex adapters
 |   |-- codex-session-start.py       #   Injects shared local context into Codex
 |   |-- codex-session-end.py         #   Enqueues a Codex transcript slice
@@ -356,6 +362,7 @@ llm-personal-kb/
 Claude hook --\
                +--> transcript normalizer --> private spool --> SQLite queue
 Codex hook ----/                                           |
+                       read-only dashboard <---------------+
                                                             v
                                              singleton detached worker
                                                             |
@@ -367,6 +374,12 @@ Codex hook ----/                                           |
                                                             |
                                       daily/ + knowledge/ + log + marker + state
 ```
+
+SQLite remains the execution authority and also stores the dashboard's durable operational view. `status_runs` holds one summary per capture or automatic compile generation, while append-only `status_events` records phases such as queueing, worker claim, provider start and result, daily-log write, compile validation and apply, retry, and completion. Queue transitions and their matching authoritative status transitions share a transaction. Informative intermediate events are best effort and never prevent provider or writer work.
+
+`uv run python scripts/status.py` opens the read-only Textual dashboard; `--snapshot` prints the grouped summary once. Both modes read `scripts/jobs.sqlite3` without creating, migrating, repairing, retrying, or deleting work. They show Active, Needs Attention, Recent, a compile panel, and recent recognized hook failures. The interactive dashboard adds selectable run details and provider-attempt timelines, refreshes once per second, preserves selection by run ID, supports responsive layouts, and honors `NO_COLOR` and `--no-color`. Closing it has no effect on workers.
+
+Successful and acknowledged runs remain in the default Recent view for seven days. Unacknowledged failures remain in Needs Attention. Acknowledgment writes only the owner-private observer file at `scripts/status-state/status-view.json`; it never changes queue state. Status history remains in SQLite. Version 1 fully instruments live Claude/Codex capture and automatic end-of-day compile. The schema permits later operation types, but manual compile, query, connection, and lint commands do not yet promise live phase reporting.
 
 Capture, model execution, and durable writes are separate boundaries. Hooks perform bounded local work and return within the host timeout. Live capture uses one singleton worker process with bounded concurrent provider work; provider-attempt persistence, job completion/retry transitions, and daily writes serialize within that process. Historical import's explicit `--concurrency N` option separately bounds parallel transcript parsing and provider work. All durable knowledge-base mutations—daily appends, validated staged applies, markers, state, and usage bookkeeping—remain serialized by the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes use their own safety boundaries. Models never write directly to the real knowledge root.
 
@@ -427,7 +440,9 @@ Before provider execution, both parsers exclude developer instructions, hidden r
 
 Live-hook operational records append as compact JSON Lines in `scripts/logs/hooks.log`. Every record has `timestamp` (UTC ISO 8601), `level`, `component`, `event`, `logger`, and `message` fields. Message quotes, control characters, and newlines remain JSON-encoded inside one physical line; implicit exception tracebacks are excluded.
 
-Transcripts, stages, queue rows, usage logs, daily logs, and knowledge files remain stored locally, but model-backed operations transmit task inputs to the selected ChatGPT-authenticated Codex or Claude subscription provider. Extraction may send normalized transcript content. A text query sends a prompt containing the full index and every concept, connection, and Q&A article. Semantic lint sends a prompt containing the full index and all articles. Compile sends a prompt plus a staged copy of the schema, selected daily log, index, build log, every article, and compatible state when present; its broad current output allowlist covers all concept and connection articles, the index, and the build log. A filed answer receives the full knowledge base in its prompt and a stage containing every article; its output allowlist covers Q&A articles, the index, and the build log. A connection pass receives its prompt, schema, index, build log, and staged candidate and bridge concept articles; its output allowlist covers connection articles, the index, and the build log. The parser exclusions above still apply before extraction. Local structural lint sends no content to either provider. Logs retain job metadata and bounded errors, not transcript bodies or credentials. Codex cloud-only history cannot be imported unless Codex exposes a local transcript or hook event.
+Hooks also emit allowlisted, privacy-safe lifecycle and error events. The dashboard reads only a bounded, identity-checked tail of `hooks.log` and displays recent recognized errors as health alerts. A missing, unsafe, malformed, or unreadable hook log yields no alert and never blocks queue status. Failures before SQLite accepts a capture remain diagnosable in the structured hook log.
+
+Transcripts, stages, queue rows, usage logs, daily logs, and knowledge files remain stored locally, but model-backed operations transmit task inputs to the selected ChatGPT-authenticated Codex or Claude subscription provider. Extraction may send normalized transcript content. A text query sends a prompt containing the full index and every concept, connection, and Q&A article. Semantic lint sends a prompt containing the full index and all articles. Compile sends a prompt plus a staged copy of the schema, selected daily log, index, build log, every article, and compatible state when present; its broad current output allowlist covers all concept and connection articles, the index, and the build log. A filed answer receives the full knowledge base in its prompt and a stage containing every article; its output allowlist covers Q&A articles, the index, and the build log. A connection pass receives its prompt, schema, index, build log, and staged candidate and bridge concept articles; its output allowlist covers connection articles, the index, and the build log. The parser exclusions above still apply before extraction. Local structural lint sends no content to either provider. Logs and dashboard status retain operational metadata and bounded redacted errors, not transcript bodies, prompts, provider output, extracted knowledge, or credentials. Codex cloud-only history cannot be imported unless Codex exposes a local transcript or hook event.
 
 ## Provider Layer and Model Routing
 
@@ -448,11 +463,13 @@ Capacity and usage limits are subscription constraints, not dollar balances. The
 
 ## Queue, Leases, and Worker
 
-`scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs` plus `provider_attempts`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
+`scripts/jobs.sqlite3` uses SQLite WAL mode and contains `jobs`, `provider_attempts`, `status_runs`, and `status_events`. The job identity includes source agent, so equal Claude and Codex session IDs remain distinct; provider fallback stays an attempt on one job. Job states are `pending`, `leased`, `succeeded`, `failed`, and `dead`.
 
-Claims use short immediate transactions. A worker renews each lease while its provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one live worker process own the queue drain; a later worker exits successfully when another healthy worker owns it. Within the owner process, `AI_MEMORY_WORKER_CONCURRENCY` bounds concurrent provider jobs (default `2`), while attempt persistence, terminal queue transitions, and daily writes serialize. Historical import uses its separate `--concurrency N` bound for parallel parsing and provider work. Durable knowledge-base mutations still serialize through the writer lock. Queue/WAL, spool, temporary-stage, and operational-log writes retain their separate transaction, permission, atomic-file, and lock boundaries.
+Enqueue creates a capture run and `queued` event in the job transaction. Claim advances it to `worker_claimed`. The worker records Codex and Claude start/result events around calls, records `daily_log_write_started` before the writer boundary, and commits success, retry, or dead-letter status with the corresponding queue transition. Claims use short immediate transactions. A worker renews each lease while its provider or writer runs, recovers expired leases after a crash, retries transient failure with bounded exponential backoff and jitter, and marks a job dead after the attempt limit. Multiple hooks may start workers, but a singleton drain lock lets only one live worker process own the queue drain; a later worker exits successfully when another healthy worker owns it. Within the owner process, `AI_MEMORY_WORKER_CONCURRENCY` bounds concurrent provider jobs (default `2`), while attempt persistence, job completion/retry transitions, and daily writes serialize. Historical import uses its separate `--concurrency N` bound for parallel parsing and provider work. Durable knowledge-base mutations still serialize through the writer lock. Queue/WAL, spool, temporary-stage, observer-state, and operational-log writes retain their separate transaction, permission, atomic-file, and lock boundaries.
 
 The singleton live worker restores end-of-day compilation after a successful daily append. When its queue drain becomes idle at or after 16:00 local time, it fingerprints the content after today's last `@compiled-through` marker and records the complete marker sequence as a required prefix. The first immediate SQLite transaction provisions an owner and exactly one takeover watchdog, starts the watchdog first with three bounded local attempts, starts the owner, and then commits their identities. The genesis watchdog carries the log name, fingerprint, required marker prefix, owner token, and watchdog token. It waits for the scheduling transaction longer than the SQLite transaction bound. If that transaction commits, the watchdog joins its exact role. If owner startup or the transaction fails, the watchdog bootstraps an expired owner and its own live watcher role only when the queue remains idle and the current log still matches every scheduling input. Replacement watchdogs and `queue_wait`, `retry_wait`, or `read_wait` contenders use the same spawn-before-commit registration protocol. Every later successful idle drain replaces the pending fingerprint with its latest observation, and at most one contender polls the predecessor lease so it can take over after watchdog death without another post-expiry drain.
+
+An automatic compile reservation owns a compile status run. Scheduler waits, owner launch, provider generation, validation, apply, recovery, retry, and completion update that run without exposing watchdog token noise in the main list. Provider, validation, and apply boundaries emit their user-visible phases; owner and watchdog takeover becomes a recovery event only when it changes the visible outcome. Generation promotion carries the appropriate status-run identity forward with the reservation.
 
 The detached owner rechecks the fingerprint, required marker prefix, reservation, and absence of pending, failed, or leased jobs. It holds an immediate queue transaction across the `compile.py` launch. Queue work that commits before launch or appears during promotion expires the owner lease into `queue_wait` while preserving the fingerprint, marker prefix, and watchdog. The watchdog heartbeats through active queue work and resumes the generation when those jobs become terminal, even if they die and no later drain succeeds. It cannot treat visible marker progress as final while the owner lease or compiler lock remains live; it waits for both to clear and rereads the daily log. Daily reads carry an explicit `unreadable`, `covered`, or `uncompiled` state; unreadable never means covered and never deletes a request. After a child exits, zero succeeds only when the readable post-state's marker tuple strictly extends the required pre-launch prefix, including a covered marker-only result. Covered output with no new marker, marker replacement or truncation, unreadable state, zero without progress, and other unchanged failures preserve the required prefix, persist an error class, and retry after bounded 5-second exponential backoff, capped at three attempts. The generation handoff rereads the daily file inside its immediate transaction, so a same-log append after the first post-compile read is promoted instead of discarded. Changed uncompiled content with unchanged markers starts a fresh generation without inheriting the old attempt count, but it retains the required marker history until the log strictly extends it.
 
@@ -523,6 +540,8 @@ uv run python scripts/query.py "What's my error handling strategy?" --file-back
 uv run python scripts/lint.py
 uv run python scripts/lint.py --structural-only
 uv run python scripts/worker.py --drain
+uv run python scripts/status.py
+uv run python scripts/status.py --snapshot
 ```
 
 Historical discovery reads Claude sessions from `~/.claude/projects/` and Codex sessions from `~/.codex/sessions/**/*.jsonl`:
@@ -542,6 +561,8 @@ Dry run parses, filters, chunks, checks deduplication, and estimates tokens/task
 `scripts/state.json` still stores `ingested`, `query_count`, `last_lint`, and legacy `total_cost`. Existing per-entry `cost_usd` values and top-level `total_cost` round-trip unchanged. These fields record historical Claude-reported costs only; they do not represent total subscription usage.
 
 New queued operations use SQLite `provider_attempts` as their source of truth. `scripts/logs/usage.jsonl` is a recoverable, bounded projection for operations outside or inside the queue. It records Codex tokens when the CLI provides them and uses an unavailable value otherwise. It never invents `cost_usd` for Codex. Historical previews report advisory token and task estimates because ChatGPT plan limits vary.
+
+The private `scripts/status-state/status-view.json` file stores only observer acknowledgments. It is bounded, atomically replaced, owner-only, and safe to lose; deleting or corrupting it can make acknowledged failures visible again but cannot alter execution. The dashboard opens the queue read-only. A missing queue produces an empty first-run view without creating the database; unsafe or invalid existing data produces a diagnostic and is never repaired.
 
 Runtime queue, lock, journal, spool, stage, log, state, daily, knowledge, and report files created during tests or operations must never enter implementation commits.
 

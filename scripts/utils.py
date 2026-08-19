@@ -24,6 +24,16 @@ try:
 except ImportError:  # pragma: no cover - POSIX branch.
     msvcrt = None
 
+_PRIVATE_STATE_DIR_FD_SUPPORTED = bool(
+    os.name != "nt"
+    and getattr(os, "O_NOFOLLOW", 0)
+    and getattr(os, "O_DIRECTORY", 0)
+    and hasattr(os, "fchmod")
+    and os.open in getattr(os, "supports_dir_fd", set())
+    and os.stat in getattr(os, "supports_dir_fd", set())
+    and os.unlink in getattr(os, "supports_dir_fd", set())
+)
+
 if __package__:
     from .config import (
         CONCEPTS_DIR,
@@ -110,6 +120,590 @@ def _fsync_directory(path: Path | str) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _validate_private_regular_file(info: os.stat_result, path: Path) -> None:
+    """Validate an owner-only state file without following links."""
+    if _link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if info.st_nlink != 1:
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"state path must be a private regular file: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError(f"state path must be a private regular file: {path}")
+
+
+def _canonicalize_secure_path(path: Path | str) -> Path:
+    """Resolve ancestor aliases while preserving the immediate parent and target."""
+    lexical = Path(os.path.abspath(Path(path).expanduser()))
+    parent = lexical.parent
+    canonical_ancestor = parent.parent.resolve(strict=False)
+    return canonical_ancestor / parent.name / lexical.name
+
+
+def read_private_bounded_file(path: Path | str, *, max_bytes: int) -> bytes | None:
+    """Read a small owner-only regular file, retaining its verified descriptor."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    target = _canonicalize_secure_path(path)
+    if _PRIVATE_STATE_DIR_FD_SUPPORTED:
+        return _read_private_bounded_file_posix(target, max_bytes=max_bytes)
+    return _read_private_bounded_file_fallback(target, max_bytes=max_bytes)
+
+
+def _read_private_bounded_file_posix(
+    target: Path,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    parent = target.parent
+    try:
+        parent_before = _inspect_private_state_parent(parent)
+    except FileNotFoundError:
+        return None
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(parent, directory_flags)
+    descriptor = -1
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = parent.lstat()
+        _validate_private_state_directory(parent_opened, parent)
+        _validate_private_state_directory(parent_after, parent)
+        if not _same_file_identity(parent_before, parent_opened) or (
+            parent_opened.st_dev,
+            parent_opened.st_ino,
+        ) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError(f"state directory identity changed: {parent}")
+        before = _relative_stat(parent_descriptor, target.name)
+        if before is None:
+            return None
+        _validate_private_regular_file(before, target)
+        if before.st_size > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(target.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if not _same_file_identity(before, opened):
+            raise ValueError(f"state path identity changed while opening: {target}")
+        if opened.st_size > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        visible = _relative_stat(parent_descriptor, target.name)
+        if visible is None:
+            raise ValueError(f"state path identity changed while reading: {target}")
+        _validate_private_regular_file(visible, target)
+        if not _same_file_identity(opened, visible):
+            raise ValueError(f"state path identity changed while reading: {target}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        return data
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _read_private_bounded_file_fallback(
+    target: Path,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    try:
+        _inspect_private_state_parent(target.parent)
+        before = target.lstat()
+    except FileNotFoundError:
+        return None
+    _validate_private_regular_file(before, target)
+    if before.st_size > max_bytes:
+        raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise ValueError(f"state path must be a private regular file: {target}") from error
+    try:
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if not _same_file_identity(before, opened):
+            raise ValueError(f"state path identity changed while opening: {target}")
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
+        visible = target.lstat()
+        _validate_private_regular_file(visible, target)
+        if not _same_file_identity(opened, visible):
+            raise ValueError(f"state path identity changed while reading: {target}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _validate_private_state_directory(info: os.stat_result, path: Path) -> None:
+    if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"state directory must be a real directory: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"state directory has an unsafe owner: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"state directory has unsafe permissions: {path}")
+
+
+def _validate_no_linked_ancestors(path: Path) -> None:
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if _link_or_reparse(info):
+                raise ValueError(f"state path has a linked ancestor: {current}")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def _prepare_private_state_parent(parent: Path) -> os.stat_result:
+    _validate_no_linked_ancestors(parent)
+    created = False
+    try:
+        info = parent.lstat()
+    except FileNotFoundError:
+        try:
+            parent.mkdir(parents=True, mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        _validate_no_linked_ancestors(parent)
+        info = parent.lstat()
+    _validate_private_state_directory(info, parent)
+    if _windows_acl_required():
+        if created:
+            _secure_windows_runtime_directory(parent, owner_only=True)
+        _validate_windows_owner_only_directory(parent)
+    return info
+
+
+def _inspect_private_state_parent(parent: Path) -> os.stat_result:
+    _validate_no_linked_ancestors(parent)
+    info = parent.lstat()
+    _validate_private_state_directory(info, parent)
+    if _windows_acl_required():
+        _validate_windows_owner_only_directory(parent)
+    return info
+
+
+def _relative_stat(directory_descriptor: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+@dataclass(frozen=True)
+class SecureReadIdentity:
+    """Pinned identity for a private regular file opened without following links."""
+
+    path: Path
+    device: int
+    inode: int
+    size: int
+
+
+def _validate_secure_read_directory(info: os.stat_result, path: Path) -> None:
+    if _link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"secure read parent is unsafe: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"secure read parent is unsafe: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"secure read parent is unsafe: {path}")
+
+
+def _validate_windows_inherited_directory(path: Path) -> None:
+    _secure_windows_runtime_directory(path, owner_only=False)
+
+
+def inspect_secure_read_file(path: Path | str) -> SecureReadIdentity:
+    """Validate and identity-pin a private file for a later read-only consumer."""
+    target = _canonicalize_secure_path(path)
+    parent = target.parent
+    _validate_no_linked_ancestors(parent)
+    parent_before = parent.lstat()
+    _validate_secure_read_directory(parent_before, parent)
+    if _windows_acl_required():
+        _validate_windows_inherited_directory(parent)
+
+    if _PRIVATE_STATE_DIR_FD_SUPPORTED:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        descriptor = -1
+        try:
+            parent_opened = os.fstat(parent_descriptor)
+            parent_after = parent.lstat()
+            _validate_secure_read_directory(parent_opened, parent)
+            _validate_secure_read_directory(parent_after, parent)
+            if not _same_file_identity(parent_before, parent_opened) or not (
+                _same_file_identity(parent_opened, parent_after)
+            ):
+                raise ValueError(f"secure read parent identity changed: {parent}")
+            before = _relative_stat(parent_descriptor, target.name)
+            if before is None:
+                raise FileNotFoundError(target)
+            _validate_private_regular_file(before, target)
+            descriptor = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            _validate_private_regular_file(opened, target)
+            visible = _relative_stat(parent_descriptor, target.name)
+            if (
+                visible is None
+                or not _same_file_identity(before, opened)
+                or not _same_file_identity(opened, visible)
+            ):
+                raise ValueError(f"secure read file identity changed: {target}")
+            return SecureReadIdentity(
+                path=target,
+                device=opened.st_dev,
+                inode=opened.st_ino,
+                size=opened.st_size,
+            )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+    before = target.lstat()
+    _validate_private_regular_file(before, target)
+    descriptor = os.open(
+        target,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _validate_private_regular_file(opened, target)
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
+        visible = target.lstat()
+        if not _same_file_identity(before, opened) or not _same_file_identity(
+            opened, visible
+        ):
+            raise ValueError(f"secure read file identity changed: {target}")
+        return SecureReadIdentity(
+            path=target,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            size=opened.st_size,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _write_private_temp_posix(
+    parent_descriptor: int,
+    target: Path,
+    data: bytes,
+) -> tuple[str, int, os.stat_result]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    temporary_descriptor = -1
+    temporary_name = ""
+    try:
+        for _attempt in range(100):
+            temporary_name = f".{target.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:  # pragma: no cover - collision probability is negligible.
+            raise FileExistsError("could not allocate private state temporary file")
+        os.fchmod(temporary_descriptor, 0o600)
+        with os.fdopen(temporary_descriptor, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_opened = os.fstat(temporary_descriptor)
+        temporary_visible = _relative_stat(parent_descriptor, temporary_name)
+        if temporary_visible is None:
+            raise ValueError("state temporary identity changed before replacement")
+        _validate_private_regular_file(temporary_opened, target.parent / temporary_name)
+        _validate_private_regular_file(temporary_visible, target.parent / temporary_name)
+        if not _same_file_identity(temporary_opened, temporary_visible):
+            raise ValueError("state temporary identity changed before replacement")
+        return temporary_name, temporary_descriptor, temporary_opened
+    except BaseException:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        raise
+
+
+def _restore_private_state_posix(
+    parent_descriptor: int,
+    target: Path,
+    prior_bytes: bytes | None,
+) -> None:
+    if prior_bytes is None:
+        try:
+            os.unlink(target.name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        os.fsync(parent_descriptor)
+        return
+    restore_name = ""
+    restore_descriptor = -1
+    try:
+        restore_name, restore_descriptor, restore_info = _write_private_temp_posix(
+            parent_descriptor,
+            target,
+            prior_bytes,
+        )
+        os.replace(
+            restore_name,
+            target.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        restore_name = ""
+        restored = _relative_stat(parent_descriptor, target.name)
+        if restored is None or (
+            restored.st_dev,
+            restored.st_ino,
+        ) != (restore_info.st_dev, restore_info.st_ino):
+            raise ValueError("state restoration identity changed after replacement")
+        os.fsync(parent_descriptor)
+    finally:
+        if restore_name:
+            try:
+                os.unlink(restore_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if restore_descriptor >= 0:
+            os.close(restore_descriptor)
+
+
+def _atomic_write_private_file_posix(
+    target: Path,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
+    parent = target.parent
+    parent_before = _prepare_private_state_parent(parent)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(parent, directory_flags)
+    temporary_descriptor = -1
+    temporary_name = ""
+    prior_descriptor = -1
+    prior_bytes: bytes | None = None
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = parent.lstat()
+        _validate_private_state_directory(parent_opened, parent)
+        _validate_private_state_directory(parent_after, parent)
+        if not _same_file_identity(parent_before, parent_opened) or (
+            parent_opened.st_dev,
+            parent_opened.st_ino,
+        ) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError(f"state directory identity changed: {parent}")
+
+        target_before = _relative_stat(parent_descriptor, target.name)
+        if target_before is not None:
+            _validate_private_regular_file(target_before, target)
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            prior_descriptor = os.open(
+                target.name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+            prior_opened = os.fstat(prior_descriptor)
+            _validate_private_regular_file(prior_opened, target)
+            if not _same_file_identity(target_before, prior_opened):
+                raise ValueError("state destination identity changed while opening")
+            with os.fdopen(prior_descriptor, "rb", closefd=False) as stream:
+                prior_bytes = stream.read(max_bytes + 1)
+            if len(prior_bytes) > max_bytes:
+                raise ValueError(f"state path exceeds {max_bytes} bytes: {target}")
+
+        temporary_name, temporary_descriptor, temporary_opened = (
+            _write_private_temp_posix(parent_descriptor, target, data)
+        )
+
+        target_current = _relative_stat(parent_descriptor, target.name)
+        if target_before is None:
+            if target_current is not None:
+                raise ValueError("state destination identity changed before replacement")
+        elif target_current is None or not _same_file_identity(
+            target_before, target_current
+        ):
+            raise ValueError("state destination identity changed before replacement")
+
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        destination = _relative_stat(parent_descriptor, target.name)
+        if destination is None or not _same_file_identity(
+            temporary_opened, destination
+        ):
+            _restore_private_state_posix(parent_descriptor, target, prior_bytes)
+            raise ValueError("state destination identity changed after replacement")
+        temporary_name = ""
+        os.fsync(parent_descriptor)
+    finally:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if prior_descriptor >= 0:
+            os.close(prior_descriptor)
+        os.close(parent_descriptor)
+
+
+def _restore_private_state_fallback(target: Path, prior_bytes: bytes | None) -> None:
+    if prior_bytes is None:
+        target.unlink(missing_ok=True)
+        _fsync_directory(target.parent)
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".restore.tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, temporary)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(prior_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        opened = os.fstat(descriptor)
+        visible = temporary.lstat()
+        _validate_private_regular_file(opened, temporary)
+        _validate_private_regular_file(visible, temporary)
+        if not _same_file_identity(opened, visible):
+            raise ValueError("state restoration identity changed before replacement")
+        os.replace(temporary, target)
+        restored = target.lstat()
+        if (restored.st_dev, restored.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("state restoration identity changed after replacement")
+        if _windows_acl_required():
+            _validate_windows_owner_only_file_descriptor(descriptor, target)
+        _fsync_directory(target.parent)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_private_file_fallback(
+    target: Path,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
+    parent = target.parent
+    parent_before = _prepare_private_state_parent(parent)
+    target_before = target.lstat() if target.exists() or target.is_symlink() else None
+    prior_bytes: bytes | None = None
+    if target_before is not None:
+        _validate_private_regular_file(target_before, target)
+        prior_bytes = _read_private_bounded_file_fallback(
+            target,
+            max_bytes=max_bytes,
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, temporary)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_opened = os.fstat(descriptor)
+        temporary_visible = temporary.lstat()
+        _validate_private_regular_file(temporary_opened, temporary)
+        _validate_private_regular_file(temporary_visible, temporary)
+        parent_after = parent.lstat()
+        _validate_private_state_directory(parent_after, parent)
+        if not _same_file_identity(parent_before, parent_after):
+            raise ValueError(f"state directory identity changed: {parent}")
+        if not _same_file_identity(temporary_opened, temporary_visible):
+            raise ValueError("state temporary identity changed before replacement")
+        target_current = target.lstat() if target.exists() or target.is_symlink() else None
+        if target_before is None:
+            if target_current is not None:
+                raise ValueError("state destination identity changed before replacement")
+        elif target_current is None or not _same_file_identity(
+            target_before, target_current
+        ):
+            raise ValueError("state destination identity changed before replacement")
+        os.replace(temporary, target)
+        destination = target.lstat()
+        try:
+            if not _same_file_identity(temporary_opened, destination):
+                raise ValueError("state destination identity changed after replacement")
+            if _windows_acl_required():
+                _validate_windows_owner_only_file_descriptor(descriptor, target)
+        except BaseException:
+            _restore_private_state_fallback(target, prior_bytes)
+            raise
+        _fsync_directory(parent)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_private_file(
+    path: Path | str,
+    data: bytes,
+    *,
+    max_bytes: int,
+) -> None:
+    """Fsync and atomically replace one bounded owner-only state file."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    if len(data) > max_bytes:
+        raise ValueError(f"state payload exceeds {max_bytes} bytes")
+    target = _canonicalize_secure_path(path)
+    if _PRIVATE_STATE_DIR_FD_SUPPORTED:
+        _atomic_write_private_file_posix(target, data, max_bytes=max_bytes)
+    else:  # pragma: no cover - exercised on descriptor-limited platforms.
+        _atomic_write_private_file_fallback(target, data, max_bytes=max_bytes)
 
 
 def _validate_log_directory(info: os.stat_result, path: Path) -> None:
@@ -277,6 +871,100 @@ def _open_runtime_directory_nofollow(path: Path) -> int | None:
 
 def _windows_acl_required() -> bool:
     return os.name == "nt"
+
+
+def _validate_windows_owner_only_directory(path: Path) -> None:
+    try:
+        from scripts.windows_acl import _active_api
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import _active_api
+
+    api = _active_api(None)
+    try:
+        handle = api.open_directory(path)
+    except Exception as error:
+        raise PermissionError(f"could not open Windows state directory: {path}") from error
+    try:
+        if api.is_reparse(handle):
+            raise PermissionError(f"Windows state directory is a reparse point: {path}")
+        identity = api.identity(handle)
+        try:
+            state = api.inspect(handle)
+        except Exception as error:
+            raise PermissionError(
+                f"could not inspect Windows state directory ACL: {path}"
+            ) from error
+        if not state.is_owner_only:
+            raise PermissionError(
+                f"Windows state directory ACL is not owner-only: {path}"
+            )
+        try:
+            observed = api.open_directory(path)
+        except Exception as error:
+            raise PermissionError(
+                f"could not reopen Windows state directory: {path}"
+            ) from error
+        try:
+            if api.is_reparse(observed) or api.identity(observed) != identity:
+                raise PermissionError(
+                    f"Windows state directory identity changed: {path}"
+                )
+            if not api.inspect(observed).is_owner_only:
+                raise PermissionError(
+                    f"Windows state directory ACL is not owner-only: {path}"
+                )
+        finally:
+            api.close(observed)
+    finally:
+        api.close(handle)
+
+
+def _validate_windows_owner_only_file_descriptor(descriptor: int, path: Path) -> None:
+    try:
+        from scripts.windows_acl import _FILE_SECURITY_ACCESS, _active_api
+    except ModuleNotFoundError:  # Standalone imports from inside scripts/.
+        from windows_acl import _FILE_SECURITY_ACCESS, _active_api
+
+    if msvcrt is None:
+        raise PermissionError("Windows file-handle API is unavailable")
+    api = _active_api(None)
+    try:
+        borrowed = msvcrt.get_osfhandle(descriptor)
+        identity = api.identity(borrowed)
+    except Exception as error:
+        raise PermissionError(
+            f"could not inspect retained Windows state file: {path}"
+        ) from error
+    try:
+        handle = api.open_file(path, access=_FILE_SECURITY_ACCESS)
+    except Exception as error:
+        raise PermissionError(f"could not open Windows state file: {path}") from error
+    try:
+        if api.is_reparse(handle) or api.identity(handle) != identity:
+            raise PermissionError(f"Windows state file identity changed: {path}")
+        try:
+            state = api.inspect(handle)
+        except Exception as error:
+            raise PermissionError(
+                f"could not inspect Windows state file ACL: {path}"
+            ) from error
+        if not state.is_owner_only:
+            raise PermissionError(f"Windows state file ACL is not owner-only: {path}")
+        try:
+            observed = api.open_file(path, access=_FILE_SECURITY_ACCESS)
+        except Exception as error:
+            raise PermissionError(f"could not reopen Windows state file: {path}") from error
+        try:
+            if api.is_reparse(observed) or api.identity(observed) != identity:
+                raise PermissionError(f"Windows state file identity changed: {path}")
+            if not api.inspect(observed).is_owner_only:
+                raise PermissionError(
+                    f"Windows state file ACL is not owner-only: {path}"
+                )
+        finally:
+            api.close(observed)
+    finally:
+        api.close(handle)
 
 
 def _secure_windows_runtime_directory(path: Path, *, owner_only: bool) -> None:
@@ -752,6 +1440,24 @@ class ExclusiveFileLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+@contextmanager
+def secure_private_state_lock(state_path: Path | str) -> Iterator[None]:
+    """Serialize one private-state mutation inside its secured directory."""
+    target = _canonicalize_secure_path(state_path)
+    _prepare_private_state_parent(target.parent)
+    lock_path = target.parent / ".status-view.lock"
+    lock = ExclusiveFileLock(lock_path)
+    with lock:
+        descriptor = lock._descriptor
+        if descriptor is None:  # pragma: no cover - guarded by context manager.
+            raise RuntimeError("private state lock has no retained descriptor")
+        _validate_private_regular_file(os.fstat(descriptor), lock_path)
+        if _windows_acl_required():
+            _secure_windows_runtime_file(descriptor, lock_path)
+            _validate_windows_owner_only_file_descriptor(descriptor, lock_path)
+        yield
 
 
 def append_daily_entry(

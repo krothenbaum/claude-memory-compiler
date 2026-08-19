@@ -37,10 +37,14 @@ from utils import (
     list_raw_files,
     list_wiki_articles,
     load_state_with_baseline,
-    notify_terminal,
     read_text_with_baseline,
 )
 from usage import record_routed_usage, routed_invalid_output
+
+try:
+    from scripts.queue import QueueRepository
+except ImportError:  # Direct execution with scripts/ on sys.path.
+    from queue import QueueRepository  # type: ignore[attr-defined]
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_FILE = Path(__file__).resolve().parent / "compile.log"
@@ -83,6 +87,45 @@ def _config(home: Path):
     environment["AI_MEMORY_HOME"] = str(home)
     environment.pop("CLAUDE_MEMORY_HOME", None)
     return load_config(environment)
+
+
+def _automatic_status_run_id(
+    environment: dict[str, str] | None = None,
+) -> int | None:
+    env = os.environ if environment is None else environment
+    if env.get("AI_MEMORY_AUTO_COMPILE") != "1":
+        return None
+    raw = env.get("AI_MEMORY_STATUS_RUN_ID")
+    try:
+        run_id = int(raw) if raw is not None else 0
+    except ValueError:
+        return None
+    return run_id if run_id > 0 and str(run_id) == raw else None
+
+
+def _record_automatic_phase(
+    home: Path,
+    run_id: int | None,
+    phase: str,
+    *,
+    details: dict[str, int] | None = None,
+) -> bool:
+    if run_id is None:
+        return False
+    try:
+        config = _config(home)
+        with QueueRepository(
+            config.queue_path, memory_home=home, sync_usage=False
+        ) as repository:
+            return repository.record_active_auto_compile_phase(
+                run_id, phase, details=details
+            )
+    except Exception:  # noqa: BLE001 - observability must never block compilation.
+        try:
+            logger.warning("automatic compile status phase unavailable: %s", phase)
+        except Exception:  # noqa: BLE001,S110 - diagnostics are best-effort.
+            pass
+        return False
 
 
 def _article_paths(home: Path) -> tuple[str, ...]:
@@ -228,6 +271,8 @@ async def compile_daily_log(
         mode_description=mode,
         timestamp=timestamp,
     )
+    status_run_id = _automatic_status_run_id()
+    _record_automatic_phase(home, status_run_id, "staging_started")
     stage = create_stage(
         home,
         f"compile-{log_path.stem}",
@@ -271,7 +316,6 @@ async def compile_daily_log(
         config.job_timeout_seconds,
         allowed_paths=allowed,
     )
-    notify_terminal(f"compile started — {log_path.name}")
     usage_recorded = False
 
     def record_usage(result) -> None:
@@ -285,6 +329,7 @@ async def compile_daily_log(
         usage_recorded = True
 
     try:
+        _record_automatic_phase(home, status_run_id, "provider_started")
         result = await provider_router.edit_workspace(request)
         if result.outcome != "success":
             record_usage(result)
@@ -294,6 +339,7 @@ async def compile_daily_log(
             return 0.0
         selected = fallback_holder[-1] if result.provider == "claude" and fallback_holder else stage
         try:
+            _record_automatic_phase(home, status_run_id, "validation_started")
             validated = validate_stage(selected, allowed_paths=allowed, task=TaskKind.COMPILE)
         except StageValidationError as validation_error:
             if result.provider != "codex" or (router is not None and router_factory is None):
@@ -311,6 +357,7 @@ async def compile_daily_log(
                 return 0.0
             selected = fallback_holder[-1]
             try:
+                _record_automatic_phase(home, status_run_id, "validation_started")
                 validated = validate_stage(
                     selected, allowed_paths=allowed, task=TaskKind.COMPILE
                 )
@@ -318,13 +365,12 @@ async def compile_daily_log(
                 result = routed_invalid_output(result, fallback_validation_error)
                 raise
         record_usage(result)
-    except Exception as exc:
+    except Exception:
         record_usage(locals().get("result"))
         logger.exception("compile provider failed for %s", log_path.name)
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():
                 discard_stage(candidate)
-        notify_terminal(f"compile failed — {log_path.name}: {exc}")
         return 0.0
 
     prior = state.setdefault("ingested", {}).get(log_path.name, {})
@@ -341,16 +387,20 @@ async def compile_daily_log(
         state_baseline=state_baseline,
     )
     try:
+        _record_automatic_phase(
+            home,
+            status_run_id,
+            "apply_started",
+            details={"changed_files": len(validated.changed_paths)},
+        )
         apply_validated_stage(validated, validated.before, bookkeeping)
     except RetryableApplyError as exc:
         logger.warning("compile apply deferred for %s: %s", log_path.name, exc)
-        notify_terminal(f"compile deferred — {log_path.name}: concurrent change")
         return 0.0
     finally:
         for candidate in [*fallback_holder, stage]:
             if candidate.root.exists():
                 discard_stage(candidate)
-    notify_terminal(f"compile complete — {log_path.name}")
     return 0.0
 
 

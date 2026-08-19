@@ -2,26 +2,46 @@
 
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import logging
 import os
-from pathlib import Path
+import secrets
 import sys
 import time
-from typing import Callable
-
+from collections.abc import Callable
+from pathlib import Path
 
 if os.environ.get("AI_MEMORY_INTERNAL_JOB") == "1" or "CLAUDE_INVOKED_BY" in os.environ:
     sys.exit(0)
+
+_raw_queue_override = os.environ.get("AI_MEMORY_QUEUE_PATH")
+_INVALID_QUEUE_OVERRIDE = False
+if "AI_MEMORY_QUEUE_PATH" in os.environ:
+    try:
+        _INVALID_QUEUE_OVERRIDE = (
+            not isinstance(_raw_queue_override, str)
+            or not _raw_queue_override.strip()
+            or not Path(_raw_queue_override).expanduser().is_absolute()
+        )
+    except (OSError, RuntimeError, ValueError):
+        _INVALID_QUEUE_OVERRIDE = True
+if _INVALID_QUEUE_OVERRIDE:
+    os.environ.pop("AI_MEMORY_QUEUE_PATH", None)
+del _raw_queue_override
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.hook_logging import (
+    classify_capture_error,
+    classify_transcript_path,
+    configure_hook_logger,
+    diagnostic_project,
+    log_hook_event,
+)
 from scripts.transcripts import parse_codex_transcript
-from scripts.hook_logging import configure_hook_logger
-
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
@@ -51,24 +71,134 @@ def _logger() -> logging.Logger:
     )
 
 
+def _record_diagnostic(
+    *,
+    event: str,
+    session_id: object,
+    project: object,
+    message: str,
+    occurrence_id: str,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    try:
+        helpers = _live_capture_helpers()
+        return helpers.persist_hook_diagnostic_with_deadline(
+            _runtime_root(),
+            event=event,
+            source_agent="codex",
+            session_id=session_id,
+            project=project,
+            message=message,
+            occurrence_id=occurrence_id,
+            deadline=deadline,
+            clock=clock,
+        )
+    except Exception:
+        return False
+
+
 def main(clock: Callable[[], float] = time.monotonic) -> None:
     deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
+    if _INVALID_QUEUE_OVERRIDE:
+        try:
+            invalid_input = json.loads(sys.stdin.read())
+            session_id = (
+                invalid_input.get("session_id")
+                if isinstance(invalid_input, dict)
+                else None
+            )
+        except (json.JSONDecodeError, ValueError, EOFError):
+            session_id = None
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "queue_unavailable",
+            "configured queue path is invalid",
+            source_agent="codex",
+            session_id=session_id,
+        )
+        return
     try:
         value = json.loads(sys.stdin.read())
         if not isinstance(value, dict):
             raise ValueError("hook input must be a JSON object")
-    except (json.JSONDecodeError, ValueError, EOFError) as error:
-        logger.error("failed to parse hook input: %s", error)
+    except (json.JSONDecodeError, ValueError, EOFError):
+        occurrence_id = secrets.token_hex(16)
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "malformed_input",
+            "failed to parse hook input",
+            source_agent="codex",
+            occurrence_id=occurrence_id,
+        )
+        _record_diagnostic(
+            event="malformed_input",
+            session_id="unknown",
+            project="unknown",
+            message="failed to parse hook input",
+            occurrence_id=occurrence_id,
+            deadline=deadline,
+            clock=clock,
+        )
         return
+
+    project = diagnostic_project(value)
 
     transcript_value = value.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
-        logger.info("skip: no transcript path")
+        occurrence_id = secrets.token_hex(16)
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            "transcript_missing",
+            "hook input did not include a transcript",
+            source_agent="codex",
+            session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
+        )
+        _record_diagnostic(
+            event="transcript_missing",
+            session_id=value.get("session_id"),
+            project=project,
+            message="hook input did not include a transcript",
+            occurrence_id=occurrence_id,
+            deadline=deadline,
+            clock=clock,
+        )
         return
     transcript_path = Path(transcript_value).expanduser()
-    if not transcript_path.is_file():
-        logger.info("skip: transcript missing")
+    transcript_event = classify_transcript_path(transcript_path)
+    if transcript_event is not None:
+        occurrence_id = secrets.token_hex(16)
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            transcript_event,
+            (
+                "transcript is missing"
+                if transcript_event == "transcript_missing"
+                else "transcript is unreadable"
+            ),
+            source_agent="codex",
+            session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
+        )
+        _record_diagnostic(
+            event=transcript_event,
+            session_id=value.get("session_id"),
+            project=project,
+            message=(
+                "transcript is missing"
+                if transcript_event == "transcript_missing"
+                else "transcript is unreadable"
+            ),
+            occurrence_id=occurrence_id,
+            deadline=deadline,
+            clock=clock,
+        )
         return
 
     try:
@@ -97,6 +227,12 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             clock=clock,
         ) as selected:
             live_slice, preview = selected
+            project = diagnostic_project(
+                {
+                    "project": getattr(preview, "project", None),
+                    "cwd": value.get("cwd"),
+                }
+            )
             if not preview.turns:
                 logger.info("skip: empty normalized transcript")
                 return
@@ -113,9 +249,41 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
                 deadline=deadline,
                 clock=clock,
             )
-        logger.info("capture %s for session %s", outcome.get("status"), outcome.get("job_id"))
+        log_hook_event(
+            logger,
+            logging.INFO,
+            "capture_succeeded",
+            f"capture {outcome.get('status')}",
+            source_agent="codex",
+            session_id=value.get("session_id"),
+        )
     except Exception as error:
-        logger.error("capture failed: %s", error)
+        event = classify_capture_error(error)
+        occurrence_id = secrets.token_hex(16) if event == "capture_failed" else None
+        log_hook_event(
+            logger,
+            logging.ERROR,
+            event,
+            (
+                "queue unavailable during capture"
+                if event == "queue_unavailable"
+                else "capture failed"
+            ),
+            source_agent="codex",
+            session_id=value.get("session_id"),
+            occurrence_id=occurrence_id,
+        )
+        if event == "capture_failed":
+            assert occurrence_id is not None
+            _record_diagnostic(
+                event=event,
+                session_id=value.get("session_id"),
+                project=project,
+                message="capture failed",
+                occurrence_id=occurrence_id,
+                deadline=deadline,
+                clock=clock,
+            )
 
 
 if __name__ == "__main__":

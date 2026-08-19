@@ -1,6 +1,8 @@
 """Windows ACL policy tests that run without a Windows host."""
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,6 +110,37 @@ def test_private_slice_acl_uses_second_write_dac_security_handle(tmp_path):
         access & required_access == required_access
         for access in api.file_accesses
     )
+    assert api.protected == [("security", False)]
+    assert api.closed == ["security", "security"]
+
+
+def test_queue_acl_helper_secures_through_existing_windows_api(
+    tmp_path, monkeypatch
+):
+    from scripts import queue as queue_module
+    from scripts import windows_acl
+
+    path = tmp_path / "jobs.sqlite3"
+    path.write_bytes(b"queue")
+    path.chmod(0o600)
+    api = FakeHandleApi(
+        {
+            "security": [
+                _state(),
+                _state(protected=True, ace_count=1, inherited=0, only=True),
+            ]
+        },
+        identities={"borrowed": (1, 10), "security": (1, 10)},
+    )
+    monkeypatch.setattr(windows_acl, "_active_api", lambda _api: api)
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(get_osfhandle=lambda _descriptor: "borrowed"),
+    )
+
+    queue_module._secure_windows_queue_file(path)
+
     assert api.protected == [("security", False)]
     assert api.closed == ["security", "security"]
 

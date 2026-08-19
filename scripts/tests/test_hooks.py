@@ -62,6 +62,19 @@ def _hook_log_records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in lines]
 
 
+def _assert_diagnostic_only(memory_home: Path, *, count: int = 1) -> None:
+    connection = sqlite3.connect(memory_home / "scripts" / "jobs.sqlite3")
+    try:
+        assert connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM status_runs").fetchone()[0] == count
+        assert connection.execute("SELECT count(*) FROM status_events").fetchone()[0] == count
+        assert connection.execute(
+            "SELECT count(*) FROM status_runs WHERE state = 'failed' AND phase = 'failed'"
+        ).fetchone()[0] == count
+    finally:
+        connection.close()
+
+
 def _tree_manifest(root: Path) -> dict[str, tuple[str, int, int, bytes | str | None]]:
     manifest: dict[str, tuple[str, int, int, bytes | str | None]] = {}
     for path in (root, *sorted(root.rglob("*"))):
@@ -350,7 +363,17 @@ def test_missing_transcript_fails_closed_without_blocking_host(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         assert elapsed < 3
-    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    database = memory_home / "scripts" / "jobs.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM status_runs").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM status_events").fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT count(*) FROM status_runs WHERE state = 'failed' AND phase = 'failed'"
+        ).fetchone()[0] == 3
+    finally:
+        connection.close()
     assert not (memory_home / "scripts" / "spool").exists()
 
 
@@ -476,7 +499,7 @@ def test_oversized_final_jsonl_record_fails_closed_without_partial_job(tmp_path)
 
     assert result.returncode == 0
     assert elapsed < 3
-    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    _assert_diagnostic_only(memory_home)
     assert not (memory_home / "scripts" / "spool").exists()
     assert list(hook_tmp.iterdir()) == []
 
@@ -504,7 +527,7 @@ def test_oversized_record_before_valid_signal_fails_closed_without_deadline_spin
 
     assert result.returncode == 0
     assert elapsed < 1.0
-    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    _assert_diagnostic_only(memory_home)
     assert not (memory_home / "scripts" / "spool").exists()
 
 
@@ -2288,7 +2311,7 @@ def test_malformed_retained_record_fails_closed_without_artifacts(
 
     assert result.returncode == 0
     assert elapsed < 3
-    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+    _assert_diagnostic_only(memory_home)
     assert not (memory_home / "scripts" / "spool").exists()
     assert list(hook_tmp.iterdir()) == []
 

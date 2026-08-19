@@ -9,13 +9,35 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 import sysconfig
-from typing import Callable, Literal, Mapping, TypeAlias
+from typing import Callable, Literal, Mapping, TypeAlias, cast
 
 try:
+    from .privacy import normalize_persistence_reason
     from .providers import ProviderResult
+    from .status_store import (
+        ALLOWED_PHASES,
+        EventLevel,
+        JsonScalar,
+        ProviderName,
+        RunKind,
+        RunState,
+        SourceAgent,
+        StatusEvent,
+        StatusRun,
+        append_event_unlocked,
+        create_job_run_unlocked,
+        create_operation_run_unlocked,
+        status_event_from_row,
+        status_run_from_row,
+        transition_run_unlocked,
+        validate_operation_event,
+        validate_operation_identity,
+        validate_operation_transition,
+    )
     from .transcripts import NormalizedSession, render_turns
     from .usage import (
         UnsafeUsagePathError,
@@ -25,7 +47,28 @@ try:
         recover_usage_log,
     )
 except ImportError:  # Direct execution with scripts/ on sys.path.
+    from privacy import normalize_persistence_reason
     from providers import ProviderResult
+    from status_store import (
+        ALLOWED_PHASES,
+        EventLevel,
+        JsonScalar,
+        ProviderName,
+        RunKind,
+        RunState,
+        SourceAgent,
+        StatusEvent,
+        StatusRun,
+        append_event_unlocked,
+        create_job_run_unlocked,
+        create_operation_run_unlocked,
+        status_event_from_row,
+        status_run_from_row,
+        transition_run_unlocked,
+        validate_operation_event,
+        validate_operation_identity,
+        validate_operation_transition,
+    )
     from transcripts import NormalizedSession, render_turns
     from usage import (
         UnsafeUsagePathError,
@@ -61,38 +104,157 @@ AutoCompileContentRead: TypeAlias = (
     tuple[AutoCompileReadStatus, str | None]
     | tuple[AutoCompileReadStatus, str | None, tuple[str, ...]]
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_ATTEMPTS = 5
-MAX_ERROR_CHARS = 1_000
 AUTO_COMPILE_RESERVATION_KEY = "auto_compile_reservation"
-_SECRET_NAMES = {"ANTHROPIC_API_KEY", "CLAUDE_API_KEY"}
-_SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
+
+_SYNTHESIZED_JOB_STATUS: dict[
+    JobStatus,
+    tuple[RunState, str, EventLevel, bool],
+] = {
+    "pending": ("queued", "queued", "info", False),
+    "leased": ("running", "worker_claimed", "info", False),
+    "failed": ("retrying", "retry_wait", "warning", True),
+    "succeeded": ("succeeded", "succeeded", "info", False),
+    "dead": ("dead", "dead", "error", True),
+}
+
+_JOB_EVENT_PHASES = frozenset(
+    {
+        "codex_started",
+        "codex_succeeded",
+        "codex_failed",
+        "claude_started",
+        "claude_succeeded",
+        "claude_failed",
+        "daily_log_write_started",
+    }
+)
+
+_STATUS_SCHEMA_STATEMENTS = (
+    """
+CREATE TABLE status_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+    operation_key TEXT UNIQUE,
+    kind TEXT NOT NULL,
+    source_agent TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    project TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'retrying', 'succeeded', 'failed', 'dead')
+    ),
+    phase TEXT NOT NULL,
+    summary TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK ((job_id IS NULL) <> (operation_key IS NULL))
+)""",
+    """
+CREATE TABLE status_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES status_runs(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    level TEXT NOT NULL CHECK (level IN ('info', 'warning', 'error')),
+    provider TEXT,
+    attempt INTEGER,
+    message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+)""",
+    "CREATE INDEX status_runs_state_updated_idx ON status_runs(state, updated_at DESC)",
+    "CREATE INDEX status_events_run_id_id_idx ON status_events(run_id, id)",
+)
+
+_QUEUE_V2_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (
+            kind IN ('capture', 'compile', 'query_file', 'connections', 'semantic_lint')
+        ),
+        source_agent TEXT NOT NULL CHECK (
+            source_agent IN ('claude', 'codex', 'system')
+        ),
+        session_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (
+            status IN ('pending', 'leased', 'succeeded', 'failed', 'dead')
+        ),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        available_at TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        UNIQUE (kind, source_agent, session_id, source_hash)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS provider_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        task TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        elapsed_ms INTEGER NOT NULL,
+        legacy_cost_usd REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS jobs_status_available_idx ON jobs(status, available_at)",
+    "CREATE INDEX IF NOT EXISTS jobs_lease_expiry_idx ON jobs(lease_expires_at)",
+    "CREATE TABLE IF NOT EXISTS queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """
+    INSERT OR IGNORE INTO queue_metadata(key, value)
+    VALUES ('queue_id', lower(hex(randomblob(16))))
+    """,
+)
+
+_VERSION_1_TO_2_STATEMENTS = (
+    "ALTER TABLE provider_attempts ADD COLUMN legacy_cost_usd REAL",
+    "CREATE TABLE queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """
+    INSERT INTO queue_metadata(key, value)
+    VALUES ('queue_id', lower(hex(randomblob(16))))
+    """,
+)
+
+
+def _windows_acl_required() -> bool:
+    return os.name == "nt"
+
+
+def _secure_windows_queue_file(path: Path) -> None:
+    try:
+        from .windows_acl import secure_windows_file_descriptor
+    except ImportError:  # Direct execution with scripts/ on sys.path.
+        from windows_acl import secure_windows_file_descriptor
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        secure_windows_file_descriptor(descriptor, path)
+    finally:
+        os.close(descriptor)
 
 
 class LeaseOwnershipError(RuntimeError):
     """Raised when a worker mutates a lease it does not own."""
-
-
-def normalize_persistence_reason(
-    reason: object,
-    env: Mapping[str, str],
-) -> str:
-    """Bound and redact metadata persisted at queue failure boundaries."""
-    normalized = " ".join(str(reason).split()) or "unspecified failure"
-    secrets = {
-        value
-        for name, value in env.items()
-        if value
-        and (
-            name in _SECRET_NAMES
-            or name.startswith("OPENAI_")
-            or name.startswith("AZURE_OPENAI_")
-            or name.endswith(_SECRET_SUFFIXES)
-        )
-    }
-    for secret in sorted(secrets, key=len, reverse=True):
-        normalized = normalized.replace(secret, "[REDACTED]")
-    return normalized[:MAX_ERROR_CHARS]
 
 
 def _utc_now() -> datetime:
@@ -224,7 +386,11 @@ class QueueRepository:
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
-            self._migrate()
+            observed_version = self._connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
+            self._secure_database_files()
+            self._migrate(observed_version)
             self._secure_database_files()
             if sync_usage:
                 self._sync_usage_records()
@@ -243,6 +409,8 @@ class QueueRepository:
         if info.st_nlink != 1:
             raise ValueError(f"queue path must not be hard-linked: {path}")
         path.chmod(0o600)
+        if _windows_acl_required():
+            _secure_windows_queue_file(path)
 
     def _prepare_private_database_files(self) -> None:
         candidates = [self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")]
@@ -270,94 +438,50 @@ class QueueRepository:
     def close(self) -> None:
         self._connection.close()
 
-    def _migrate(self) -> None:
-        version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if version > SCHEMA_VERSION:
+    def _migration_version_observed(self, version: int) -> None:
+        """Test seam for synchronizing concurrent migration openers."""
+
+    def _migrate(self, observed_version: int | None = None) -> None:
+        if observed_version is None:
+            observed_version = self._connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
+        self._migration_version_observed(observed_version)
+        if observed_version > SCHEMA_VERSION:
             raise RuntimeError(
-                f"queue schema {version} is newer than supported version {SCHEMA_VERSION}"
+                f"queue schema {observed_version} is newer than supported version "
+                f"{SCHEMA_VERSION}"
             )
-        if version == SCHEMA_VERSION:
+        if observed_version == SCHEMA_VERSION:
             return
-        if version == 1:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                self._connection.execute(
-                    "ALTER TABLE provider_attempts ADD COLUMN legacy_cost_usd REAL"
-                )
-                self._connection.execute(
-                    "CREATE TABLE queue_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-                )
-                self._connection.execute(
-                    "INSERT INTO queue_metadata(key, value) VALUES ('queue_id', lower(hex(randomblob(16))))"
-                )
-                self._connection.execute("PRAGMA user_version = 2")
-                self._connection.execute("COMMIT")
-                return
-            except BaseException:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                raise
+        self._connection.execute("BEGIN IMMEDIATE")
         try:
-            self._connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL CHECK (
-                        kind IN ('capture', 'compile', 'query_file', 'connections', 'semantic_lint')
-                    ),
-                    source_agent TEXT NOT NULL CHECK (
-                        source_agent IN ('claude', 'codex', 'system')
-                    ),
-                    session_id TEXT NOT NULL,
-                    project TEXT NOT NULL,
-                    cwd TEXT NOT NULL,
-                    trigger TEXT NOT NULL,
-                    source_path TEXT NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        status IN ('pending', 'leased', 'succeeded', 'failed', 'dead')
-                    ),
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    available_at TEXT NOT NULL,
-                    lease_owner TEXT,
-                    lease_expires_at TEXT,
-                    last_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    UNIQUE (kind, source_agent, session_id, source_hash)
-                );
-                CREATE TABLE IF NOT EXISTS provider_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    task TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    reason TEXT,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    elapsed_ms INTEGER NOT NULL,
-                    legacy_cost_usd REAL
-                );
-                CREATE INDEX IF NOT EXISTS jobs_status_available_idx
-                    ON jobs(status, available_at);
-                CREATE INDEX IF NOT EXISTS jobs_lease_expiry_idx
-                    ON jobs(lease_expires_at);
-                CREATE TABLE IF NOT EXISTS queue_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                INSERT OR IGNORE INTO queue_metadata(key, value)
-                    VALUES ('queue_id', lower(hex(randomblob(16))));
-                PRAGMA user_version = 2;
-                COMMIT;
-                """
-            )
+            while True:
+                version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+                if version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"queue schema {version} is newer than supported version "
+                        f"{SCHEMA_VERSION}"
+                    )
+                if version == SCHEMA_VERSION:
+                    self._connection.execute("COMMIT")
+                    return
+                if version == 0:
+                    for statement in _QUEUE_V2_SCHEMA_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 2")
+                    continue
+                if version == 1:
+                    for statement in _VERSION_1_TO_2_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 2")
+                    continue
+                if version == 2:
+                    for statement in _STATUS_SCHEMA_STATEMENTS:
+                        self._connection.execute(statement)
+                    self._connection.execute("PRAGMA user_version = 3")
+                    continue
+                raise RuntimeError(f"unsupported queue schema version {version}")
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -365,6 +489,438 @@ class QueueRepository:
 
     def _now(self) -> datetime:
         return _datetime(self._clock())
+
+    def status_run_for_job(self, job_id: int) -> StatusRun:
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return status_run_from_row(row, redaction_env=self._redaction_env)
+
+    def _ensure_job_run_unlocked(self, job_id: int) -> StatusRun:
+        """Synthesize one authoritative coarse event for a pre-v3 queue job."""
+        try:
+            return self.status_run_for_job(job_id)
+        except KeyError:
+            job = self._connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise
+            started_at = _loaded_time(job["created_at"])
+            updated_at = _loaded_time(job["updated_at"])
+            if started_at is None or updated_at is None:
+                raise ValueError("queue job is missing a required timestamp")
+            mapping = _SYNTHESIZED_JOB_STATUS.get(job["status"])
+            if mapping is None:
+                raise ValueError(f"invalid queue job status: {job['status']!r}")
+            state, phase, level, retains_error = mapping
+            completed_at = (
+                _loaded_time(job["completed_at"])
+                if state in {"succeeded", "dead"}
+                else None
+            )
+            error = (
+                normalize_persistence_reason(job["last_error"], self._redaction_env)
+                if retains_error and job["last_error"] is not None
+                else None
+            )
+            run_id = create_job_run_unlocked(
+                self._connection,
+                job_id=job["id"],
+                kind=job["kind"],
+                source_agent=job["source_agent"],
+                session_id=job["session_id"],
+                project=job["project"],
+                now=started_at,
+                state=state,
+                phase=phase,
+                summary=error,
+                error=error,
+                updated_at=updated_at,
+                completed_at=completed_at,
+                redaction_env=self._redaction_env,
+            )
+            details = (
+                {"retry_at": _stored_time(job["available_at"])}
+                if state == "retrying"
+                else None
+            )
+            append_event_unlocked(
+                self._connection,
+                run_id,
+                phase,
+                now=completed_at or updated_at,
+                level=level,
+                attempt=(job["attempt_count"] or None),
+                message=error,
+                details=details,
+                redaction_env=self._redaction_env,
+            )
+            return self.status_run_for_job(job_id)
+
+    def status_run_for_operation(self, operation_key: str) -> StatusRun | None:
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE operation_key = ?", (operation_key,)
+        ).fetchone()
+        return (
+            status_run_from_row(row, redaction_env=self._redaction_env)
+            if row is not None
+            else None
+        )
+
+    def status_events(self, run_id: int) -> tuple[StatusEvent, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM status_events WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        return tuple(
+            status_event_from_row(row, redaction_env=self._redaction_env)
+            for row in rows
+        )
+
+    def _append_run_event(
+        self,
+        run: StatusRun,
+        phase: str,
+        *,
+        level: EventLevel,
+        provider: ProviderName | None,
+        attempt: int | None,
+        message: str | None,
+        details: Mapping[str, JsonScalar] | None,
+    ) -> None:
+        transition_run_unlocked(
+            self._connection,
+            run.id,
+            run.state,
+            phase,
+            now=self._now(),
+            summary=run.summary,
+            error=run.error,
+            completed_at=run.completed_at,
+            level=level,
+            provider=provider,
+            attempt=attempt,
+            message=message,
+            details=details,
+            redaction_env=self._redaction_env,
+        )
+
+    def append_job_event(
+        self,
+        job_id: int,
+        owner: str,
+        phase: str,
+        *,
+        expected_attempt_count: int,
+        level: EventLevel = "info",
+        provider: ProviderName | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if (
+            isinstance(expected_attempt_count, bool)
+            or not isinstance(expected_attempt_count, int)
+            or expected_attempt_count < 1
+        ):
+            raise ValueError("expected_attempt_count must be a positive integer")
+        if phase not in _JOB_EVENT_PHASES:
+            raise ValueError(f"invalid job event phase: {phase!r}")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            job = self._connection.execute(
+                """
+                SELECT attempt_count FROM jobs
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                    AND attempt_count = ?
+                """,
+                (job_id, owner, expected_attempt_count),
+            ).fetchone()
+            if job is None:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self.status_run_for_job(job_id)
+            if run.state != "running":
+                raise ValueError(
+                    f"leased job {job_id} has incompatible run state {run.state!r}"
+                )
+            self._append_run_event(
+                run,
+                phase,
+                level=level,
+                provider=provider,
+                attempt=job["attempt_count"],
+                message=message,
+                details=details,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def create_operation_run(
+        self,
+        operation_key: str,
+        *,
+        kind: RunKind,
+        source_agent: SourceAgent,
+        session_id: str,
+        project: str,
+        phase: str = "reserved",
+    ) -> StatusRun:
+        operation_key, kind, source_agent, session_id, project = (
+            validate_operation_identity(
+                operation_key,
+                kind,
+                source_agent,
+                session_id,
+                project,
+                redaction_env=self._redaction_env,
+            )
+        )
+        if phase not in ALLOWED_PHASES:
+            raise ValueError(f"invalid status phase: {phase!r}")
+        validate_operation_event("queued", phase)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.status_run_for_operation(operation_key)
+            if existing is not None:
+                identity = (kind, source_agent, session_id, project)
+                persisted_identity = (
+                    existing.kind,
+                    existing.source_agent,
+                    existing.session_id,
+                    existing.project,
+                )
+                if persisted_identity != identity:
+                    raise ValueError("operation_key is already used by another operation")
+                self._connection.execute("COMMIT")
+                return existing
+            now = self._now()
+            run_id = create_operation_run_unlocked(
+                self._connection,
+                operation_key=operation_key,
+                kind=kind,
+                source_agent=source_agent,
+                session_id=session_id,
+                project=project,
+                phase=phase,
+                now=now,
+                redaction_env=self._redaction_env,
+            )
+            append_event_unlocked(
+                self._connection,
+                run_id,
+                phase,
+                now=now,
+                redaction_env=self._redaction_env,
+            )
+            created = self.status_run_for_operation(operation_key)
+            if created is None:  # Defensive: insert and readback share a transaction.
+                raise RuntimeError("created operation status could not be read back")
+            self._connection.execute("COMMIT")
+            return created
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def create_failed_operation_run(
+        self,
+        operation_key: str,
+        *,
+        kind: RunKind = "capture",
+        source_agent: str,
+        session_id: str,
+        project: str,
+        summary: str | None,
+        error: str | None,
+    ) -> StatusRun:
+        """Atomically create one terminal diagnostic run and failed event."""
+        persisted_source = source_agent
+        validation_source = cast(SourceAgent, source_agent)
+        operation_key, kind, _source, session_id, project = (
+            validate_operation_identity(
+                operation_key,
+                kind,
+                validation_source,
+                session_id,
+                project,
+                redaction_env=self._redaction_env,
+            )
+        )
+        if source_agent not in {"claude", "codex", "system"}:
+            raise ValueError(f"invalid diagnostic source_agent: {source_agent!r}")
+        now = self._now()
+        candidate = StatusRun(
+            id=0,
+            job_id=None,
+            operation_key=operation_key,
+            kind=kind,
+            source_agent=persisted_source,
+            session_id=session_id,
+            project=project,
+            state="failed",
+            phase="failed",
+            summary=summary,
+            error=error,
+            started_at=now,
+            updated_at=now,
+            completed_at=now,
+            redaction_env=self._redaction_env,
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.status_run_for_operation(operation_key)
+            if existing is not None:
+                identity = (kind, persisted_source, session_id, project)
+                persisted_identity = (
+                    existing.kind,
+                    existing.source_agent,
+                    existing.session_id,
+                    existing.project,
+                )
+                if persisted_identity != identity or (
+                    existing.state != "failed"
+                    or existing.phase != "failed"
+                    or existing.completed_at is None
+                ):
+                    raise ValueError(
+                        "operation_key is already used by another operation"
+                    )
+                self._connection.execute("COMMIT")
+                return existing
+            cursor = self._connection.execute(
+                """
+                INSERT INTO status_runs (
+                    operation_key, kind, source_agent, session_id, project,
+                    state, phase, summary, error, started_at, updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.operation_key,
+                    candidate.kind,
+                    candidate.source_agent,
+                    candidate.session_id,
+                    candidate.project,
+                    candidate.state,
+                    candidate.phase,
+                    candidate.summary,
+                    candidate.error,
+                    _stored_time(candidate.started_at),
+                    _stored_time(candidate.updated_at),
+                    _stored_time(now),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("created diagnostic run has no identifier")
+            append_event_unlocked(
+                self._connection,
+                cursor.lastrowid,
+                "failed",
+                now=now,
+                level="error",
+                message=candidate.error or candidate.summary,
+                redaction_env=self._redaction_env,
+            )
+            created = self.status_run_for_operation(operation_key)
+            if created is None:
+                raise RuntimeError("created diagnostic status could not be read back")
+            self._connection.execute("COMMIT")
+            return created
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def append_operation_event(
+        self,
+        run_id: int,
+        phase: str,
+        *,
+        level: EventLevel = "info",
+        provider: ProviderName | None = None,
+        attempt: int | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            run = status_run_from_row(row, redaction_env=self._redaction_env)
+            validate_operation_event(run.state, phase)
+            self._append_run_event(
+                run,
+                phase,
+                level=level,
+                provider=provider,
+                attempt=attempt,
+                message=message,
+                details=details,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def transition_operation_run(
+        self,
+        run_id: int,
+        state: RunState,
+        phase: str,
+        *,
+        summary: str | None = None,
+        error: str | None = None,
+        level: EventLevel = "info",
+        provider: ProviderName | None = None,
+        attempt: int | None = None,
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        now = self._now()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            run = status_run_from_row(row, redaction_env=self._redaction_env)
+            validate_operation_transition(run.state, state, phase)
+            transition_run_unlocked(
+                self._connection,
+                run_id,
+                state,
+                phase,
+                now=now,
+                summary=summary,
+                error=error,
+                completed_at=(
+                    now if state in {"succeeded", "failed", "dead"} else None
+                ),
+                level=level,
+                provider=provider,
+                attempt=attempt,
+                message=message,
+                details=details,
+                redaction_env=self._redaction_env,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     @property
     def queue_id(self) -> str:
@@ -397,7 +953,8 @@ class QueueRepository:
         )
 
     def enqueue_capture(self, session: NormalizedSession) -> EnqueueResult:
-        now = _stored_time(self._now())
+        now_dt = self._now()
+        now = _stored_time(now_dt)
         payload = json.dumps(
             {
                 "timestamp": session.timestamp,
@@ -407,39 +964,77 @@ class QueueRepository:
             sort_keys=True,
             separators=(",", ":"),
         )
-        cursor = self._connection.execute(
-            """
-            INSERT OR IGNORE INTO jobs (
-                kind, source_agent, session_id, project, cwd, trigger, source_path,
-                source_hash, payload_json, status, attempt_count, available_at,
-                created_at, updated_at
-            ) VALUES ('capture', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-            """,
-            (
-                session.agent,
-                session.session_id,
-                session.project,
-                session.cwd,
-                session.trigger,
-                session.source_path,
-                session.source_hash,
-                payload,
-                now,
-                now,
-                now,
-            ),
-        )
-        created = cursor.rowcount == 1
-        row = self._connection.execute(
-            """
-            SELECT * FROM jobs
-            WHERE kind = 'capture' AND source_agent = ? AND session_id = ? AND source_hash = ?
-            """,
-            (session.agent, session.session_id, session.source_hash),
-        ).fetchone()
-        if row is None:  # Defensive: the insert/select are on one connection.
-            raise RuntimeError("enqueued capture could not be read back")
-        return EnqueueResult(self._job(row), created)
+        owns_transaction = not self._connection.in_transaction
+        if owns_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
+        else:
+            self._connection.execute("SAVEPOINT enqueue_capture_status")
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT OR IGNORE INTO jobs (
+                    kind, source_agent, session_id, project, cwd, trigger, source_path,
+                    source_hash, payload_json, status, attempt_count, available_at,
+                    created_at, updated_at
+                ) VALUES ('capture', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    session.agent,
+                    session.session_id,
+                    session.project,
+                    session.cwd,
+                    session.trigger,
+                    session.source_path,
+                    session.source_hash,
+                    payload,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = self._connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE kind = 'capture' AND source_agent = ? AND session_id = ?
+                    AND source_hash = ?
+                """,
+                (session.agent, session.session_id, session.source_hash),
+            ).fetchone()
+            if row is None:  # Defensive: insert and readback share this transaction.
+                raise RuntimeError("enqueued capture could not be read back")
+            if created:
+                run_id = create_job_run_unlocked(
+                    self._connection,
+                    job_id=row["id"],
+                    kind=row["kind"],
+                    source_agent=row["source_agent"],
+                    session_id=row["session_id"],
+                    project=row["project"],
+                    now=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+                append_event_unlocked(
+                    self._connection,
+                    run_id,
+                    "queued",
+                    now=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+            else:
+                self._ensure_job_run_unlocked(row["id"])
+            result = EnqueueResult(self._job(row), created)
+            self._connection.execute(
+                "COMMIT" if owns_transaction else "RELEASE enqueue_capture_status"
+            )
+            return result
+        except BaseException:
+            if owns_transaction and self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            elif self._connection.in_transaction:
+                self._connection.execute("ROLLBACK TO enqueue_capture_status")
+                self._connection.execute("RELEASE enqueue_capture_status")
+            raise
 
     def claim_next(
         self,
@@ -468,6 +1063,7 @@ class QueueRepository:
             if row is None:
                 self._connection.execute("COMMIT")
                 return None
+            run = self._ensure_job_run_unlocked(row["id"])
             self._connection.execute(
                 """
                 UPDATE jobs
@@ -480,6 +1076,14 @@ class QueueRepository:
             claimed = self._connection.execute(
                 "SELECT * FROM jobs WHERE id = ?", (row["id"],)
             ).fetchone()
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "running",
+                "worker_claimed",
+                now=now_dt,
+                redaction_env=self._redaction_env,
+            )
             self._connection.execute("COMMIT")
             return self._job(claimed)
         except BaseException:
@@ -618,19 +1222,53 @@ class QueueRepository:
         """Recover and project usage after the caller owns worker singleton."""
         self._sync_usage_records()
 
-    def complete(self, job_id: int, owner: str) -> None:
-        now = _stored_time(self._now())
-        cursor = self._connection.execute(
-            """
-            UPDATE jobs
-            SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
-                last_error = NULL, updated_at = ?, completed_at = ?
-            WHERE id = ? AND status = 'leased' AND lease_owner = ?
-            """,
-            (now, now, job_id, owner),
-        )
-        if cursor.rowcount != 1:
-            raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+    def complete(
+        self,
+        job_id: int,
+        owner: str,
+        *,
+        summary: str | None = None,
+    ) -> None:
+        now_dt = self._now()
+        now = _stored_time(now_dt)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            ownership = self._connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                """,
+                (job_id, owner),
+            ).fetchone()
+            if ownership is None:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            run = self._ensure_job_run_unlocked(job_id)
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'succeeded', lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = NULL, updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'leased' AND lease_owner = ?
+                """,
+                (now, now, job_id, owner),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "succeeded",
+                "succeeded",
+                now=now_dt,
+                summary=summary,
+                completed_at=now_dt,
+                redaction_env=self._redaction_env,
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def retry(
         self,
@@ -650,8 +1288,12 @@ class QueueRepository:
             ).fetchone()
             if row is None:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
-            now = _stored_time(self._now())
+            run = self._ensure_job_run_unlocked(job_id)
+            now_dt = self._now()
+            now = _stored_time(now_dt)
             dead = row["attempt_count"] >= self.max_attempts
+            normalized_error = normalize_persistence_reason(error, self._redaction_env)
+            retry_at = _stored_time(available_at)
             cursor = self._connection.execute(
                 """
                 UPDATE jobs
@@ -661,8 +1303,8 @@ class QueueRepository:
                 """,
                 (
                     "dead" if dead else "failed",
-                    _stored_time(available_at),
-                    normalize_persistence_reason(error, self._redaction_env),
+                    retry_at,
+                    normalized_error,
                     now,
                     now if dead else None,
                     job_id,
@@ -671,6 +1313,20 @@ class QueueRepository:
             )
             if cursor.rowcount != 1:
                 raise LeaseOwnershipError(f"job {job_id} is not leased by {owner}")
+            transition_run_unlocked(
+                self._connection,
+                run.id,
+                "dead" if dead else "retrying",
+                "dead" if dead else "retry_wait",
+                now=now_dt,
+                summary=normalized_error,
+                error=normalized_error,
+                completed_at=now_dt if dead else None,
+                level="error" if dead else "warning",
+                message=normalized_error,
+                details=None if dead else {"retry_at": retry_at},
+                redaction_env=self._redaction_env,
+            )
             self._connection.execute("COMMIT")
         except BaseException:
             if self._connection.in_transaction:
@@ -678,19 +1334,62 @@ class QueueRepository:
             raise
 
     def recover_stale(self, now: datetime | str | int | float) -> int:
-        now_value = _stored_time(now)
-        cursor = self._connection.execute(
-            """
-            UPDATE jobs
-            SET status = CASE WHEN attempt_count >= ? THEN 'dead' ELSE 'failed' END,
-                available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-                last_error = 'worker lease expired', updated_at = ?,
-                completed_at = CASE WHEN attempt_count >= ? THEN ? ELSE NULL END
-            WHERE status = 'leased' AND lease_expires_at <= ?
-            """,
-            (self.max_attempts, now_value, now_value, self.max_attempts, now_value, now_value),
-        )
-        return cursor.rowcount
+        now_dt = _datetime(now)
+        now_value = _stored_time(now_dt)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            stale = self._connection.execute(
+                """
+                SELECT id, attempt_count FROM jobs
+                WHERE status = 'leased' AND lease_expires_at <= ?
+                ORDER BY id
+                """,
+                (now_value,),
+            ).fetchall()
+            runs = {
+                job["id"]: self._ensure_job_run_unlocked(job["id"])
+                for job in stale
+            }
+            cursor = self._connection.execute(
+                """
+                UPDATE jobs
+                SET status = CASE WHEN attempt_count >= ? THEN 'dead' ELSE 'failed' END,
+                    available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = 'worker lease expired', updated_at = ?,
+                    completed_at = CASE WHEN attempt_count >= ? THEN ? ELSE NULL END
+                WHERE status = 'leased' AND lease_expires_at <= ?
+                """,
+                (
+                    self.max_attempts,
+                    now_value,
+                    now_value,
+                    self.max_attempts,
+                    now_value,
+                    now_value,
+                ),
+            )
+            for job in stale:
+                dead = job["attempt_count"] >= self.max_attempts
+                run = runs[job["id"]]
+                transition_run_unlocked(
+                    self._connection,
+                    run.id,
+                    "dead" if dead else "retrying",
+                    "dead" if dead else "recovery_pending",
+                    now=now_dt,
+                    summary="worker lease expired",
+                    error="worker lease expired",
+                    completed_at=now_dt if dead else None,
+                    level="error" if dead else "warning",
+                    message="worker lease expired",
+                    redaction_env=self._redaction_env,
+                )
+            self._connection.execute("COMMIT")
+            return cursor.rowcount
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def get_job(self, job_id: int) -> Job:
         row = self._connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -788,6 +1487,295 @@ class QueueRepository:
             LIMIT 1
             """
         ).fetchone() is not None
+
+    @staticmethod
+    def _auto_compile_operation_key(log_name: str, fingerprint: str) -> str:
+        return f"auto-compile:{log_name}:{fingerprint}"
+
+    @classmethod
+    def _run_matches_auto_compile_generation(
+        cls, run: StatusRun, log_name: str, fingerprint: str
+    ) -> bool:
+        base = cls._auto_compile_operation_key(log_name, fingerprint)
+        key = run.operation_key
+        return key == base or (
+            isinstance(key, str)
+            and key.startswith(f"{base}:")
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", key[len(base) + 1 :])
+            is not None
+        )
+
+    def _create_auto_compile_run_unlocked(
+        self,
+        log_name: str,
+        fingerprint: str,
+        now: datetime,
+        execution_token: str | None = None,
+    ) -> int:
+        base_key = self._auto_compile_operation_key(log_name, fingerprint)
+        operation_key = base_key
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE operation_key = ?", (operation_key,)
+        ).fetchone()
+        if row is not None:
+            existing = status_run_from_row(row, redaction_env=self._redaction_env)
+            if existing.state not in {"succeeded", "failed", "dead"}:
+                return existing.id
+            suffix = (execution_token or secrets.token_hex(8))[:16]
+            operation_key = f"{base_key}:{suffix}"
+            counter = 1
+            while self._connection.execute(
+                "SELECT 1 FROM status_runs WHERE operation_key = ?", (operation_key,)
+            ).fetchone() is not None:
+                operation_key = f"{base_key}:{suffix}-{counter}"
+                counter += 1
+        project = self.memory_home.name
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", project):
+            project = "global"
+        run_id = create_operation_run_unlocked(
+            self._connection,
+            operation_key=operation_key,
+            kind="compile",
+            source_agent="system",
+            session_id="",
+            project=project,
+            phase="reserved",
+            now=now,
+            redaction_env=self._redaction_env,
+        )
+        append_event_unlocked(
+            self._connection,
+            run_id,
+            "reserved",
+            now=now,
+            redaction_env=self._redaction_env,
+        )
+        return run_id
+
+    def _ensure_auto_compile_links_unlocked(
+        self, reservation: dict[str, object], now: datetime
+    ) -> bool:
+        changed = False
+        fingerprint = reservation.get("fingerprint")
+        log_name = reservation.get("log_name")
+        if isinstance(fingerprint, str) and isinstance(log_name, str):
+            run = self._auto_compile_run_unlocked(reservation)
+            if (
+                run is None
+                or run.state in {"succeeded", "failed", "dead"}
+                or not self._run_matches_auto_compile_generation(
+                    run, log_name, fingerprint
+                )
+            ):
+                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
+                    log_name,
+                    fingerprint,
+                    now,
+                    execution_token=str(reservation.get("token", "legacy")),
+                )
+                changed = True
+        pending = reservation.get("pending_fingerprint")
+        pending_log = reservation.get("pending_log_name")
+        if isinstance(pending, str) and isinstance(pending_log, str):
+            run = self._auto_compile_run_unlocked(reservation, pending=True)
+            if (
+                run is None
+                or run.state in {"succeeded", "failed", "dead"}
+                or not self._run_matches_auto_compile_generation(
+                    run, pending_log, pending
+                )
+            ):
+                reservation["pending_status_run_id"] = (
+                    self._create_auto_compile_run_unlocked(
+                        pending_log,
+                        pending,
+                        now,
+                        execution_token=str(
+                            reservation.get("watcher_token", "legacy-pending")
+                        ),
+                    )
+                )
+                changed = True
+        return changed
+
+    def _delete_auto_compile_reservation_unlocked(
+        self,
+        reservation: Mapping[str, object],
+        *,
+        now: datetime,
+        active_succeeded: bool,
+        reason: str,
+    ) -> None:
+        active = self._auto_compile_run_unlocked(reservation)
+        pending = self._auto_compile_run_unlocked(reservation, pending=True)
+        linked: dict[int, tuple[StatusRun, bool]] = {}
+        if active is not None:
+            linked[active.id] = (active, active_succeeded)
+        if pending is not None and pending.id not in linked:
+            linked[pending.id] = (pending, False)
+        for run, succeeded in linked.values():
+            if run is None or run.state in {"succeeded", "failed", "dead"}:
+                continue
+            if succeeded:
+                if run.state in {"queued", "retrying"}:
+                    self._transition_auto_compile_run_unlocked(
+                        {"status_run_id": run.id},
+                        "running",
+                        "generation_recovered",
+                        now=now,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    {"status_run_id": run.id},
+                    "succeeded",
+                    "succeeded",
+                    now=now,
+                    summary=reason,
+                )
+            else:
+                transition_run_unlocked(
+                    self._connection,
+                    run.id,
+                    "failed",
+                    "failed",
+                    now=now,
+                    summary=reason,
+                    completed_at=now,
+                    redaction_env=self._redaction_env,
+                )
+        self._connection.execute(
+            "DELETE FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        )
+
+    def _auto_compile_run_unlocked(
+        self, reservation: Mapping[str, object], *, pending: bool = False
+    ) -> StatusRun | None:
+        key = "pending_status_run_id" if pending else "status_run_id"
+        run_id = reservation.get(key)
+        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM status_runs WHERE id = ? AND operation_key IS NOT NULL",
+            (run_id,),
+        ).fetchone()
+        return (
+            status_run_from_row(row, redaction_env=self._redaction_env)
+            if row is not None
+            else None
+        )
+
+    def _transition_auto_compile_run_unlocked(
+        self,
+        reservation: Mapping[str, object],
+        state: RunState,
+        phase: str,
+        *,
+        now: datetime,
+        summary: str | None = None,
+        error: str | None = None,
+        level: EventLevel = "info",
+        message: str | None = None,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> None:
+        run = self._auto_compile_run_unlocked(reservation)
+        if run is None or run.state in {"succeeded", "failed", "dead"}:
+            return
+        if run.state == state:
+            validate_operation_event(run.state, phase)
+        else:
+            validate_operation_transition(run.state, state, phase)
+        transition_run_unlocked(
+            self._connection,
+            run.id,
+            state,
+            phase,
+            now=now,
+            summary=summary,
+            error=error,
+            completed_at=now if state in {"succeeded", "failed", "dead"} else None,
+            level=level,
+            message=message,
+            details=details,
+            redaction_env=self._redaction_env,
+        )
+
+    def active_auto_compile_status_run(
+        self, run_id: int, *, now: datetime | str | int | float
+    ) -> StatusRun | None:
+        row = self._connection.execute(
+            "SELECT value FROM queue_metadata WHERE key = ?",
+            (AUTO_COMPILE_RESERVATION_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            reservation = json.loads(row["value"])
+            unexpired = _datetime(reservation["expires_at"]) > _datetime(now)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        run = self._auto_compile_run_unlocked(reservation)
+        return run if unexpired and run is not None and run.id == run_id else None
+
+    def record_active_auto_compile_phase(
+        self,
+        run_id: int,
+        phase: str,
+        *,
+        details: Mapping[str, JsonScalar] | None = None,
+    ) -> bool:
+        """Record a child phase only while its exact reservation remains active."""
+        now = self._now()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is None:
+                self._connection.execute("COMMIT")
+                return False
+            try:
+                reservation = json.loads(row["value"])
+                unexpired = _datetime(reservation["expires_at"]) > now
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                unexpired = False
+                reservation = {}
+            run = self._auto_compile_run_unlocked(reservation)
+            if not unexpired or run is None or run.id != run_id:
+                self._connection.execute("COMMIT")
+                return False
+            if phase == "staging_started" and run.state == "queued":
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            elif phase == "staging_started" and run.state == "retrying":
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "generation_recovered",
+                    now=now,
+                    summary="Retrying automatic compile",
+                )
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            elif run.state == "running":
+                if run.phase == phase and phase == "staging_started":
+                    self._connection.execute("COMMIT")
+                    return True
+                self._transition_auto_compile_run_unlocked(
+                    reservation, "running", phase, now=now, details=details
+                )
+            else:
+                self._connection.execute("COMMIT")
+                return False
+            self._connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
 
     def reserve_auto_compile(
         self,
@@ -909,9 +1897,19 @@ class QueueRepository:
                     "log_name": log_name,
                     "required_marker_prefix": [],
                     "expires_at": _stored_time(expires_dt),
+                    "status_run_id": self._create_auto_compile_run_unlocked(
+                        log_name, fingerprint, now_dt, execution_token=token
+                    ),
                 }
                 role = "owner"
             else:
+                reservation["pending_status_run_id"] = (
+                    reservation.get("status_run_id")
+                    if reservation.get("fingerprint") == fingerprint
+                    else self._create_auto_compile_run_unlocked(
+                        log_name, fingerprint, now_dt, execution_token=token
+                    )
+                )
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
                 reservation["pending_required_marker_prefix"] = []
@@ -996,8 +1994,24 @@ class QueueRepository:
                 except (TypeError, json.JSONDecodeError):
                     reservation = {}
             status = reservation.get("status")
+            if status == "failed":
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Restarting exhausted automatic compile reservation",
+                )
+                reservation = {}
+            elif reservation:
+                self._ensure_auto_compile_links_unlocked(reservation, now_dt)
             predecessor_token: str | None = None
-            if not reservation or status == "failed":
+            if not reservation:
+                status_run_id = self._create_auto_compile_run_unlocked(
+                    log_name,
+                    fingerprint,
+                    now_dt,
+                    execution_token=owner_token,
+                )
                 reservation = {
                     "token": owner_token,
                     "fingerprint": fingerprint,
@@ -1006,14 +2020,43 @@ class QueueRepository:
                     "watcher_token": watchdog_token,
                     "watcher_expires_at": _stored_time(expires_dt),
                     "required_marker_prefix": list(required_marker_prefix),
+                    "status_run_id": status_run_id,
                 }
                 roles = ("owner", "watchdog")
             else:
+                if reservation.get("fingerprint") == fingerprint:
+                    pending_status_run_id = reservation.get("status_run_id")
+                else:
+                    pending_status_run_id = self._create_auto_compile_run_unlocked(
+                        log_name,
+                        fingerprint,
+                        now_dt,
+                        execution_token=watchdog_token,
+                    )
+                prior_pending = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                if (
+                    prior_pending is not None
+                    and prior_pending.id != pending_status_run_id
+                    and prior_pending.state not in {"succeeded", "failed", "dead"}
+                ):
+                    transition_run_unlocked(
+                        self._connection,
+                        prior_pending.id,
+                        "failed",
+                        "failed",
+                        now=now_dt,
+                        summary="Superseded by newer uncompiled content",
+                        completed_at=now_dt,
+                        redaction_env=self._redaction_env,
+                    )
                 reservation["pending_fingerprint"] = fingerprint
                 reservation["pending_log_name"] = log_name
                 reservation["pending_required_marker_prefix"] = list(
                     required_marker_prefix
                 )
+                reservation["pending_status_run_id"] = pending_status_run_id
                 try:
                     watcher_live = (
                         _datetime(reservation["watcher_expires_at"]) > now_dt
@@ -1109,9 +2152,11 @@ class QueueRepository:
                     ),
                 )
             elif matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Automatic compile scheduling rolled back",
                 )
             self._connection.execute("COMMIT")
             return matched
@@ -1271,6 +2316,9 @@ class QueueRepository:
                 "expires_at": _stored_time(now_dt),
                 "watcher_token": watchdog_token,
                 "watcher_expires_at": _stored_time(watcher_expiry),
+                "status_run_id": self._create_auto_compile_run_unlocked(
+                    log_name, fingerprint, now_dt
+                ),
             }
             self._connection.execute(
                 "INSERT INTO queue_metadata(key, value) VALUES (?, ?)",
@@ -1358,9 +2406,11 @@ class QueueRepository:
                     ),
                 )
             elif matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=False,
+                    reason="Automatic compile owner failed to start",
                 )
             self._connection.execute("COMMIT")
             return matched
@@ -1530,9 +2580,30 @@ class QueueRepository:
                 self._connection.execute("COMMIT")
                 return "wait", None
             if observed_status == "covered":
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                completed_run = self._auto_compile_run_unlocked(reservation)
+                if completed_run is not None and completed_run.state in {
+                    "queued",
+                    "retrying",
+                }:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "running",
+                        "generation_recovered",
+                        now=now_dt,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "succeeded",
+                    "succeeded",
+                    now=now_dt,
+                    summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                )
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=True,
+                    reason=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
                 self._connection.execute("COMMIT")
                 return "done", None
@@ -1557,15 +2628,57 @@ class QueueRepository:
                 )
             ):
                 raise ValueError("invalid watcher generation observation")
-            reservation.pop("pending_fingerprint", None)
-            reservation.pop("pending_log_name", None)
-            reservation.pop("pending_required_marker_prefix", None)
-            reservation.pop("contender_token", None)
-            reservation.pop("contender_predecessor_token", None)
-            reservation.pop("contender_expires_at", None)
             changed_generation = (
                 observed.get("fingerprint") != reservation.get("fingerprint")
             )
+            if changed_generation:
+                active_run = self._auto_compile_run_unlocked(reservation)
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                reused_pending = (
+                    pending_run is not None
+                    and self._run_matches_auto_compile_generation(
+                        pending_run, observed_log_name, observed_fingerprint
+                    )
+                    and pending_run.state not in {"succeeded", "failed", "dead"}
+                )
+                for discarded in (
+                    active_run,
+                    None if reused_pending else pending_run,
+                ):
+                    if discarded is not None and discarded.state not in {
+                        "succeeded",
+                        "failed",
+                        "dead",
+                    }:
+                        transition_run_unlocked(
+                            self._connection,
+                            discarded.id,
+                            "failed",
+                            "failed",
+                            now=now_dt,
+                            summary="Superseded during automatic compile takeover",
+                            completed_at=now_dt,
+                            redaction_env=self._redaction_env,
+                        )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if reused_pending and pending_run is not None
+                    else self._create_auto_compile_run_unlocked(
+                        observed_log_name,
+                        observed_fingerprint,
+                        now_dt,
+                        execution_token=token,
+                    )
+                )
+            reservation.pop("pending_fingerprint", None)
+            reservation.pop("pending_log_name", None)
+            reservation.pop("pending_required_marker_prefix", None)
+            reservation.pop("pending_status_run_id", None)
+            reservation.pop("contender_token", None)
+            reservation.pop("contender_predecessor_token", None)
+            reservation.pop("contender_expires_at", None)
             reservation.update(observed)
             fingerprint = reservation["fingerprint"]
             reservation["token"] = token
@@ -1577,6 +2690,13 @@ class QueueRepository:
                 reservation.pop("last_error_class", None)
             reservation.pop("next_retry_at", None)
             reservation.pop("status", None)
+            self._transition_auto_compile_run_unlocked(
+                reservation,
+                "running",
+                "generation_recovered",
+                now=now_dt,
+                summary="Recovered interrupted automatic compile",
+            )
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
                 (
@@ -1735,6 +2855,61 @@ class QueueRepository:
                     reservation["expires_at"] = _stored_time(retry_at)
                     reservation["watcher_expires_at"] = _stored_time(expires_dt)
                     outcome = "retry_wait"
+            if changed:
+                prior_run = self._auto_compile_run_unlocked(reservation)
+                if (
+                    prior_run is not None
+                    and prior_run.state not in {"succeeded", "failed", "dead"}
+                ):
+                    transition_run_unlocked(
+                        self._connection,
+                        prior_run.id,
+                        "failed",
+                        "failed",
+                        now=now_dt,
+                        summary="Generation changed before compile completed",
+                        completed_at=now_dt,
+                        redaction_env=self._redaction_env,
+                    )
+                reservation["status_run_id"] = self._create_auto_compile_run_unlocked(
+                    str(reservation["log_name"]), str(observed), now_dt
+                )
+            run = self._auto_compile_run_unlocked(reservation)
+            if (
+                not changed
+                and run is not None
+                and run.state not in {"succeeded", "failed", "dead"}
+            ):
+                if outcome == "retry_wait":
+                    if run.state == "queued":
+                        self._transition_auto_compile_run_unlocked(
+                            reservation,
+                            "running",
+                            "staging_started",
+                            now=now_dt,
+                        )
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "retrying",
+                        "retry_wait",
+                        now=now_dt,
+                        summary=safe_error or "compile_failure",
+                        error=safe_error or "compile_failure",
+                        level="warning",
+                        message=safe_error or "compile_failure",
+                        details={"retry_at": reservation["next_retry_at"]},
+                    )
+                else:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "dead",
+                        "dead",
+                        now=now_dt,
+                        summary=safe_error or "compile_failure",
+                        error=safe_error or "compile_failure",
+                        level="error",
+                        message=safe_error or "compile_failure",
+                    )
             self._connection.execute(
                 "UPDATE queue_metadata SET value = ? WHERE key = ?",
                 (
@@ -1869,12 +3044,97 @@ class QueueRepository:
                 promoted_marker_prefix = tuple(pending_prefix)
                 active_observed = False
             if read_status == "covered" and observed is None:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                completed_run = self._auto_compile_run_unlocked(reservation)
+                if completed_run is not None and completed_run.state in {
+                    "queued",
+                    "retrying",
+                }:
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "running",
+                        "generation_recovered",
+                        now=now_dt,
+                        summary="Recovered completed automatic compile",
+                    )
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "succeeded",
+                    "succeeded",
+                    now=now_dt,
+                    summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                )
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=now_dt,
+                    active_succeeded=True,
+                    reason=f"Compiled {reservation.get('log_name', 'daily log')}",
                 )
                 self._connection.execute("COMMIT")
                 return None
+            changed_generation = observed != fingerprint
+            if changed_generation:
+                active_run = self._auto_compile_run_unlocked(reservation)
+                if read_status == "covered" and marker_advanced:
+                    finishing = active_run
+                    if finishing is not None and finishing.state in {
+                        "queued",
+                        "retrying",
+                    }:
+                        self._transition_auto_compile_run_unlocked(
+                            reservation,
+                            "running",
+                            "staging_started",
+                            now=now_dt,
+                        )
+                    self._transition_auto_compile_run_unlocked(
+                        reservation,
+                        "succeeded",
+                        "succeeded",
+                        now=now_dt,
+                        summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+                    )
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                reused_pending = (
+                    pending_run is not None
+                    and self._run_matches_auto_compile_generation(
+                        pending_run, str(promoted_log_name), str(observed)
+                    )
+                    and pending_run.state not in {"succeeded", "failed", "dead"}
+                )
+                for discarded in (
+                    active_run
+                    if not (read_status == "covered" and marker_advanced)
+                    else None,
+                    None if reused_pending else pending_run,
+                ):
+                    if discarded is not None and discarded.state not in {
+                        "succeeded",
+                        "failed",
+                        "dead",
+                    }:
+                        transition_run_unlocked(
+                            self._connection,
+                            discarded.id,
+                            "failed",
+                            "failed",
+                            now=now_dt,
+                            summary="Superseded during deferred automatic compile",
+                            completed_at=now_dt,
+                            redaction_env=self._redaction_env,
+                        )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if reused_pending and pending_run is not None
+                    else self._create_auto_compile_run_unlocked(
+                        str(promoted_log_name),
+                        str(observed),
+                        now_dt,
+                        execution_token=str(reservation.get("token", "deferred")),
+                    )
+                )
+                reservation.pop("pending_status_run_id", None)
             reservation["fingerprint"] = observed
             reservation["log_name"] = promoted_log_name
             if promoted_marker_prefix is not None:
@@ -1911,21 +3171,40 @@ class QueueRepository:
         *,
         now: datetime | str | int | float,
     ) -> tuple[
-        str, str | None, str | None, str | None, tuple[str, ...] | None
+        str, str | None, str | None, str | None, tuple[str, ...] | None, int
     ] | None:
         """Return an owned active/pending fingerprint and source-name pair."""
         now_dt = _datetime(now)
-        row = self._connection.execute(
-            "SELECT value FROM queue_metadata WHERE key = ?",
-            (AUTO_COMPILE_RESERVATION_KEY,),
-        ).fetchone()
-        if row is None:
-            return None
+        self._connection.execute("BEGIN IMMEDIATE")
         try:
+            row = self._connection.execute(
+                "SELECT value FROM queue_metadata WHERE key = ?",
+                (AUTO_COMPILE_RESERVATION_KEY,),
+            ).fetchone()
+            if row is None:
+                self._connection.execute("COMMIT")
+                return None
             reservation = json.loads(row["value"])
+            if self._ensure_auto_compile_links_unlocked(reservation, now_dt):
+                self._connection.execute(
+                    "UPDATE queue_metadata SET value = ? WHERE key = ?",
+                    (
+                        json.dumps(
+                            reservation, sort_keys=True, separators=(",", ":")
+                        ),
+                        AUTO_COMPILE_RESERVATION_KEY,
+                    ),
+                )
             unexpired = _datetime(reservation["expires_at"]) > now_dt
+            self._connection.execute("COMMIT")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
             return None
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
         fingerprint = reservation.get("fingerprint")
         pending = reservation.get("pending_fingerprint")
         if (
@@ -1962,7 +3241,23 @@ class QueueRepository:
             required_markers = tuple(required_marker_prefix)
         else:
             required_markers = None
-        return fingerprint, pending, log_name, pending_log_name, required_markers
+        run = self._auto_compile_run_unlocked(reservation)
+        if (
+            run is None
+            or not isinstance(log_name, str)
+            or not self._run_matches_auto_compile_generation(
+                run, log_name, fingerprint
+            )
+        ):
+            return None
+        return (
+            fingerprint,
+            pending,
+            log_name,
+            pending_log_name,
+            required_markers,
+            run.id,
+        )
 
     def promote_pending_auto_compile(
         self,
@@ -2062,6 +3357,32 @@ class QueueRepository:
                 return False
             reservation["fingerprint"] = pending_fingerprint
             reservation.pop("pending_fingerprint", None)
+            active_run = self._auto_compile_run_unlocked(reservation)
+            if (
+                active_run is not None
+                and active_run.state not in {"succeeded", "failed", "dead"}
+            ):
+                transition_run_unlocked(
+                    self._connection,
+                    active_run.id,
+                    "failed",
+                    "failed",
+                    now=now_dt,
+                    summary="Superseded before automatic compile launch",
+                    completed_at=now_dt,
+                    redaction_env=self._redaction_env,
+                )
+            pending_run = self._auto_compile_run_unlocked(reservation, pending=True)
+            reservation["status_run_id"] = (
+                pending_run.id
+                if pending_run is not None
+                else self._create_auto_compile_run_unlocked(
+                    str(reservation.get("pending_log_name", reservation.get("log_name"))),
+                    pending_fingerprint,
+                    now_dt,
+                )
+            )
+            reservation.pop("pending_status_run_id", None)
             pending_log_name = reservation.pop("pending_log_name", None)
             if isinstance(pending_log_name, str):
                 reservation["log_name"] = pending_log_name
@@ -2209,9 +3530,42 @@ class QueueRepository:
                 observed_fingerprint is not None
                 and observed_fingerprint != fingerprint
             )
+            finishing_run = self._auto_compile_run_unlocked(reservation)
+            if finishing_run is not None and finishing_run.state in {
+                "queued",
+                "retrying",
+            }:
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "staging_started",
+                    now=now_dt,
+                )
+            self._transition_auto_compile_run_unlocked(
+                reservation,
+                "succeeded",
+                "succeeded",
+                now=now_dt,
+                summary=f"Compiled {reservation.get('log_name', 'daily log')}",
+            )
             if should_promote:
                 reservation["fingerprint"] = observed_fingerprint
                 reservation["log_name"] = promoted_log_name
+                pending_run = self._auto_compile_run_unlocked(
+                    reservation, pending=True
+                )
+                reservation["status_run_id"] = (
+                    pending_run.id
+                    if pending_run is not None
+                    and self._run_matches_auto_compile_generation(
+                        pending_run,
+                        str(promoted_log_name),
+                        str(observed_fingerprint),
+                    )
+                    else self._create_auto_compile_run_unlocked(
+                        str(promoted_log_name), str(observed_fingerprint), now_dt
+                    )
+                )
                 if promoted_marker_prefix is not None:
                     reservation["required_marker_prefix"] = list(
                         promoted_marker_prefix
@@ -2225,6 +3579,7 @@ class QueueRepository:
                     reservation.pop("pending_fingerprint", None)
                     reservation.pop("pending_log_name", None)
                     reservation.pop("pending_required_marker_prefix", None)
+                    reservation.pop("pending_status_run_id", None)
                 reservation["expires_at"] = _stored_time(expires_dt)
                 self._connection.execute(
                     "UPDATE queue_metadata SET value = ? WHERE key = ?",
@@ -2237,9 +3592,11 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return observed_fingerprint
-            self._connection.execute(
-                "DELETE FROM queue_metadata WHERE key = ?",
-                (AUTO_COMPILE_RESERVATION_KEY,),
+            self._delete_auto_compile_reservation_unlocked(
+                reservation,
+                now=now_dt,
+                active_succeeded=True,
+                reason=f"Compiled {reservation.get('log_name', 'daily log')}",
             )
             self._connection.execute("COMMIT")
             return None
@@ -2267,9 +3624,11 @@ class QueueRepository:
                     and reservation.get("fingerprint") == fingerprint
                 )
             if matched:
-                self._connection.execute(
-                    "DELETE FROM queue_metadata WHERE key = ?",
-                    (AUTO_COMPILE_RESERVATION_KEY,),
+                self._delete_auto_compile_reservation_unlocked(
+                    reservation,
+                    now=self._now(),
+                    active_succeeded=False,
+                    reason="Automatic compile reservation released",
                 )
             self._connection.execute("COMMIT")
             return matched
@@ -2383,6 +3742,14 @@ class QueueRepository:
                 )
                 self._connection.execute("COMMIT")
                 return None
+            run = self._auto_compile_run_unlocked(reservation)
+            if run is not None and run.state in {"queued", "retrying"}:
+                self._transition_auto_compile_run_unlocked(
+                    reservation,
+                    "running",
+                    "staging_started",
+                    now=now_dt,
+                )
             process = launch()
             self._connection.execute("COMMIT")
             return process

@@ -2,16 +2,138 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import logging
 import os
+import re
+import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
+    from .privacy import normalize_persistence_reason
     from .utils import open_secure_log_stream, prepare_secure_log_directory
 except ImportError:  # Standalone execution with scripts/ on sys.path.
+    from privacy import normalize_persistence_reason
     from utils import open_secure_log_stream, prepare_secure_log_directory
+
+
+_HOOK_EVENTS = frozenset(
+    {
+        "hook_log",
+        "malformed_input",
+        "transcript_missing",
+        "transcript_unreadable",
+        "capture_failed",
+        "queue_unavailable",
+        "capture_succeeded",
+        "capture_skipped",
+    }
+)
+_SOURCE_AGENTS = frozenset({"claude", "codex"})
+MAX_HOOK_CONTEXT_CHARS = 256
+_ABSOLUTE_PATH_START = re.compile(r"(?i)(?<![\w])(?:[a-z]:[\\/]|\\\\|/)")
+
+
+def _safe_context(value: object, env: dict[str, str]) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > MAX_HOOK_CONTEXT_CHARS:
+        return None
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        return None
+    if normalize_persistence_reason(value, _canonical_redaction_env(env)) != value:
+        return None
+    return value
+
+
+def _safe_occurrence_id(value: object) -> str | None:
+    if (
+        isinstance(value, str)
+        and len(value) == 32
+        and value.isascii()
+        and value.isalnum()
+    ):
+        return value.lower()
+    return None
+
+
+def diagnostic_project(payload: dict[str, object]) -> str:
+    """Derive bounded project attribution without persisting raw cwd data."""
+    environment = dict(os.environ)
+    project = _safe_context(payload.get("project"), environment)
+    if project is not None:
+        return project
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        derived = _safe_context(Path(cwd).name, environment)
+        if derived is not None:
+            return derived
+    return "unknown"
+
+
+def _safe_event_message(value: object, env: dict[str, str]) -> str:
+    text = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in str(value)
+    )
+    canonical = " ".join(text.split())
+    return normalize_persistence_reason(canonical, _canonical_redaction_env(env))
+
+
+def _canonical_redaction_env(env: dict[str, str]) -> dict[str, str]:
+    return {
+        name: canonical
+        for name, value in env.items()
+        if (canonical := " ".join(value.split()))
+    }
+
+
+def _scrub_absolute_paths(value: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    while match := _ABSOLUTE_PATH_START.search(value, cursor):
+        start = match.start()
+        quoted_start = start > 0 and value[start - 1] in {'"', "'"}
+        replacement_start = start - 1 if quoted_start else start
+        parts.append(value[cursor:replacement_start])
+        parts.append("[PATH]")
+        if quoted_start:
+            quote = value[start - 1]
+            closing = value.find(quote, match.end())
+            cursor = len(value) if closing < 0 else closing + 1
+        else:
+            cursor = len(value)
+        if cursor >= len(value):
+            break
+    if not parts:
+        return value
+    parts.append(value[cursor:])
+    return "".join(parts)
+
+
+def _safe_legacy_message(value: object, env: dict[str, str]) -> str:
+    raw = str(value)
+    canonical = " ".join(raw.split())
+    redacted = normalize_persistence_reason(
+        canonical,
+        _canonical_redaction_env(env),
+    )
+    path_safe = _scrub_absolute_paths(raw)
+    contains_path = path_safe != raw
+    contains_control = any(
+        (ord(character) < 32 and character not in "\n\r\t")
+        or ord(character) == 127
+        for character in raw
+    )
+    if (
+        len(raw) <= 1_000
+        and "[REDACTED]" not in redacted
+        and not contains_path
+        and not contains_control
+    ):
+        return raw
+    return _safe_event_message(path_safe, env)
 
 
 class HookJsonFormatter(logging.Formatter):
@@ -22,17 +144,39 @@ class HookJsonFormatter(logging.Formatter):
         self.component = component
 
     def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.fromtimestamp(record.created, timezone.utc)
+        timestamp = datetime.fromtimestamp(record.created, UTC)
+        event = getattr(record, "hook_event", "hook_log")
+        if event not in _HOOK_EVENTS:
+            event = "hook_log"
+        message = record.getMessage()
+        if event == "hook_log":
+            message = _safe_legacy_message(message, dict(os.environ))
+        else:
+            message = _safe_event_message(message, dict(os.environ))
         value = {
             "timestamp": timestamp.isoformat(timespec="milliseconds").replace(
                 "+00:00", "Z"
             ),
             "level": record.levelname,
             "component": self.component,
-            "event": "hook_log",
+            "event": event,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": message,
         }
+        source_agent = getattr(record, "source_agent", None)
+        if source_agent in _SOURCE_AGENTS:
+            value["source_agent"] = source_agent
+        session_id = _safe_context(
+            getattr(record, "session_id", None),
+            dict(os.environ),
+        )
+        if session_id is not None:
+            value["session_id"] = session_id
+        occurrence_id = _safe_occurrence_id(
+            getattr(record, "occurrence_id", None)
+        )
+        if occurrence_id is not None:
+            value["occurrence_id"] = occurrence_id
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -45,7 +189,7 @@ class _HookLogHandler(logging.StreamHandler):
             if written != len(payload):
                 raise OSError("incomplete hook log append")
         except Exception:
-            self.handleError(record)
+            return
 
     def close(self) -> None:
         try:
@@ -62,6 +206,11 @@ def _remove_owned_handlers(logger: logging.Logger) -> None:
             handler.close()
 
 
+def _handler_log_path(handler: logging.Handler) -> Path | None:
+    value = getattr(handler, "_memory_log_path", None)
+    return Path(value) if isinstance(value, str) else None
+
+
 def configure_hook_logger(
     logger_name: str,
     label: str,
@@ -75,14 +224,19 @@ def configure_hook_logger(
         for handler in logger.handlers
         if getattr(handler, "_memory_hook_file", False)
     ]
-    if len(tagged) == 1 and Path(tagged[0]._memory_log_path) == target:
+    if len(tagged) == 1 and _handler_log_path(tagged[0]) == target:
         return logger
 
     _remove_owned_handlers(logger)
-    try:
-        prepare_secure_log_directory(memory_root)
-        handler: logging.Handler = _HookLogHandler(open_secure_log_stream(target))
-    except (OSError, ValueError):
+    handler: logging.Handler | None = None
+    for _attempt in range(2):
+        try:
+            prepare_secure_log_directory(memory_root)
+            handler = _HookLogHandler(open_secure_log_stream(target))
+            break
+        except (OSError, ValueError):
+            continue
+    if handler is None:
         handler = logging.NullHandler()
     handler.setFormatter(HookJsonFormatter(label))
     handler._memory_hook_file = True  # type: ignore[attr-defined]
@@ -91,3 +245,59 @@ def configure_hook_logger(
     logger.setLevel(logging.INFO)
     logger.propagate = False
     return logger
+
+
+def log_hook_event(
+    logger: logging.Logger,
+    level: int,
+    event: str,
+    message: object,
+    *,
+    source_agent: str,
+    session_id: object = None,
+    occurrence_id: object = None,
+) -> None:
+    """Emit one structured, bounded hook event without exception metadata."""
+    logger.log(
+        level,
+        "%s",
+        message,
+        extra={
+            "hook_event": event,
+            "source_agent": source_agent,
+            "session_id": session_id,
+            "occurrence_id": occurrence_id,
+        },
+    )
+
+
+def classify_transcript_path(path: Path) -> str | None:
+    """Classify a transcript path without reading or exposing its contents."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "transcript_missing"
+    except OSError:
+        return "transcript_unreadable"
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return "transcript_unreadable"
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o444 == 0:
+        return "transcript_unreadable"
+    return None
+
+
+def classify_capture_error(error: BaseException) -> str:
+    """Classify only typed capture/queue failures, never message prose."""
+    child_event = getattr(error, "event", None)
+    if isinstance(child_event, str) and child_event in {
+        "queue_unavailable",
+        "capture_failed",
+    }:
+        return child_event
+    try:
+        from .capture import CaptureQueueUnavailableError
+    except ImportError:  # Direct execution with scripts/ on sys.path.
+        from capture import CaptureQueueUnavailableError
+    if isinstance(error, CaptureQueueUnavailableError):
+        return "queue_unavailable"
+    return "capture_failed"

@@ -9,17 +9,19 @@ The project adapts [Karpathy's LLM Knowledge Base](https://gist.github.com/karpa
 ```text
 Claude Code SessionEnd / PreCompact --\
                                       +--> local parser --> SQLite queue --> worker
-Codex SessionEnd --------------------/                           |
-                                                                 v
-                                           Codex (ChatGPT login) --> Claude fallback
-                                                                 |
-                                                                 v
-                          daily/ --> end-of-day staged compile --> knowledge/
+Codex SessionEnd --------------------/                 |            |
+                                                       v            v
+                                            optional dashboard  Codex --> Claude fallback
+                                                                    |
+                                                                    v
+                         daily/ <-- extracted entry <-- worker result
+                            |
+                            +--> end-of-day staged compile --> knowledge/
 
 Claude Code / Codex SessionStart --> local index and recent-log context
 ```
 
-Hooks perform local parsing and enqueue work; they never call a model. The worker prefers Codex, uses `gpt-5.6-luna` for extraction and semantic lint, and uses `gpt-5.6-terra` for synthesis and staged edits. If Codex authentication, capacity, timeout, command execution, output validation, or staged validation fails, the same job falls back to the subscription-backed Claude Agent SDK. Provider attempts and fallback reasons remain available in the queue and usage log.
+Hooks perform local parsing and enqueue work; they never call a model. The worker prefers Codex, uses `gpt-5.6-luna` for extraction and semantic lint, and uses `gpt-5.6-terra` for synthesis and staged edits. If Codex authentication, capacity, timeout, command execution, output validation, or staged validation fails, the same job falls back to the subscription-backed Claude Agent SDK. Provider attempts and fallback reasons remain available in the queue and usage log. Status runs and append-only events in the same SQLite database record live capture and automatic compile progress. The optional dashboard observes those records; it does not run or control jobs.
 
 All model-driven edits happen in disposable staging directories. Host Python validates each stage and applies approved files under one writer lock with a recovery journal. Models never write directly to the real knowledge base.
 
@@ -52,6 +54,7 @@ cd claude-memory-compiler
 uv sync
 export AI_MEMORY_HOME="$PWD"
 bin/setup-global.sh
+uv run python scripts/status.py
 ```
 
 `AI_MEMORY_HOME` is the canonical absolute path to the central knowledge base. `CLAUDE_MEMORY_HOME` remains a deprecated compatibility alias. If both variables are set, they must resolve to the same path. Provider children receive `AI_MEMORY_INTERNAL_JOB=1`; hooks check that guard before touching the queue or spool, which prevents recursive capture.
@@ -96,9 +99,25 @@ uv run python scripts/query.py "question" --file-back # query and stage a filed 
 uv run python scripts/lint.py                         # structural and semantic checks
 uv run python scripts/lint.py --structural-only       # local checks; no provider call
 uv run python scripts/worker.py --drain               # recover leases and drain ready jobs
+uv run python scripts/status.py                       # watch the interactive status dashboard
+uv run python scripts/status.py --snapshot            # print one status snapshot and exit
 ```
 
 At personal scale, the model can select relevant articles from `knowledge/index.md` more accurately than cosine similarity. Consider hybrid retrieval only when the index grows beyond the available context window.
+
+## Status Dashboard
+
+Run `uv run python scripts/status.py` in a separate terminal tab or split pane. Watch mode is the default. It groups jobs into Active, Needs Attention, and Recent, provides a selectable event and provider-attempt timeline, and keeps the automatic compile state visible in a separate panel. Successful and acknowledged runs remain in Recent for seven days. Unacknowledged failures remain in Needs Attention until you select one and press `a`.
+
+Before the first capture creates the queue database, both watch and snapshot modes show an empty status view without creating the database. Unsafe or malformed existing queue data still produces a diagnostic.
+
+The dashboard uses restrained semantic color for running, retrying, successful, and failed work. State icons and labels carry the same meaning without color. Set `NO_COLOR` or pass `--no-color` to disable color. Press `?` for the complete key map.
+
+The dashboard is a read-only observer. Closing it never cancels a flush or compile. Jobs continue in the detached worker, and their persisted phases, fallback path, result, and bounded error appear when you reopen it. Acknowledgment changes only the private display state at `scripts/status-state/status-view.json`; it cannot change, retry, reset, or delete a queue job. Use the separate recovery commands below when a job needs operator action.
+
+Status records contain operational metadata: source agent, project and session identity, phase, provider, timing, bounded result summaries, and redacted errors. They exclude transcript bodies, prompts, provider output, and extracted knowledge. Hook failures that persist successfully appear as durable runs in Needs Attention. Pressing `a` acknowledges the selected run in observer state and moves it to Recent without changing execution history. When durable persistence cannot complete, the dashboard instead shows the recognized `scripts/logs/hooks.log` occurrence in its 24-hour health banner. The structured hook log and other diagnostic logs remain the fallback for failures that occur before SQLite can accept a status record.
+
+Version 1 fully instruments live Claude/Codex capture and automatic end-of-day compile. The status schema can support other operations later, but the dashboard does not claim live status for uninstrumented manual compile, query, connection, or lint commands.
 
 ## Historical Import
 

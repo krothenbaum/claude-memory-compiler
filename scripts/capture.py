@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import datetime
 import hashlib
 import os
-from pathlib import Path
 import platform
 import shutil
 import sqlite3
@@ -16,8 +13,11 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Callable, Literal, Mapping
-
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -26,7 +26,6 @@ if str(ROOT) not in sys.path:
 from scripts.config import load_config
 from scripts.queue import EnqueueResult, Job, QueueRepository
 from scripts.transcripts import parse_claude_transcript, parse_codex_transcript
-
 
 CAPTURE_DB_BUSY_TIMEOUT_MS = 250
 SNAPSHOT_LINK_RETRY_ATTEMPTS = 3
@@ -40,6 +39,10 @@ class UnsafeSpoolError(ValueError):
 
 class CaptureDeadlineExceeded(TimeoutError):
     """Raised before queue commit when a bounded live capture runs out of time."""
+
+
+class CaptureQueueUnavailableError(RuntimeError):
+    """Expected queue configuration, open, or storage failure during capture."""
 
 
 def _check_deadline(
@@ -81,6 +84,52 @@ def _guarded_outcome(env: Mapping[str, str]) -> CaptureOutcome | None:
     if "CLAUDE_INVOKED_BY" in env:
         return CaptureOutcome("skipped", reason="legacy_internal_job")
     return None
+
+
+def _validate_live_queue_override(env: Mapping[str, str]) -> None:
+    """Reject an unsafe configured queue identity before config resolution."""
+    if "AI_MEMORY_QUEUE_PATH" not in env:
+        return
+    configured = env.get("AI_MEMORY_QUEUE_PATH")
+    if not isinstance(configured, str) or not configured:
+        error = ValueError("AI_MEMORY_QUEUE_PATH must not be empty")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    target = Path(configured).expanduser()
+    if not target.is_absolute():
+        error = ValueError("AI_MEMORY_QUEUE_PATH must be absolute")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        error = ValueError("configured queue must be a regular non-symlink file")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    if info.st_nlink != 1:
+        error = ValueError("configured queue must not be hard-linked")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        error = ValueError("configured queue has an unsafe owner")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        error = ValueError("configured queue has unsafe permissions")
+        raise CaptureQueueUnavailableError(
+            "queue configuration is unavailable"
+        ) from error
 
 
 def launch_worker(memory_home: Path | str) -> None:
@@ -442,6 +491,8 @@ def capture_transcript(
     if not source.is_file():
         raise ValueError("transcript_path must name a regular file")
 
+    if queue is None:
+        _validate_live_queue_override(source_env)
     if memory_home is None:
         root = load_config(source_env).root_dir
     else:
@@ -484,13 +535,18 @@ def capture_transcript(
         owns_queue = queue is None
         if queue is None:
             _check_deadline(deadline, monotonic)
-            queue_config = load_config(
-                {
-                    **source_env,
-                    "AI_MEMORY_HOME": str(root),
-                    "CLAUDE_MEMORY_HOME": str(root),
-                }
-            )
+            try:
+                queue_config = load_config(
+                    {
+                        **source_env,
+                        "AI_MEMORY_HOME": str(root),
+                        "CLAUDE_MEMORY_HOME": str(root),
+                    }
+                )
+            except OSError as error:
+                raise CaptureQueueUnavailableError(
+                    "queue configuration is unavailable"
+                ) from error
             busy_timeout_ms = CAPTURE_DB_BUSY_TIMEOUT_MS
             if deadline is not None:
                 remaining_seconds = deadline - monotonic()
@@ -519,9 +575,19 @@ def capture_transcript(
                         for marker in ("locked", "busy")
                     )
                     if not transient or attempt == 24:
-                        raise
+                        raise CaptureQueueUnavailableError(
+                            "queue repository is unavailable"
+                        ) from error
                     _check_deadline(deadline, monotonic)
                     time.sleep(0.01)
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    raise CaptureQueueUnavailableError(
+                        "queue repository is unavailable"
+                    ) from error
+                except RuntimeError as error:
+                    raise CaptureQueueUnavailableError(
+                        "queue repository schema is unavailable"
+                    ) from error
             else:  # pragma: no cover - the bounded loop always breaks or raises.
                 raise RuntimeError("queue open retry loop exhausted")
         else:
@@ -535,7 +601,12 @@ def capture_transcript(
                     expected_digest=snapshot_digest,
                     expected_size=snapshot_size,
                 )
-            result = repository.enqueue_capture(normalized)
+            try:
+                result = repository.enqueue_capture(normalized)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                raise CaptureQueueUnavailableError(
+                    "queue enqueue is unavailable"
+                ) from error
             committed_result = result
         finally:
             if owns_queue:
