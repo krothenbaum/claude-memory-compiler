@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from types import SimpleNamespace
 from typing import Literal
@@ -9,12 +10,15 @@ from typing import Literal
 from scripts.providers import ProviderResult, ProviderRouter, TextRequest
 from scripts.queue import QueueRepository
 from scripts.status_app import StatusDashboard
+from scripts.status_health import read_recent_hook_alerts, record_hook_diagnostic
 from scripts.status_store import (
     CompileReadinessProbes,
     CompileStatus,
     HealthAlert,
     ObserverState,
     StatusSnapshot,
+    acknowledge_run,
+    observer_state_path,
     read_run_details,
     read_snapshot,
 )
@@ -464,3 +468,67 @@ def test_persisted_worker_status_survives_observer_attach_detach_and_reopen(tmp_
         ("session-fallback", "claude extraction"),
         ("session-live", "codex extraction"),
     ]
+
+
+def test_hook_diagnostic_outlives_health_tail_and_observer_acknowledges(
+    tmp_path,
+):
+    occurred_at = datetime.now(UTC)
+    assert record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="codex",
+        session_id="durable-session",
+        project="memory",
+        message="capture failed",
+        token_factory=lambda: "durable-occurrence",
+    )
+    logs = tmp_path / "scripts" / "logs"
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    logs.chmod(0o700)
+    hook_log = logs / "hooks.log"
+    hook_log.write_text(
+        json.dumps(
+            {
+                "timestamp": occurred_at.isoformat().replace("+00:00", "Z"),
+                "level": "ERROR",
+                "component": "codex-session-end",
+                "event": "capture_failed",
+                "logger": "ai-memory-codex-session-end",
+                "message": "capture failed",
+                "source_agent": "codex",
+                "session_id": "durable-session",
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hook_log.chmod(0o600)
+
+    assert len(read_recent_hook_alerts(tmp_path, now=occurred_at)) == 1
+    later = occurred_at + timedelta(days=2)
+    assert read_recent_hook_alerts(tmp_path, now=later) == ()
+
+    queue_path = tmp_path / "scripts" / "jobs.sqlite3"
+    initial = read_snapshot(
+        queue_path,
+        now=later,
+        observer_state=ObserverState.empty(),
+        memory_home=tmp_path,
+    )
+    assert len(initial.attention) == 1
+    diagnostic = initial.attention[0]
+    assert diagnostic.state == "failed"
+    assert diagnostic.source_agent == "codex"
+    assert diagnostic.session_id == "durable-session"
+
+    observer = acknowledge_run(observer_state_path(tmp_path), diagnostic.id)
+    acknowledged = read_snapshot(
+        queue_path,
+        now=later,
+        observer_state=observer,
+        memory_home=tmp_path,
+    )
+    assert acknowledged.attention == ()
+    assert [run.id for run in acknowledged.recent] == [diagnostic.id]

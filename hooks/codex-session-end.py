@@ -69,6 +69,32 @@ def _logger() -> logging.Logger:
     )
 
 
+def _record_diagnostic(
+    *,
+    event: str,
+    session_id: object,
+    project: object,
+    message: str,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    try:
+        from scripts.status_health import record_hook_diagnostic
+
+        return record_hook_diagnostic(
+            _runtime_root(),
+            event=event,
+            source_agent="codex",
+            session_id=session_id,
+            project=project,
+            message=message,
+            deadline=deadline,
+            clock=clock,
+        )
+    except Exception:
+        return False
+
+
 def main(clock: Callable[[], float] = time.monotonic) -> None:
     deadline = clock() + HOOK_WORK_BUDGET_SECONDS
     logger = _logger()
@@ -103,6 +129,14 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             "failed to parse hook input",
             source_agent="codex",
         )
+        _record_diagnostic(
+            event="malformed_input",
+            session_id="unknown",
+            project="unknown",
+            message="failed to parse hook input",
+            deadline=deadline,
+            clock=clock,
+        )
         return
 
     transcript_value = value.get("transcript_path")
@@ -114,6 +148,14 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             "hook input did not include a transcript",
             source_agent="codex",
             session_id=value.get("session_id"),
+        )
+        _record_diagnostic(
+            event="transcript_missing",
+            session_id=value.get("session_id"),
+            project=value.get("project"),
+            message="hook input did not include a transcript",
+            deadline=deadline,
+            clock=clock,
         )
         return
     transcript_path = Path(transcript_value).expanduser()
@@ -130,6 +172,18 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             ),
             source_agent="codex",
             session_id=value.get("session_id"),
+        )
+        _record_diagnostic(
+            event=transcript_event,
+            session_id=value.get("session_id"),
+            project=value.get("project"),
+            message=(
+                "transcript is missing"
+                if transcript_event == "transcript_missing"
+                else "transcript is unreadable"
+            ),
+            deadline=deadline,
+            clock=clock,
         )
         return
 
@@ -197,6 +251,15 @@ def main(clock: Callable[[], float] = time.monotonic) -> None:
             source_agent="codex",
             session_id=value.get("session_id"),
         )
+        if event == "capture_failed":
+            _record_diagnostic(
+                event=event,
+                session_id=value.get("session_id"),
+                project=value.get("project"),
+                message="capture failed",
+                deadline=deadline,
+                clock=clock,
+            )
 
 
 if __name__ == "__main__":

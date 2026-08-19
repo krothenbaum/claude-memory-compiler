@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 
 from scripts import capture as capture_module
 from scripts import hook_logging
+from scripts.queue import QueueRepository
 
 ROOT = Path(__file__).resolve().parents[2]
 HOOKS = ROOT / "hooks"
@@ -57,6 +59,20 @@ def _close_logger(logger: logging.Logger) -> None:
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
+
+
+def _diagnostic_runs(memory_home: Path) -> list[sqlite3.Row]:
+    path = memory_home / "scripts" / "jobs.sqlite3"
+    if not path.exists():
+        return []
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(
+            "SELECT * FROM status_runs ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -107,6 +123,10 @@ def test_precompact_structured_input_errors_are_visible_to_health_reader(
     )
     assert len(alerts) == 1
     assert alerts[0].component == "pre-compact"
+    runs = _diagnostic_runs(memory_home)
+    assert len(runs) == 1
+    assert runs[0]["state"] == "failed"
+    assert runs[0]["phase"] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -179,6 +199,8 @@ def test_precompact_structured_capture_outcomes_are_visible(
         now=datetime.now(UTC),
     )
     assert bool(alerts) is is_error
+    runs = _diagnostic_runs(memory_home)
+    assert len(runs) == int(expected_event == "capture_failed")
 
 
 @pytest.mark.parametrize(
@@ -186,11 +208,13 @@ def test_precompact_structured_capture_outcomes_are_visible(
     [("session-end.py", "claude"), ("codex-session-end.py", "codex")],
 )
 def test_malformed_hook_input_records_precise_error_event(
-    monkeypatch, hook_name, source_agent
+    tmp_path, monkeypatch, hook_name, source_agent
 ):
     hook = _load_hook(hook_name)
     logger, handler = _record_logger(f"malformed-{source_agent}")
     monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO("{"))
 
     hook.main(clock=lambda: 0.0)
@@ -201,6 +225,9 @@ def test_malformed_hook_input_records_precise_error_event(
     assert record.hook_event == "malformed_input"
     assert record.source_agent == source_agent
     assert record.session_id is None
+    runs = _diagnostic_runs(tmp_path)
+    assert len(runs) == 1
+    assert runs[0]["source_agent"] == source_agent
 
 
 @pytest.mark.parametrize(
@@ -307,6 +334,8 @@ def test_missing_transcript_records_error_without_exposing_path(
     logger, handler = _record_logger(f"missing-{source_agent}")
     secret_path = tmp_path / "credential-private-transcript.jsonl"
     monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path / "memory"))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
     monkeypatch.setattr(
         sys,
         "stdin",
@@ -328,6 +357,7 @@ def test_missing_transcript_records_error_without_exposing_path(
     assert record.source_agent == source_agent
     assert record.session_id == "session-missing"
     assert str(secret_path) not in record.getMessage()
+    assert len(_diagnostic_runs(tmp_path / "memory")) == 1
 
 
 @pytest.mark.parametrize(
@@ -342,6 +372,8 @@ def test_nonregular_transcript_records_unreadable_event(
     transcript_directory = tmp_path / "transcript-directory"
     transcript_directory.mkdir()
     monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path / "memory"))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
     monkeypatch.setattr(
         sys,
         "stdin",
@@ -361,6 +393,7 @@ def test_nonregular_transcript_records_unreadable_event(
     assert record.levelno == logging.ERROR
     assert record.hook_event == "transcript_unreadable"
     assert record.session_id == "session-unreadable"
+    assert len(_diagnostic_runs(tmp_path / "memory")) == 1
 
 
 def test_pre_enqueue_failure_records_capture_failed_with_session(tmp_path, monkeypatch):
@@ -371,6 +404,8 @@ def test_pre_enqueue_failure_records_capture_failed_with_session(tmp_path, monke
     slice_path = tmp_path / "slice.jsonl"
     slice_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path / "memory"))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
         "session_id": "session-before-queue",
         "transcript_path": str(transcript),
@@ -395,6 +430,52 @@ def test_pre_enqueue_failure_records_capture_failed_with_session(tmp_path, monke
     record = handler.records[-1]
     assert record.hook_event == "capture_failed"
     assert record.session_id == "session-before-queue"
+    assert len(_diagnostic_runs(tmp_path / "memory")) == 1
+
+
+def test_codex_capture_failure_records_diagnostic(tmp_path, monkeypatch):
+    hook = _load_hook("codex-session-end.py")
+    logger, handler = _record_logger("codex-capture-diagnostic")
+    memory_home = tmp_path / "memory"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "session_id": "codex-capture",
+                    "transcript_path": str(transcript),
+                    "project": "memory",
+                }
+            )
+        ),
+    )
+
+    @contextmanager
+    def selected(*_args, **_kwargs):
+        yield transcript, SimpleNamespace(turns=(object(),))
+
+    helpers = SimpleNamespace(
+        bounded_transcript_slice=selected,
+        require_time_remaining=lambda *_args, **_kwargs: None,
+        enqueue_capture_with_deadline=lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(ValueError("capture failed")),
+        MIN_CAPTURE_REMAINING_SECONDS=0.75,
+    )
+    monkeypatch.setattr(hook, "_live_capture_helpers", lambda: helpers)
+
+    hook.main(clock=lambda: 0.0)
+
+    assert handler.records[-1].hook_event == "capture_failed"
+    runs = _diagnostic_runs(memory_home)
+    assert len(runs) == 1
+    assert runs[0]["source_agent"] == "codex"
 
 
 def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
@@ -403,6 +484,8 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
     transcript = tmp_path / "session.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setenv("AI_MEMORY_HOME", str(tmp_path / "memory"))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
         "session_id": "session-db",
         "transcript_path": str(transcript),
@@ -427,6 +510,7 @@ def test_unavailable_queue_records_queue_unavailable(tmp_path, monkeypatch):
     hook.main(clock=lambda: 0.0)
 
     assert handler.records[-1].hook_event == "queue_unavailable"
+    assert _diagnostic_runs(tmp_path / "memory") == []
 
 
 @pytest.mark.parametrize(
@@ -537,6 +621,7 @@ def test_real_capture_child_classifies_unsafe_queue_boundary(
         "message": "queue unavailable during capture",
     }
     assert str(transcript) not in json.dumps(records[-1])
+    assert _diagnostic_runs(memory_home) == []
 
 
 def test_structured_hook_log_redacts_bounds_and_stays_one_line(tmp_path, monkeypatch):
@@ -959,3 +1044,160 @@ def test_recent_hook_alerts_rejects_naive_now(tmp_path):
             tmp_path,
             now=NOW.replace(tzinfo=None),
         )
+
+
+def test_record_hook_diagnostic_persists_safe_terminal_run(tmp_path, monkeypatch):
+    health = _health_module()
+    secret = "credential-value-never-persist"
+    monkeypatch.setenv("AI_MEMORY_VIEW_TOKEN", secret)
+
+    recorded = health.record_hook_diagnostic(
+        tmp_path,
+        event="malformed_input",
+        source_agent="invalid-agent",
+        session_id=f"session-{secret}\nprivate",
+        project="",
+        message=f"Malformed {secret}\ninput",
+        deadline=10.0,
+        clock=lambda: 0.0,
+        token_factory=lambda: "raw-private-token",
+    )
+
+    assert recorded is True
+    with QueueRepository(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        sync_usage=False,
+    ) as repository:
+        rows = repository._connection.execute("SELECT * FROM status_runs").fetchall()
+        assert len(rows) == 1
+        run = repository.status_run_for_operation(rows[0]["operation_key"])
+        assert run is not None
+        assert run.state == "failed"
+        assert run.source_agent == "unknown"
+        assert run.session_id == "unknown"
+        assert run.project == "unknown"
+        assert secret not in (run.error or "")
+        assert "raw-private-token" not in (run.operation_key or "")
+        assert len(repository.status_events(run.id)) == 1
+        assert repository._connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("event", ["queue_unavailable", "capture_succeeded", "hook_log"])
+def test_record_hook_diagnostic_ignores_log_only_or_nonfailure_events(tmp_path, event):
+    health = _health_module()
+
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event=event,
+        source_agent="claude",
+        session_id="session",
+        project="memory",
+        message="failure",
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) is False
+    assert not (tmp_path / "scripts" / "jobs.sqlite3").exists()
+
+def test_record_hook_diagnostic_deadline_and_persistence_failure_are_advisory(
+    tmp_path, monkeypatch
+):
+    health = _health_module()
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="session",
+        project="memory",
+        message="failure",
+        deadline=0.05,
+        clock=lambda: 0.0,
+    ) is False
+    assert not (tmp_path / "scripts" / "jobs.sqlite3").exists()
+
+    monkeypatch.setattr(
+        health,
+        "QueueRepository",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("diagnostic unavailable")
+        ),
+        raising=False,
+    )
+    assert health.record_hook_diagnostic(
+        tmp_path,
+        event="capture_failed",
+        source_agent="claude",
+        session_id="session",
+        project="memory",
+        message="failure",
+        deadline=10.0,
+        clock=lambda: 0.0,
+    ) is False
+
+
+@pytest.mark.parametrize("failure_mode", ["persistence", "deadline"])
+def test_hook_diagnostic_failure_or_deadline_does_not_change_hook_outcome(
+    tmp_path, monkeypatch, failure_mode
+):
+    hook = _load_hook("session-end.py")
+    health = _health_module()
+    logger, handler = _record_logger(f"diagnostic-{failure_mode}")
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("AI_MEMORY_HOME", str(memory_home))
+    monkeypatch.delenv("CLAUDE_MEMORY_HOME", raising=False)
+    monkeypatch.setattr(hook, "_logger", lambda: logger)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({"session_id": "advisory"})),
+    )
+    if failure_mode == "persistence":
+        monkeypatch.setattr(
+            health,
+            "QueueRepository",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("diagnostic unavailable")
+            ),
+        )
+        clock = lambda: 0.0
+    else:
+        ticks = iter([0.0, 2.2])
+        clock = lambda: next(ticks)
+
+    hook.main(clock=clock)
+
+    assert handler.records[-1].hook_event == "transcript_missing"
+    assert not (memory_home / "scripts" / "jobs.sqlite3").exists()
+
+
+def test_concurrent_hook_diagnostic_occurrences_are_distinct(tmp_path):
+    health = _health_module()
+
+    def record(index):
+        return health.record_hook_diagnostic(
+            tmp_path,
+            event="capture_failed",
+            source_agent="codex",
+            session_id=f"session-{index}",
+            project="memory",
+            message="capture failed",
+            deadline=10.0,
+            clock=lambda: 0.0,
+            token_factory=lambda: f"occurrence-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        assert all(executor.map(record, range(8)))
+
+    with QueueRepository(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        sync_usage=False,
+    ) as repository:
+        runs = repository._connection.execute(
+            "SELECT id, operation_key FROM status_runs ORDER BY id"
+        ).fetchall()
+        assert len(runs) == 8
+        assert len({row["operation_key"] for row in runs}) == 8
+        event_count = repository._connection.execute(
+            "SELECT count(*) FROM status_events"
+        ).fetchone()[0]
+        assert event_count == 8

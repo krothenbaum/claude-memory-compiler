@@ -13,7 +13,7 @@ import secrets
 import sqlite3
 import stat
 import sysconfig
-from typing import Callable, Literal, Mapping, TypeAlias
+from typing import Callable, Literal, Mapping, TypeAlias, cast
 
 try:
     from .privacy import normalize_persistence_reason
@@ -721,6 +721,118 @@ class QueueRepository:
             created = self.status_run_for_operation(operation_key)
             if created is None:  # Defensive: insert and readback share a transaction.
                 raise RuntimeError("created operation status could not be read back")
+            self._connection.execute("COMMIT")
+            return created
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def create_failed_operation_run(
+        self,
+        operation_key: str,
+        *,
+        kind: RunKind = "capture",
+        source_agent: str,
+        session_id: str,
+        project: str,
+        summary: str | None,
+        error: str | None,
+    ) -> StatusRun:
+        """Atomically create one terminal diagnostic run and failed event."""
+        persisted_source = source_agent
+        validation_source = cast(
+            SourceAgent,
+            "system" if source_agent == "unknown" else source_agent,
+        )
+        operation_key, kind, _source, session_id, project = (
+            validate_operation_identity(
+                operation_key,
+                kind,
+                validation_source,
+                session_id,
+                project,
+                redaction_env=self._redaction_env,
+            )
+        )
+        if source_agent not in {"claude", "codex", "system", "unknown"}:
+            raise ValueError(f"invalid diagnostic source_agent: {source_agent!r}")
+        now = self._now()
+        candidate = StatusRun(
+            id=0,
+            job_id=None,
+            operation_key=operation_key,
+            kind=kind,
+            source_agent=persisted_source,
+            session_id=session_id,
+            project=project,
+            state="failed",
+            phase="failed",
+            summary=summary,
+            error=error,
+            started_at=now,
+            updated_at=now,
+            completed_at=now,
+            redaction_env=self._redaction_env,
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.status_run_for_operation(operation_key)
+            if existing is not None:
+                identity = (kind, persisted_source, session_id, project)
+                persisted_identity = (
+                    existing.kind,
+                    existing.source_agent,
+                    existing.session_id,
+                    existing.project,
+                )
+                if persisted_identity != identity or (
+                    existing.state != "failed"
+                    or existing.phase != "failed"
+                    or existing.completed_at is None
+                ):
+                    raise ValueError(
+                        "operation_key is already used by another operation"
+                    )
+                self._connection.execute("COMMIT")
+                return existing
+            cursor = self._connection.execute(
+                """
+                INSERT INTO status_runs (
+                    operation_key, kind, source_agent, session_id, project,
+                    state, phase, summary, error, started_at, updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.operation_key,
+                    candidate.kind,
+                    candidate.source_agent,
+                    candidate.session_id,
+                    candidate.project,
+                    candidate.state,
+                    candidate.phase,
+                    candidate.summary,
+                    candidate.error,
+                    _stored_time(candidate.started_at),
+                    _stored_time(candidate.updated_at),
+                    _stored_time(now),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("created diagnostic run has no identifier")
+            append_event_unlocked(
+                self._connection,
+                cursor.lastrowid,
+                "failed",
+                now=now,
+                level="error",
+                message=candidate.error or candidate.summary,
+                redaction_env=self._redaction_env,
+            )
+            created = self.status_run_for_operation(operation_key)
+            if created is None:
+                raise RuntimeError("created diagnostic status could not be read back")
             self._connection.execute("COMMIT")
             return created
         except BaseException:

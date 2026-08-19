@@ -707,3 +707,112 @@ def test_persistence_redacts_generic_credential_suffixes_only(tmp_path):
         assert persisted.count("[REDACTED]") == 4
         assert all(value not in persisted for value in list(credentials.values())[:4])
         assert credentials["UNRELATED_SETTING"] in persisted
+
+
+def test_failed_operation_run_is_atomic_terminal_and_has_no_job(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        run = repository.create_failed_operation_run(
+            "hook-diagnostic:malformed_input:occurrence-1",
+            kind="capture",
+            source_agent="claude",
+            session_id="session-1",
+            project="memory",
+            summary="Hook input failed",
+            error="Malformed hook input",
+        )
+
+        assert run.state == "failed"
+        assert run.phase == "failed"
+        assert run.started_at == NOW
+        assert run.updated_at == NOW
+        assert run.completed_at == NOW
+        assert run.job_id is None
+        assert repository._connection.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+        events = repository.status_events(run.id)
+        assert len(events) == 1
+        assert events[0].phase == "failed"
+        assert events[0].level == "error"
+        assert events[0].message == "Malformed hook input"
+
+
+def test_failed_operation_run_is_idempotent_but_occurrences_are_distinct(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, clock=lambda: NOW, sync_usage=False) as repository:
+        first = repository.create_failed_operation_run(
+            "hook-diagnostic:capture_failed:occurrence-1",
+            source_agent="codex",
+            session_id="session-1",
+            project="memory",
+            summary="Capture failed",
+            error="Capture failed",
+        )
+        repeated = repository.create_failed_operation_run(
+            "hook-diagnostic:capture_failed:occurrence-1",
+            source_agent="codex",
+            session_id="session-1",
+            project="memory",
+            summary="Capture failed",
+            error="Capture failed",
+        )
+        second = repository.create_failed_operation_run(
+            "hook-diagnostic:capture_failed:occurrence-2",
+            source_agent="codex",
+            session_id="session-1",
+            project="memory",
+            summary="Capture failed",
+            error="Capture failed",
+        )
+
+        assert repeated == first
+        assert second.id != first.id
+        assert len(repository.status_events(first.id)) == 1
+        assert len(repository.status_events(second.id)) == 1
+
+
+def test_failed_operation_run_redacts_and_rolls_back_event_failure(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    secret = "credential-value-never-persist"
+    with QueueRepository(
+        path,
+        clock=lambda: NOW,
+        redaction_env={"OPENAI_API_KEY": secret},
+        sync_usage=False,
+    ) as repository:
+        run = repository.create_failed_operation_run(
+            "hook-diagnostic:capture_failed:private",
+            source_agent="claude",
+            session_id="session-private",
+            project="memory",
+            summary=f"Failed with {secret}\nsummary",
+            error=f"Failed with {secret}\nerror",
+        )
+        assert secret not in (run.summary or "")
+        assert secret not in (run.error or "")
+        assert "\n" not in (run.error or "")
+
+        monkeypatch.setattr(
+            queue_module,
+            "append_event_unlocked",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("event insert failed")
+            ),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="event insert failed"):
+            repository.create_failed_operation_run(
+                "hook-diagnostic:capture_failed:rollback",
+                source_agent="claude",
+                session_id="session-private",
+                project="memory",
+                summary="Failed",
+                error="Failed",
+            )
+
+        assert (
+            repository.status_run_for_operation(
+                "hook-diagnostic:capture_failed:rollback"
+            )
+            is None
+        )
