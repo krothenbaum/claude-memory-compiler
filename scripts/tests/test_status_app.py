@@ -13,6 +13,7 @@ from textual.content import Content
 from scripts.status_app import StatusDashboard, run_dashboard
 from scripts.status_store import (
     CompileStatus,
+    HealthAlert,
     ObserverState,
     RunDetails,
     StatusDatabaseUnavailable,
@@ -127,6 +128,44 @@ async def test_dashboard_structure_and_responsive_layout(tmp_path, size, layout_
 
 
 @async_test
+async def test_dashboard_header_uses_full_matching_counts_when_rows_are_trimmed(tmp_path):
+    value = replace(snapshot(), active_count=12, attention_count=7, recent_count=30)
+    dashboard = app(tmp_path, lambda *_args, **_kwargs: value)
+
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        header = str(dashboard.query_one("#app-header").render())
+
+    assert "12 active" in header
+    assert "7 needs attention" in header
+
+
+@async_test
+async def test_health_banner_elides_alerts_and_keeps_run_list_usable(tmp_path):
+    alerts = tuple(
+        HealthAlert(
+            created_at=NOW,
+            level="error",
+            message=f"Hook failure {index}",
+        )
+        for index in range(5)
+    )
+    value = replace(snapshot(), health_alerts=alerts)
+    dashboard = app(tmp_path, lambda *_args, **_kwargs: value)
+
+    async with dashboard.run_test(size=(80, 16)) as pilot:
+        await pilot.pause()
+        health = dashboard.query_one("#health-banner")
+        rendered = str(health.render())
+        assert "Hook failure 0" in rendered
+        assert "Hook failure 1" in rendered
+        assert "Hook failure 2" not in rendered
+        assert "+3 more" in rendered
+        assert health.region.height <= 3
+        assert dashboard.query_one("#run-list").region.height > 0
+
+
+@async_test
 async def test_refresh_keeps_last_good_snapshot_on_sqlite_contention(tmp_path):
     calls = 0
 
@@ -146,8 +185,8 @@ async def test_refresh_keeps_last_good_snapshot_on_sqlite_contention(tmp_path):
 
 
 @async_test
-async def test_missing_database_shows_persistent_diagnostic_without_creation(tmp_path):
-    queue_path = tmp_path / "missing.sqlite3"
+async def test_unavailable_database_shows_persistent_diagnostic_without_creation(tmp_path):
+    queue_path = tmp_path / "unavailable.sqlite3"
 
     def reader(*_args, **_kwargs):
         raise StatusDatabaseUnavailable(queue_path, "missing database")
@@ -156,7 +195,31 @@ async def test_missing_database_shows_persistent_diagnostic_without_creation(tmp
     async with dashboard.run_test() as pilot:
         await pilot.pause()
         assert dashboard.query_one("#diagnostic").display is True
-        assert "missing.sqlite3" in str(dashboard.query_one("#diagnostic").render())
+        assert "unavailable.sqlite3" in str(
+            dashboard.query_one("#diagnostic").render()
+        )
+    assert not queue_path.exists()
+
+
+@async_test
+async def test_missing_first_run_database_renders_empty_without_creation(tmp_path):
+    queue_path = tmp_path / "missing.sqlite3"
+    dashboard = StatusDashboard(
+        queue_path,
+        memory_home=tmp_path,
+        observer_loader=lambda _path: ObserverState.empty(),
+        health_loader=lambda: (),
+        clock=lambda: NOW,
+    )
+
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.snapshot is not None
+        assert dashboard.snapshot.active == ()
+        assert dashboard.snapshot.attention == ()
+        assert dashboard.snapshot.recent == ()
+        assert dashboard.query_one("#diagnostic").display is False
+
     assert not queue_path.exists()
 
 
@@ -481,6 +544,27 @@ async def test_wrapped_sqlite_busy_keeps_last_good_frame_and_initial_busy_diagno
         assert initial.query_one("#delayed-banner").display is True
         assert initial.query_one("#diagnostic").display is True
     assert not (tmp_path / "missing.sqlite3").exists()
+
+
+@async_test
+async def test_busy_detection_walks_past_nonbusy_operational_error(tmp_path):
+    locked = sqlite3.OperationalError("database is locked")
+    nonbusy = sqlite3.OperationalError("disk I/O error")
+    wrapped = StatusDataInvalid(tmp_path / "jobs.sqlite3", "invalid")
+    wrapped.__cause__ = nonbusy
+    wrapped.__context__ = locked
+    nonbusy.__cause__ = wrapped
+
+    def reader(*_args, **_kwargs):
+        raise wrapped
+
+    dashboard = app(tmp_path, reader)
+    async with dashboard.run_test() as pilot:
+        await pilot.pause()
+        assert dashboard.query_one("#delayed-banner").display is True
+        assert "database is busy" in str(
+            dashboard.query_one("#diagnostic").render()
+        )
 
 
 @async_test

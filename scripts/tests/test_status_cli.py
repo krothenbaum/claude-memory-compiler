@@ -197,15 +197,21 @@ def test_snapshot_golden_covers_success_fallback_retry_failure_and_compile(tmp_p
 
 
 @pytest.mark.parametrize(
-    ("state", "icon"),
+    ("state", "icon", "ascii_icon", "color_code"),
     [
-        ("ready", "○"),
-        ("retrying", "↻"),
-        ("complete", "✓"),
-        ("failed", "!"),
+        ("ready", "○", "o", "\x1b[36m"),
+        ("reserved", "○", "o", "\x1b[36m"),
+        ("waiting_queue", "○", "o", "\x1b[33m"),
+        ("waiting_sessions", "○", "o", "\x1b[33m"),
+        ("before_window", "○", "o", "\x1b[2m"),
+        ("retrying", "↻", "~", "\x1b[33m"),
+        ("complete", "✓", "+", "\x1b[32m"),
+        ("failed", "!", "!", "\x1b[31m"),
     ],
 )
-def test_compile_states_have_stable_icons(tmp_path, monkeypatch, state, icon):
+def test_compile_states_have_explicit_semantic_rendering(
+    tmp_path, monkeypatch, state, icon, ascii_icon, color_code
+):
     snapshot = StatusSnapshot(
         active=(),
         attention=(),
@@ -215,6 +221,7 @@ def test_compile_states_have_stable_icons(tmp_path, monkeypatch, state, icon):
     )
     status_cli = _install_snapshot(monkeypatch, snapshot)
     output = StringIO()
+    label = state.replace("_", " ")
 
     assert (
         status_cli.main(
@@ -227,7 +234,24 @@ def test_compile_states_have_stable_icons(tmp_path, monkeypatch, state, icon):
         == 0
     )
 
-    assert f"  {icon} {state} · Compile is {state}\n" in output.getvalue()
+    assert f"  {icon} {label} · Compile is {state}\n" in output.getvalue()
+
+    assert f"  {ascii_icon} {label} | Compile is {state}\n" in status_cli._render_snapshot(
+        snapshot,
+        now=NOW,
+        width=100,
+        color=False,
+        unicode_glyphs=False,
+    )
+
+    colored = status_cli._render_snapshot(
+        snapshot,
+        now=NOW,
+        width=100,
+        color=True,
+        unicode_glyphs=True,
+    )
+    assert f"{color_code}  {icon} {label}" in colored
 
 
 def test_snapshot_calls_read_only_projection_contract(tmp_path, monkeypatch):
@@ -265,7 +289,7 @@ def test_snapshot_calls_read_only_projection_contract(tmp_path, monkeypatch):
     }
 
 
-def test_missing_database_is_diagnostic_nonzero_and_never_created(tmp_path):
+def test_missing_database_is_an_empty_success_and_is_never_created(tmp_path):
     import status as status_cli
 
     queue_path = tmp_path / "missing.sqlite3"
@@ -281,10 +305,11 @@ def test_missing_database_is_diagnostic_nonzero_and_never_created(tmp_path):
         output=output,
     )
 
-    assert result == 2
-    assert output.getvalue() == (
-        f"MEMORY STATUS\n\nInspection failed: status database is unavailable: {queue_path}\n"
-    )
+    assert result == 0
+    assert "Inspection failed" not in output.getvalue()
+    assert "ACTIVE\n  — None" in output.getvalue()
+    assert "NEEDS ATTENTION\n  — None" in output.getvalue()
+    assert "RECENT\n  — None" in output.getvalue()
     assert not queue_path.exists()
 
 
@@ -516,6 +541,39 @@ def test_invalid_environment_is_guarded_without_traceback(command):
         "MEMORY STATUS\n\nInspection failed: AI_MEMORY_PROVIDER_ORDER must be codex,claude\n"
     )
     assert completed.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        [sys.executable, str(ROOT / "scripts" / "status.py"), "--snapshot"],
+        [sys.executable, "-m", "scripts.status", "--snapshot"],
+    ],
+    ids=["direct-first-run", "module-first-run"],
+)
+def test_missing_first_run_queue_is_empty_and_not_created(tmp_path, command):
+    queue_path = tmp_path / "scripts" / "jobs.sqlite3"
+    env = dict(os.environ)
+    env["AI_MEMORY_HOME"] = str(tmp_path)
+    env["AI_MEMORY_QUEUE_PATH"] = str(queue_path)
+    env.pop("CLAUDE_MEMORY_HOME", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "ACTIVE\n  — None" in completed.stdout
+    assert "NEEDS ATTENTION\n  — None" in completed.stdout
+    assert "RECENT\n  — None" in completed.stdout
+    assert completed.stderr == ""
+    assert not queue_path.exists()
 
 
 @pytest.mark.parametrize(

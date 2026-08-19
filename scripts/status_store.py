@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sqlite3
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import InitVar, dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -422,6 +423,7 @@ class CompileReadinessProbes:
     daily_state: Callable[[], str]
     reservation_state: Callable[[], str | None]
     reservation_attempt: Callable[[], int | None] = lambda: None
+    compile_after_hour: Callable[[], int] = lambda: _default_compile_after_hour()
 
 
 @dataclass(frozen=True)
@@ -457,6 +459,20 @@ class StatusSnapshot:
     compile: CompileStatus
     health_alerts: tuple[HealthAlert, ...]
     has_more: bool = False
+    active_count: int | None = None
+    attention_count: int | None = None
+    recent_count: int | None = None
+
+    def __post_init__(self) -> None:
+        for label, count, runs in (
+            ("active", self.active_count, self.active),
+            ("attention", self.attention_count, self.attention),
+            ("recent", self.recent_count, self.recent),
+        ):
+            if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count < len(runs)
+            ):
+                raise ValueError(f"{label} count must cover the projected runs")
 
 
 class StatusReadError(RuntimeError):
@@ -1206,6 +1222,92 @@ def _read_runs(
     return tuple(runs)
 
 
+def _read_run_group_counts(
+    connection: sqlite3.Connection,
+    tables: frozenset[str],
+    *,
+    now: datetime,
+    all_history: bool,
+    query: str,
+    acknowledged_run_ids: frozenset[int],
+) -> tuple[int, int, int]:
+    """Count matching attention, active, and recent runs without materializing them."""
+    cutoff = _stored_time(now.astimezone(UTC) - _RECENT_WINDOW)
+    needle = " ".join(query.split()).casefold()
+    acknowledged = tuple(sorted(acknowledged_run_ids))
+    placeholders = ",".join("?" for _ in acknowledged)
+    modern_in = f"id IN ({placeholders})" if acknowledged else "0=1"
+    modern_not_in = f"id NOT IN ({placeholders})" if acknowledged else "1=1"
+    legacy_in = f"(-jobs.id) IN ({placeholders})" if acknowledged else "0=1"
+    legacy_not_in = f"(-jobs.id) NOT IN ({placeholders})" if acknowledged else "1=1"
+    query_modern = (
+        " AND safe_status_match(kind,source_agent,session_id,project,state,phase,summary)=1"
+        if needle
+        else ""
+    )
+    query_legacy = (
+        " AND safe_legacy_match(jobs.kind,jobs.source_agent,jobs.session_id,"
+        "jobs.project,jobs.status)=1"
+        if needle
+        else ""
+    )
+    recent_modern = "" if all_history else " AND julianday(updated_at) >= julianday(?)"
+    recent_legacy = (
+        "" if all_history else " AND julianday(jobs.updated_at) >= julianday(?)"
+    )
+    modern_categories = (
+        f"state IN ('failed','dead') AND {modern_not_in}",
+        "state IN ('queued','running','retrying')",
+        (
+            f"(state='succeeded' OR (state IN ('failed','dead') AND {modern_in}))"
+            f"{recent_modern}"
+        ),
+    )
+    legacy_categories = (
+        f"jobs.status='dead' AND {legacy_not_in}",
+        "jobs.status IN ('pending','leased','failed')",
+        (
+            f"(jobs.status='succeeded' OR (jobs.status='dead' AND {legacy_in}))"
+            f"{recent_legacy}"
+        ),
+    )
+    counts = [0, 0, 0]
+    if "status_runs" in tables:
+        for index, predicate in enumerate(modern_categories):
+            parameters: tuple[object, ...] = (
+                (*acknowledged,) if index != 1 else ()
+            )
+            if index == 2 and not all_history:
+                parameters = (*parameters, cutoff)
+            row = connection.execute(
+                "SELECT count(*) FROM status_runs WHERE kind != 'compile' AND "
+                + predicate
+                + query_modern,
+                parameters,
+            ).fetchone()
+            counts[index] += int(row[0])
+    legacy_join = (
+        " LEFT JOIN status_runs ON status_runs.job_id=jobs.id "
+        "WHERE status_runs.id IS NULL AND "
+        if "status_runs" in tables
+        else " WHERE "
+    )
+    for index, predicate in enumerate(legacy_categories):
+        parameters = (*acknowledged,) if index != 1 else ()
+        if index == 2 and not all_history:
+            parameters = (*parameters, cutoff)
+        row = connection.execute(
+            "SELECT count(*) FROM jobs"
+            + legacy_join
+            + "jobs.kind != 'compile' AND "
+            + predicate
+            + query_legacy,
+            parameters,
+        ).fetchone()
+        counts[index] += int(row[0])
+    return counts[0], counts[1], counts[2]
+
+
 def _read_latest_compile_run(
     connection: sqlite3.Connection,
     tables: frozenset[str],
@@ -1310,11 +1412,21 @@ def project_compile_status(
     local_now = probes.local_now()
     if local_now.tzinfo is None or local_now.utcoffset() is None:
         raise ValueError("compile readiness time must be timezone-aware")
-    if local_now.hour < 16:
+    compile_after_hour = probes.compile_after_hour()
+    if (
+        isinstance(compile_after_hour, bool)
+        or not isinstance(compile_after_hour, int)
+        or not 0 <= compile_after_hour <= 23
+    ):
+        raise ValueError("compile-after hour must be between 0 and 23")
+    if local_now.hour < compile_after_hour:
         return with_last_result(
             CompileStatus(
                 state="before_window",
-                summary="Next automatic compile window begins at 16:00",
+                summary=(
+                    "Next automatic compile window begins at "
+                    f"{compile_after_hour:02d}:00"
+                ),
             )
         )
     if queue_active_count < 0:
@@ -1347,6 +1459,13 @@ def project_compile_status(
             CompileStatus(
                 state="complete",
                 summary="Today's captured content is compiled",
+            )
+        )
+    if daily_state == "missing":
+        return with_last_result(
+            CompileStatus(
+                state="complete",
+                summary="No captured content today",
             )
         )
     if daily_state == "uncompiled":
@@ -1429,33 +1548,49 @@ def _default_session_count() -> int:
         return -1
 
 
+def _default_compile_after_hour() -> int:
+    """Load the scheduler's compile window lazily to avoid import cycles."""
+    if __package__:
+        from .flush import COMPILE_AFTER_HOUR
+    else:
+        from flush import COMPILE_AFTER_HOUR
+
+    return COMPILE_AFTER_HOUR
+
+
 def _default_daily_state(
     queue_path: Path,
     now: datetime,
     memory_home: Path | None = None,
 ) -> str:
+    root = (
+        Path(os.path.abspath(memory_home.expanduser()))
+        if memory_home is not None
+        else (
+            queue_path.parent.parent if queue_path.parent.name == "scripts" else None
+        )
+    )
+    if root is None:
+        return "unreadable"
+    local_now = now.astimezone()
+    daily_path = root / "daily" / f"{local_now.strftime('%Y-%m-%d')}.md"
+    try:
+        daily_metadata = daily_path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISREG(daily_metadata.st_mode):
+        return "unreadable"
     try:
         if __package__:
             from .flush import _read_daily_compile_state
         else:
             from flush import _read_daily_compile_state
 
-        root = (
-            Path(os.path.abspath(memory_home.expanduser()))
-            if memory_home is not None
-            else (
-                queue_path.parent.parent
-                if queue_path.parent.name == "scripts"
-                else None
-            )
-        )
-        if root is None:
-            return "unreadable"
-        local_now = now.astimezone()
-        daily_path = (
-            root / "daily" / f"{local_now.strftime('%Y-%m-%d')}.md"
-        )
         return _read_daily_compile_state(daily_path).status
+    except FileNotFoundError:
+        return "missing"
     except (ImportError, OSError, RuntimeError, ValueError):
         return "unreadable"
 
@@ -1479,6 +1614,48 @@ def read_snapshot(
     ):
         raise ValueError("max_runs must be between 1 and 10000")
     resolved = Path(os.path.abspath(queue_path.expanduser()))
+
+    def default_probes(
+        reservation_state: str | None,
+        reservation_attempt: int | None,
+    ) -> CompileReadinessProbes:
+        return CompileReadinessProbes(
+            local_now=lambda: now.astimezone(),
+            session_count=_default_session_count,
+            daily_state=(
+                (lambda: _default_daily_state(resolved, now, memory_home))
+                if memory_home is not None
+                else (lambda: _default_daily_state(resolved, now))
+            ),
+            reservation_state=lambda: reservation_state,
+            reservation_attempt=lambda: reservation_attempt,
+        )
+
+    try:
+        resolved.lstat()
+    except FileNotFoundError:
+        compile_status = project_compile_status(
+            compile_run=None,
+            queue_active_count=0,
+            probes=(
+                compile_probes
+                if compile_probes is not None
+                else default_probes(None, None)
+            ),
+        )
+        return StatusSnapshot(
+            active=(),
+            attention=(),
+            recent=(),
+            compile=compile_status,
+            health_alerts=tuple(health_alerts),
+            active_count=0,
+            attention_count=0,
+            recent_count=0,
+        )
+    except OSError:
+        pass
+
     connection = _open_read_only_database(resolved)
     try:
         tables = _database_tables(connection)
@@ -1493,6 +1670,18 @@ def read_snapshot(
             max_runs=max_runs,
             query=query,
             acknowledged_run_ids=observer_state.acknowledged_run_ids,
+        )
+        bounded_counts = (
+            _read_run_group_counts(
+                connection,
+                tables,
+                now=now,
+                all_history=bool(query.strip()),
+                query=query,
+                acknowledged_run_ids=observer_state.acknowledged_run_ids,
+            )
+            if max_runs is not None
+            else None
         )
         latest_compile_run = _read_latest_compile_run(connection, tables)
         (
@@ -1561,49 +1750,48 @@ def read_snapshot(
         probes=(
             compile_probes
             if compile_probes is not None
-            else CompileReadinessProbes(
-                local_now=lambda: now.astimezone(),
-                session_count=_default_session_count,
-                daily_state=(
-                    (lambda: _default_daily_state(resolved, now, memory_home))
-                    if memory_home is not None
-                    else (lambda: _default_daily_state(resolved, now))
-                ),
-                reservation_state=lambda: reservation_state,
-                reservation_attempt=lambda: reservation_attempt,
-            )
+            else default_probes(reservation_state, reservation_attempt)
         ),
     )
+    active_count = len(active)
+    attention_count = len(attention)
+    recent_count = len(recent)
     has_more = False
     if max_runs is not None:
-        has_more = len(active) + len(attention) + len(recent) > max_runs
+        assert bounded_counts is not None
+        attention_count, active_count, recent_count = bounded_counts
+        has_more = attention_count + active_count + recent_count > max_runs
         sources = (attention, active, recent)
         targets: list[list[StatusRun]] = [[], [], []]
-        nonempty = [index for index, source in enumerate(sources) if source]
-        initial = nonempty if max_runs >= len(nonempty) else nonempty[:max_runs]
-        def fair_take(source: tuple[StatusRun, ...], count: int) -> list[StatusRun]:
-            if count <= 0:
-                return []
+        ordered_sources: list[list[StatusRun]] = []
+        for source in sources:
+            ordered = list(source)
             modern = [run for run in source if run.id > 0]
             legacy = [run for run in source if run.id < 0]
-            chosen: list[StatusRun] = []
-            if count >= 2 and modern and legacy:
-                chosen.extend((modern[0], legacy[0]))
-            remaining_candidates = [run for run in source if run not in chosen]
-            chosen.extend(remaining_candidates[: count - len(chosen)])
-            return sorted(chosen, key=_run_sort_key, reverse=True)
-
-        for index in initial:
-            targets[index] = fair_take(sources[index], 1)
-        remaining = max_runs - len(initial)
-        for index in (0, 1, 2):
-            if remaining <= 0:
+            if modern and legacy:
+                first = source[0]
+                counterpart = legacy[0] if first.id > 0 else modern[0]
+                ordered = [first, counterpart]
+                ordered.extend(run for run in source if run not in ordered)
+            ordered_sources.append(ordered)
+        positions = [0, 0, 0]
+        selected = 0
+        while selected < max_runs:
+            progressed = False
+            for index, source in enumerate(ordered_sources):
+                position = positions[index]
+                if position >= len(source):
+                    continue
+                targets[index].append(source[position])
+                positions[index] += 1
+                selected += 1
+                progressed = True
+                if selected == max_runs:
+                    break
+            if not progressed:
                 break
-            desired = len(targets[index]) + remaining
-            replacement = fair_take(sources[index], desired)
-            added = len(replacement) - len(targets[index])
-            targets[index] = replacement
-            remaining -= added
+        for target in targets:
+            target.sort(key=_run_sort_key, reverse=True)
         attention, active, recent = map(tuple, targets)
     return StatusSnapshot(
         active=active,
@@ -1612,6 +1800,9 @@ def read_snapshot(
         compile=compile_status,
         health_alerts=tuple(health_alerts),
         has_more=has_more,
+        active_count=active_count,
+        attention_count=attention_count,
+        recent_count=recent_count,
     )
 
 

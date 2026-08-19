@@ -1670,17 +1670,26 @@ def test_run_details_maps_unknown_provider_attempt_outcome_to_unknown(tmp_path):
     assert details.provider_attempts[0].outcome == "unknown"
 
 
-def test_missing_database_is_a_typed_diagnostic_and_is_not_created(tmp_path):
+def test_missing_database_projects_an_empty_first_run_without_creation(tmp_path):
     path = tmp_path / "missing.sqlite3"
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: READ_NOW,
+        session_count=lambda: 0,
+        daily_state=lambda: "covered",
+        reservation_state=lambda: None,
+    )
 
-    with pytest.raises(status_store_module.StatusDatabaseUnavailable) as caught:
-        status_store_module.read_snapshot(
-            path,
-            now=READ_NOW,
-            observer_state=status_store_module.ObserverState.empty(),
-        )
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        compile_probes=probes,
+    )
 
-    assert caught.value.path == path.resolve()
+    assert snapshot.active == ()
+    assert snapshot.attention == ()
+    assert snapshot.recent == ()
+    assert snapshot.compile.state == "complete"
     assert not path.exists()
 
 
@@ -2973,6 +2982,81 @@ def test_custom_queue_uses_explicit_memory_home_for_daily_readiness(
     assert with_root.compile.state == "ready"
 
 
+def test_missing_daily_log_is_a_benign_no_capture_state(tmp_path):
+    memory_home = tmp_path / "memory"
+    memory_home.mkdir()
+
+    state = status_store_module._default_daily_state(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        memory_home,
+    )
+
+    assert state == "missing"
+
+
+def test_unreadable_daily_log_remains_unavailable(tmp_path, monkeypatch):
+    memory_home = tmp_path / "memory"
+    daily_path = memory_home / "daily" / "2026-08-18.md"
+    daily_path.parent.mkdir(parents=True)
+    daily_path.write_text("# Daily Log\n", encoding="utf-8")
+    original_stat = Path.stat
+
+    def denied_stat(path, *args, **kwargs):
+        if path == daily_path:
+            raise PermissionError("denied")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+
+    state = status_store_module._default_daily_state(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        memory_home,
+    )
+
+    assert state == "unreadable"
+
+
+def test_dangling_daily_log_symlink_is_not_treated_as_missing(tmp_path):
+    memory_home = tmp_path / "memory"
+    daily_path = memory_home / "daily" / "2026-08-18.md"
+    daily_path.parent.mkdir(parents=True)
+    try:
+        daily_path.symlink_to(memory_home / "absent.md")
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    state = status_store_module._default_daily_state(
+        tmp_path / "scripts" / "jobs.sqlite3",
+        datetime.fromisoformat("2026-08-18T17:00:00-07:00"),
+        memory_home,
+    )
+
+    assert state == "unreadable"
+
+
+def test_compile_window_uses_flush_compile_after_hour(monkeypatch):
+    import scripts.flush as flush_module
+
+    monkeypatch.setattr(flush_module, "COMPILE_AFTER_HOUR", 17)
+    probes = status_store_module.CompileReadinessProbes(
+        local_now=lambda: datetime.fromisoformat("2026-08-18T16:30:00-07:00"),
+        session_count=lambda: 0,
+        daily_state=lambda: "uncompiled",
+        reservation_state=lambda: None,
+    )
+
+    status = status_store_module.project_compile_status(
+        compile_run=None,
+        queue_active_count=0,
+        probes=probes,
+    )
+
+    assert status.state == "before_window"
+    assert status.summary == "Next automatic compile window begins at 17:00"
+
+
 def test_snapshot_projection_queries_share_one_read_transaction(tmp_path, monkeypatch):
     path = tmp_path / "jobs.sqlite3"
     with QueueRepository(path, sync_usage=False):
@@ -3132,6 +3216,61 @@ def test_bounded_attention_reserves_modern_and_legacy_sources(tmp_path):
     assert {run.id > 0 for run in snapshot.attention} == {True, False}
     assert len(snapshot.attention) == 2
     assert snapshot.has_more
+
+
+def test_bounded_snapshot_round_robins_capacity_across_all_groups(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        for index in range(3):
+            for offset, state, phase in (
+                (0, "failed", "failed"),
+                (10, "running", "worker_claimed"),
+                (20, "succeeded", "succeeded"),
+            ):
+                _insert_projection_run(
+                    repository._connection,
+                    run_id=1_000 + offset + index,
+                    state=state,
+                    phase=phase,
+                    updated_at=READ_NOW - timedelta(seconds=index),
+                    project=f"{state}-{index}",
+                )
+        repository._connection.commit()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        max_runs=6,
+    )
+
+    assert tuple(map(len, (snapshot.attention, snapshot.active, snapshot.recent))) == (
+        2,
+        2,
+        2,
+    )
+    assert snapshot.has_more is True
+
+
+def test_bounded_snapshot_reports_full_matching_group_counts(tmp_path):
+    path = tmp_path / "jobs.sqlite3"
+    _create_projection_queue(path)
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState(
+            version=1,
+            acknowledged_run_ids=frozenset({4}),
+        ),
+        max_runs=2,
+    )
+
+    assert snapshot.active_count == 2
+    assert snapshot.attention_count == 1
+    assert snapshot.recent_count == 2
+    assert sum(map(len, (snapshot.active, snapshot.attention, snapshot.recent))) == 2
+    assert snapshot.has_more is True
 
 
 def test_bounded_candidate_queries_limit_projection_materialization(

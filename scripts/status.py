@@ -38,6 +38,11 @@ _STATE_ICONS = {
     "dead": "!",
 }
 _COMPILE_ICONS = {
+    "ready": "○",
+    "reserved": "○",
+    "waiting_queue": "○",
+    "waiting_sessions": "○",
+    "before_window": "○",
     "running": "●",
     "retrying": "↻",
     "complete": "✓",
@@ -53,6 +58,11 @@ _STATE_COLORS = {
     "retrying": "\x1b[33m",
     "succeeded": "\x1b[32m",
     "complete": "\x1b[32m",
+    "ready": "\x1b[36m",
+    "reserved": "\x1b[36m",
+    "waiting_queue": "\x1b[33m",
+    "waiting_sessions": "\x1b[33m",
+    "before_window": "\x1b[2m",
     "failed": "\x1b[31m",
     "dead": "\x1b[31m",
     "unavailable": "\x1b[31m",
@@ -233,6 +243,11 @@ def _render_snapshot(
         _COMPILE_ICONS
         if unicode_glyphs
         else {
+            "ready": "o",
+            "reserved": "o",
+            "waiting_queue": "o",
+            "waiting_sessions": "o",
+            "before_window": "o",
             "running": "*",
             "retrying": "~",
             "complete": "+",

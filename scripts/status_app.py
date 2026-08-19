@@ -55,6 +55,7 @@ SnapshotReader = Callable[..., StatusSnapshot]
 DetailsReader = Callable[[Path, int], RunDetails]
 HealthLoader = Callable[[], tuple[HealthAlert, ...]]
 MAX_RENDERED_RUNS = 200
+MAX_VISIBLE_HEALTH_ALERTS = 2
 _SOURCE_LABELS = {"claude": "Claude", "codex": "Codex", "system": "System"}
 
 
@@ -145,7 +146,13 @@ class StatusDashboard(App[None]):
     Screen { layout: vertical; }
     #app-header { height: 3; padding: 0 1; text-style: bold; color: ansi_bright_cyan; }
     #health-banner, #delayed-banner, #diagnostic { height: auto; padding: 0 1; }
-    #health-banner { color: yellow; }
+    #health-banner {
+        color: yellow;
+        max-height: 3;
+        overflow-y: hidden;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
     #delayed-banner { color: yellow; display: none; }
     #diagnostic { color: red; display: none; }
     #filter-input { display: none; height: 3; }
@@ -330,9 +337,12 @@ class StatusDashboard(App[None]):
 
     @staticmethod
     def _is_busy_error(error: BaseException) -> bool:
-        current: BaseException | None = error
+        pending: list[BaseException] = [error]
         seen: set[int] = set()
-        while current is not None and id(current) not in seen:
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
             seen.add(id(current))
             if isinstance(current, sqlite3.OperationalError):
                 code = getattr(current, "sqlite_errorcode", None)
@@ -340,8 +350,12 @@ class StatusDashboard(App[None]):
                 if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
                     return True
                 message = str(current).lower()
-                return "database is locked" in message or "database is busy" in message
-            current = current.__cause__ or current.__context__
+                if "database is locked" in message or "database is busy" in message:
+                    return True
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
         return False
 
     async def refresh_snapshot(self) -> None:
@@ -508,15 +522,30 @@ class StatusDashboard(App[None]):
 
     async def _render_snapshot_unlocked(self) -> None:
         assert self.snapshot is not None
+        active_count = (
+            len(self.snapshot.active)
+            if self.snapshot.active_count is None
+            else self.snapshot.active_count
+        )
+        attention_count = (
+            len(self.snapshot.attention)
+            if self.snapshot.attention_count is None
+            else self.snapshot.attention_count
+        )
         self.query_one("#app-header", Static).update(
             Text(
-                f"AI Memory  ● watching    {len(self.snapshot.active)} active   "
-                f"{len(self.snapshot.attention)} needs attention"
+                f"AI Memory  ● watching    {active_count} active   "
+                f"{attention_count} needs attention"
             )
         )
         alerts = self.snapshot.health_alerts
         health = self.query_one("#health-banner", Static)
-        health.update(Text(" · ".join(alert.message for alert in alerts)))
+        visible_alerts = alerts[:MAX_VISIBLE_HEALTH_ALERTS]
+        health_lines = [alert.message for alert in visible_alerts]
+        hidden_alerts = len(alerts) - len(visible_alerts)
+        if hidden_alerts:
+            health_lines.append(f"+{hidden_alerts} more")
+        health.update(Text("\n".join(health_lines)))
         health.display = bool(alerts)
         run_list = self.query_one("#run-list", VerticalScroll)
         scroll_y = run_list.scroll_y
