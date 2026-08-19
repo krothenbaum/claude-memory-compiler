@@ -247,22 +247,21 @@ class StatusDashboard(App[None]):
             placeholder="Filter status history", id="filter-input", disabled=True
         )
         with Horizontal(id="main-grid"):
-            with Vertical(id="runs-pane"):
-                with VerticalScroll(id="run-list"):
-                    with Vertical(id="active-section", classes="run-section"):
-                        yield Static("ACTIVE", classes="section-label")
-                        yield Vertical(id="active-runs", classes="run-rows")
-                    with Vertical(id="attention-section", classes="run-section"):
-                        yield Static("NEEDS ATTENTION", classes="section-label")
-                        yield Vertical(id="attention-runs", classes="run-rows")
-                    with Vertical(id="recent-section", classes="run-section"):
-                        yield Static("RECENT", classes="section-label")
-                        yield Vertical(id="recent-runs", classes="run-rows")
-                    yield Static(
-                        f"Showing first {MAX_RENDERED_RUNS} matching runs — refine filter",
-                        id="truncation-notice",
-                        classes="section-label",
-                    )
+            with Vertical(id="runs-pane"), VerticalScroll(id="run-list"):
+                with Vertical(id="active-section", classes="run-section"):
+                    yield Static("ACTIVE", classes="section-label")
+                    yield Vertical(id="active-runs", classes="run-rows")
+                with Vertical(id="attention-section", classes="run-section"):
+                    yield Static("NEEDS ATTENTION", classes="section-label")
+                    yield Vertical(id="attention-runs", classes="run-rows")
+                with Vertical(id="recent-section", classes="run-section"):
+                    yield Static("RECENT", classes="section-label")
+                    yield Vertical(id="recent-runs", classes="run-rows")
+                yield Static(
+                    f"Showing first {MAX_RENDERED_RUNS} matching runs — refine filter",
+                    id="truncation-notice",
+                    classes="section-label",
+                )
             with Vertical(id="details-pane"):
                 yield Static("Select a run", id="details")
         yield Static(id="compile-panel")
