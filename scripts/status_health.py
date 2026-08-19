@@ -17,15 +17,18 @@ from typing import Final
 try:
     from .config import load_config
     from .privacy import normalize_persistence_reason
-    from .queue import QueueRepository
     from .status_store import HealthAlert
     from .utils import inspect_secure_read_file
 except ImportError:  # Direct execution with scripts/ on sys.path.
     from config import load_config
     from privacy import normalize_persistence_reason
-    from queue import QueueRepository
     from status_store import HealthAlert
     from utils import inspect_secure_read_file
+
+try:
+    from .queue import QueueRepository
+except ImportError:  # Direct execution with scripts/ on sys.path.
+    from queue import QueueRepository  # type: ignore[attr-defined]
 
 
 _HOOK_COMPONENTS: Final[frozenset[str]] = frozenset(
