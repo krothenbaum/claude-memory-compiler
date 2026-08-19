@@ -288,14 +288,18 @@ class MemoryWorker:
             "warning" if attempt.provider == "codex" else "error"
         )
         async with self._writer_lock:
-            self._append_status_event(
-                job,
-                phase,
-                provider=attempt.provider,
-                level=level,
-                message=None if succeeded else (attempt.reason or attempt.outcome),
-                details={"elapsed_ms": max(0, attempt.elapsed_ms)},
-            )
+            try:
+                self._append_status_event(
+                    job,
+                    phase,
+                    provider=attempt.provider,
+                    level=level,
+                    message=None if succeeded else (attempt.reason or attempt.outcome),
+                    details={"elapsed_ms": max(0, attempt.elapsed_ms)},
+                )
+            except LeaseLostError:
+                self.queue.record_attempt(job.id, attempt)
+                raise
             self.queue.record_attempt(job.id, attempt)
 
     def _build_router(self, job: Job) -> TextRouter:

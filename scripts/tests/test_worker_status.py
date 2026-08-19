@@ -281,7 +281,9 @@ def test_daily_writer_failure_retries_after_write_started_without_success(tmp_pa
         assert repository.status_run_for_job(queued.job_id).summary == "disk full"
 
 
-def test_stale_attempt_rejection_stops_later_provider_events(tmp_path):
+def test_completed_attempt_is_recorded_once_when_end_event_detects_lost_lease(
+    tmp_path,
+):
     with QueueRepository(
         tmp_path / "jobs.sqlite3", clock=lambda: NOW, max_attempts=3, sync_usage=False
     ) as repository:
@@ -324,7 +326,10 @@ def test_stale_attempt_rejection_stops_later_provider_events(tmp_path):
             "worker_claimed",
         ]
         assert repository.get_job(queued.job_id).lease_owner == "replacement"
-        assert repository.attempts_for(queued.job_id) == []
+        assert [
+            (attempt.provider, attempt.outcome)
+            for attempt in repository.attempts_for(queued.job_id)
+        ] == [("codex", "success")]
         assert writes == []
 
 
