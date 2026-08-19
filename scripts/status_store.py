@@ -1036,9 +1036,43 @@ def _read_runs(
     runs: list[StatusRun] = []
     cutoff = _stored_time(now.astimezone(UTC) - _RECENT_WINDOW)
     needle = " ".join(query.split()).casefold()
-    def safe_match(*values: object) -> int:
-        return int(any(needle in (normalize_summary(value, os.environ) or "").casefold() for value in values))
+
+    def visible_match(*values: str) -> int:
+        return int(any(needle in value.casefold() for value in values))
+
+    def safe_match(
+        kind: object,
+        source: object,
+        session: object,
+        project: object,
+        state: object,
+        phase: object,
+        summary: object,
+    ) -> int:
+        return visible_match(
+            _safe_projection_identity(
+                "kind", kind, max_chars=64, allowed=_RUN_KINDS
+            ),
+            _safe_projection_identity(
+                "source_agent", source, max_chars=32, allowed=_SOURCE_AGENTS
+            ),
+            _safe_projection_identity(
+                "session_id", session, max_chars=MAX_OPERATION_IDENTITY_CHARS
+            ),
+            _safe_projection_identity(
+                "project", project, max_chars=MAX_OPERATION_IDENTITY_CHARS
+            ),
+            _safe_projection_identity(
+                "state", state, max_chars=32, allowed=_RUN_STATES
+            ),
+            _safe_projection_identity(
+                "phase", phase, max_chars=64, allowed=ALLOWED_PHASES
+            ),
+            normalize_summary(summary, os.environ) or "",
+        )
+
     connection.create_function("safe_status_match", -1, safe_match, deterministic=True)
+
     def safe_legacy_match(*values: object) -> int:
         kind, source, session, project, status = values
         mapping = {
@@ -1048,7 +1082,22 @@ def _read_runs(
             "succeeded": ("succeeded", "succeeded", "Completed"),
             "dead": ("dead", "dead", "Attempts exhausted"),
         }.get(str(status), ("unknown", "unknown", ""))
-        return safe_match(kind, source, session, project, *mapping)
+        return visible_match(
+            _safe_projection_identity(
+                "kind", kind, max_chars=64, allowed=_RUN_KINDS
+            ),
+            _safe_projection_identity(
+                "source_agent", source, max_chars=32, allowed=_SOURCE_AGENTS
+            ),
+            _safe_projection_identity(
+                "session_id", session, max_chars=MAX_OPERATION_IDENTITY_CHARS
+            ),
+            _safe_projection_identity(
+                "project", project, max_chars=MAX_OPERATION_IDENTITY_CHARS
+            ),
+            *mapping,
+        )
+
     connection.create_function("safe_legacy_match", 5, safe_legacy_match, deterministic=True)
     if max_runs is not None:
         acknowledged = tuple(sorted(acknowledged_run_ids))
@@ -1772,7 +1821,8 @@ def read_snapshot(
                 first = source[0]
                 counterpart = legacy[0] if first.id > 0 else modern[0]
                 ordered = [first, counterpart]
-                ordered.extend(run for run in source if run not in ordered)
+                selected_ids = {first.id, counterpart.id}
+                ordered.extend(run for run in source if run.id not in selected_ids)
             ordered_sources.append(ordered)
         positions = [0, 0, 0]
         selected = 0

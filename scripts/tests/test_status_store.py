@@ -3273,6 +3273,124 @@ def test_bounded_snapshot_reports_full_matching_group_counts(tmp_path):
     assert snapshot.has_more is True
 
 
+@pytest.mark.parametrize(
+    ("storage", "state", "phase", "job_status", "group", "count_field"),
+    [
+        ("modern", "running", "worker_claimed", None, "active", "active_count"),
+        ("modern", "failed", "failed", None, "attention", "attention_count"),
+        ("legacy", None, None, "pending", "active", "active_count"),
+        ("legacy", None, None, "dead", "attention", "attention_count"),
+    ],
+)
+def test_bounded_counts_match_safely_projected_query_fields(
+    tmp_path, storage, state, phase, job_status, group, count_field
+):
+    path = tmp_path / "jobs.sqlite3"
+    if storage == "modern":
+        with QueueRepository(path, sync_usage=False) as repository:
+            _insert_projection_run(
+                repository._connection,
+                run_id=501,
+                state=state,
+                phase=phase,
+                updated_at=READ_NOW,
+                project="safe-project",
+            )
+            repository._connection.execute(
+                "UPDATE status_runs SET source_agent = ? WHERE id = 501",
+                ("claude\ncontrol",),
+            )
+            repository._connection.commit()
+    else:
+        _create_version_2_queue(path)
+        connection = sqlite3.connect(path)
+        try:
+            timestamp = READ_NOW.isoformat()
+            connection.execute(
+                """INSERT INTO jobs(id,kind,source_agent,session_id,project,cwd,trigger,
+                source_path,source_hash,payload_json,status,attempt_count,available_at,
+                created_at,updated_at,completed_at) VALUES(501,'capture',?,'safe-session',
+                'safe-project','/tmp','end','/tmp/x','safe-hash','{}',?,1,?,?,?,?)""",
+                (
+                    "claude\ncontrol",
+                    job_status,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        query="control",
+        max_runs=2,
+    )
+
+    assert getattr(snapshot, group) == ()
+    assert getattr(snapshot, count_field) == 0
+    assert snapshot.has_more is False
+
+
+def test_round_robin_source_preparation_does_not_compare_status_runs(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "jobs.sqlite3"
+    with QueueRepository(path, sync_usage=False) as repository:
+        for index in range(3):
+            _insert_projection_run(
+                repository._connection,
+                run_id=600 + index,
+                state="failed",
+                phase="failed",
+                updated_at=READ_NOW - timedelta(seconds=index),
+                project="modern",
+            )
+            timestamp = (READ_NOW - timedelta(minutes=1, seconds=index)).isoformat()
+            repository._connection.execute(
+                """INSERT INTO jobs(id,kind,source_agent,session_id,project,cwd,trigger,
+                source_path,source_hash,payload_json,status,attempt_count,available_at,
+                created_at,updated_at,completed_at) VALUES(?, 'capture','claude',?,
+                'legacy','/tmp','end','/tmp/x',?,'{}','dead',1,?,?,?,?)""",
+                (
+                    index + 1,
+                    f"legacy-{index}",
+                    f"legacy-hash-{index}",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        repository._connection.commit()
+
+    comparisons = 0
+    original_eq = StatusRun.__eq__
+
+    def counted_eq(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return original_eq(left, right)
+
+    monkeypatch.setattr(StatusRun, "__eq__", counted_eq)
+
+    snapshot = status_store_module.read_snapshot(
+        path,
+        now=READ_NOW,
+        observer_state=status_store_module.ObserverState.empty(),
+        max_runs=6,
+    )
+
+    assert len(snapshot.attention) == 6
+    assert {run.id > 0 for run in snapshot.attention} == {True, False}
+    assert comparisons == 0
+
+
 def test_bounded_candidate_queries_limit_projection_materialization(
     tmp_path, monkeypatch
 ):
