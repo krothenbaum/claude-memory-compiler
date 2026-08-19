@@ -109,6 +109,8 @@ At personal scale, the model can select relevant articles from `knowledge/index.
 
 Run `uv run python scripts/status.py` in a separate terminal tab or split pane. Watch mode is the default. It groups jobs into Active, Needs Attention, and Recent, provides a selectable event and provider-attempt timeline, and keeps the automatic compile state visible in a separate panel. Successful and acknowledged runs remain in Recent for seven days. Unacknowledged failures remain in Needs Attention until you select one and press `a`.
 
+Before the first capture creates the queue database, both watch and snapshot modes show an empty status view without creating the database. Unsafe or malformed existing queue data still produces a diagnostic.
+
 The dashboard uses restrained semantic color for running, retrying, successful, and failed work. State icons and labels carry the same meaning without color. Set `NO_COLOR` or pass `--no-color` to disable color. Press `?` for the complete key map.
 
 The dashboard is a read-only observer. Closing it never cancels a flush or compile. Jobs continue in the detached worker, and their persisted phases, fallback path, result, and bounded error appear when you reopen it. Acknowledgment changes only the private display state at `scripts/status-state/status-view.json`; it cannot change, retry, reset, or delete a queue job. Use the separate recovery commands below when a job needs operator action.

@@ -562,7 +562,7 @@ Dry run parses, filters, chunks, checks deduplication, and estimates tokens/task
 
 New queued operations use SQLite `provider_attempts` as their source of truth. `scripts/logs/usage.jsonl` is a recoverable, bounded projection for operations outside or inside the queue. It records Codex tokens when the CLI provides them and uses an unavailable value otherwise. It never invents `cost_usd` for Codex. Historical previews report advisory token and task estimates because ChatGPT plan limits vary.
 
-The private `scripts/status-state/status-view.json` file stores only observer acknowledgments. It is bounded, atomically replaced, owner-only, and safe to lose; deleting or corrupting it can make acknowledged failures visible again but cannot alter execution. The dashboard opens the queue read-only and treats missing, unsafe, or invalid queue data as a diagnostic instead of creating or repairing files.
+The private `scripts/status-state/status-view.json` file stores only observer acknowledgments. It is bounded, atomically replaced, owner-only, and safe to lose; deleting or corrupting it can make acknowledged failures visible again but cannot alter execution. The dashboard opens the queue read-only. A missing queue produces an empty first-run view without creating the database; unsafe or invalid existing data produces a diagnostic and is never repaired.
 
 Runtime queue, lock, journal, spool, stage, log, state, daily, knowledge, and report files created during tests or operations must never enter implementation commits.
 
